@@ -6,7 +6,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node22 --external:better-sqlite3 --outfile=dist/bundle/main.js && rm -rf dist/drizzle && cp -R ../../db/drizzle dist/drizzle"
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --external:better-sqlite3 --outfile=dist/bundle/main.js && rm -rf dist/drizzle && cp -R ../../db/drizzle dist/drizzle"
   },
   "dependencies": {
     "@fly/sprites": "^0.2.4",
