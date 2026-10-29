@@ -4,5 +4,17 @@
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
+  },
+  "scripts": {
+    "db:generate": "drizzle-kit generate && node src/strict.ts"
+  },
+  "dependencies": {
+    "@harness/shared": "workspace:*",
+    "better-sqlite3": "^12.11.1",
+    "drizzle-orm": "0.45.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^9.6.0",
+    "drizzle-kit": "0.31.11"
   }
 }
