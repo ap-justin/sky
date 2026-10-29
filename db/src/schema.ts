@@ -8,6 +8,7 @@ import type {
   PendingRequest,
   RequestId,
   RunId,
+  RunRollup,
   RunStatus,
   WebhookId,
 } from "@harness/shared";
@@ -136,6 +137,8 @@ export const runs = sqliteTable(
     costUsd: real("cost_usd"),
     turns: integer(),
     durationMs: integer("duration_ms"),
+    // no CHECK: adding one makes drizzle-kit rebuild the table; the API parses with the shared RunRollup first
+    rollup: text({ mode: "json" }).$type<RunRollup>(),
     createdAt: createdAt(),
   },
   (t) => [

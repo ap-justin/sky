@@ -13,6 +13,7 @@ import {
   EventType,
   type RequestId,
   type RunId,
+  type RunRollup,
   RunStatus,
   type WebhookId,
 } from "@harness/shared";
@@ -25,6 +26,7 @@ import {
   openDb,
   requestKinds,
   runRequests,
+  runs,
   webhookDeliveries,
   webhooks,
 } from "./index.js";
@@ -522,4 +524,39 @@ test("migrating a populated 0003 file adds an empty run_requests table and keeps
 
   for (const table of ["runs", "events"]) expect(count(table)).toBe(1);
   expect(count("run_requests")).toBe(0);
+});
+
+test("drizzle round-trips a run's rollup as a parsed object, null until set", () => {
+  migrate(db);
+  seedRun();
+  const [before] = db.select().from(runs).all();
+  expect(before?.rollup).toBeNull();
+
+  const sha = "a".repeat(40);
+  const rollup: RunRollup = {
+    base: sha,
+    run: {
+      commits: [{ sha, subject: "fix" }],
+      files: 2,
+      added: 10,
+      removed: 3,
+    },
+    cumulative: { commits: [], files: 0, added: 0, removed: 0 },
+  };
+  db.update(runs).set({ rollup }).run();
+  const [after] = db.select().from(runs).all();
+  expect(after?.rollup).toEqual(rollup);
+});
+
+test("migrating a populated 0004 file adds a null rollup to every run and keeps every row", () => {
+  migrateThrough("0004_perpetual_hellion");
+  seedRun();
+  insertEvent();
+
+  migrate(db);
+
+  for (const table of ["runs", "events"]) expect(count(table)).toBe(1);
+  expect(db.$client.prepare("select rollup from runs").get()).toEqual({
+    rollup: null,
+  });
 });
