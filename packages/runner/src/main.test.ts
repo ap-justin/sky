@@ -1,9 +1,9 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
-import { createServer } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { join } from "node:path";
-import { beforeAll, expect, test } from "vitest";
+import { afterEach, beforeAll, expect, test } from "vitest";
 
 const pkg = join(import.meta.dirname, "..");
 const bundle = join(pkg, "dist/bundle/runner.mjs");
@@ -11,6 +11,14 @@ const bundle = join(pkg, "dist/bundle/runner.mjs");
 beforeAll(() => {
   execFileSync("pnpm", ["run", "--silent", "build"], { cwd: pkg });
 }, 30_000);
+
+const servers: Server[] = [];
+afterEach(() => {
+  for (const s of servers.splice(0)) {
+    s.closeAllConnections();
+    s.close();
+  }
+});
 
 async function runBundle(env: Record<string, string>) {
   const child = spawn(process.execPath, [bundle], {
@@ -83,4 +91,51 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
     api.closeAllConnections();
     api.close();
   }
+});
+
+test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies by the signal", async () => {
+  let respond: (() => void) | undefined;
+  const posted = new Promise<void>((resolve) => {
+    const api = createServer((req, res) => {
+      req.resume();
+      req.on("end", () => {
+        respond = () => res.writeHead(204).end();
+        resolve();
+      });
+    });
+    api.listen(0, "127.0.0.1");
+    servers.push(api);
+  });
+  const api = servers.at(-1);
+  if (!api) throw new Error("no server");
+  await once(api, "listening");
+  const { port } = api.address() as AddressInfo;
+  const child = spawn(process.execPath, [bundle], {
+    env: {
+      PATH: process.env.PATH ?? "",
+      AGENT_ID: "agt_1",
+      RUN_ID: "run_1",
+      PROMPT: "do it",
+      API_BASE_URL: `http://127.0.0.1:${port}`,
+      AGENT_TOKEN: "agent-secret",
+      CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+      REPO_DIR: "/nonexistent/repo",
+      WORKTREES_DIR: "/nonexistent/worktrees",
+    },
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+  let stderr = "";
+  child.stderr.on("data", (d) => (stderr += d));
+  const exited = once(child, "exit");
+  // the runner is mid-post of run.failed, the API holding its answer
+  await posted;
+  child.kill("SIGHUP");
+  await new Promise((r) => setTimeout(r, 300));
+  expect(child.exitCode).toBeNull();
+  expect(child.signalCode).toBeNull();
+  respond?.();
+  const [code, signal] = await exited;
+  expect({ code, signal }).toEqual({ code: null, signal: "SIGHUP" });
+  // the sprite hold has no socket outside a sprite, and says so
+  expect(stderr).toMatch(/sprite API/);
 });

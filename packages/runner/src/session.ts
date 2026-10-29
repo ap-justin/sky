@@ -34,6 +34,21 @@ export type QueryFn = (params: {
 }) => AsyncIterable<SDKMessage>;
 
 const MAX_PROGRESS_CHARS = 2000;
+/**
+ * Seconds before the SDK cancels a PreToolUse hook, and with it the approval gate (its default is
+ * 600). `waitTimeoutMs` bounds each wait, but this clock also runs while a call queues behind
+ * other waits, so it covers ten waits, and a day at least; kept far below a Node timer's
+ * 2^31-1 ms, past which a timer fires at once.
+ */
+const gateTimeoutS = (waitTimeoutMs: number) =>
+  Math.max(86_400, Math.ceil((10 * waitTimeoutMs) / 1000));
+/** Who the session's own commits are by; in the env, so a commit never needs `git config`. */
+const SESSION_GIT_IDENTITY = {
+  GIT_AUTHOR_NAME: "Claude",
+  GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
+  GIT_COMMITTER_NAME: "Claude",
+  GIT_COMMITTER_EMAIL: "noreply@anthropic.com",
+};
 
 type RunnerEvent = Omit<RunnerEventPost, "runId">;
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
@@ -54,7 +69,7 @@ function sessionOptions(
     cwd,
     resume: config.sessionId,
     abortController,
-    env,
+    env: { ...env, ...SESSION_GIT_IDENTITY },
     systemPrompt: { type: "preset", preset: "claude_code" },
     // the approval policy holds calls in the PreToolUse hook; everything else runs unasked
     permissionMode: "bypassPermissions",
@@ -70,26 +85,30 @@ function sessionOptions(
  * behind earlier posts and the hook answers `continue` at once, whatever the post does.
  * The one exception is `gate`, which holds a PreToolUse call until it has a decision.
  */
-function sessionHooks(on: {
-  progress: (event: RunnerEvent) => void;
-  stop: (lastMessage: string | undefined) => void;
-  gate: (
-    input: PreToolUseHookInput,
-    signal: AbortSignal,
-  ) => Promise<SyncHookJSONOutput>;
-}): Options["hooks"] {
+function sessionHooks(
+  gateTimeout: number,
+  on: {
+    progress: (event: RunnerEvent) => void;
+    stop: (lastMessage: string | undefined) => void;
+    gate: (
+      input: PreToolUseHookInput,
+      signal: AbortSignal,
+    ) => Promise<SyncHookJSONOutput>;
+  },
+): Options["hooks"] {
   const matcher = <E extends HookEvent>(
     handle: (
       input: Extract<HookInput, { hook_event_name: E }>,
       signal: AbortSignal,
     ) => undefined | Promise<SyncHookJSONOutput>,
+    timeout?: number,
   ): HookCallbackMatcher[] => {
     const hook: HookCallback = async (input, _toolUseId, { signal }) =>
       (await handle(
         input as Extract<HookInput, { hook_event_name: E }>,
         signal,
       )) ?? { continue: true };
-    return [{ hooks: [hook] }];
+    return [{ hooks: [hook], ...(timeout && { timeout }) }];
   };
   return {
     Notification: matcher<"Notification">((input) => {
@@ -107,7 +126,7 @@ function sessionHooks(on: {
         },
       });
       return on.gate(input, signal);
-    }),
+    }, gateTimeout),
     Stop: matcher<"Stop">((input) => {
       on.stop(input.last_assistant_message);
     }),
@@ -163,6 +182,8 @@ export async function runSession(
   const abortController = new AbortController();
   const forward = () => abortController.abort(deps.signal.reason);
   deps.signal.addEventListener("abort", forward, { once: true });
+  // a stop during worktree setup aborted the signal before the listener existed
+  if (deps.signal.aborted) forward();
 
   // why the runner itself aborted the session; it outranks the stream error or result that follows
   let stopReason: string | undefined;
@@ -291,7 +312,7 @@ export async function runSession(
   let streamError: string | undefined;
   let started = false;
   let stopMessage: string | undefined;
-  const hooks = sessionHooks({
+  const hooks = sessionHooks(gateTimeoutS(config.waitTimeoutMs), {
     // a failed post must not fail the tool call that triggered it
     progress: (event) => void post(event).catch(() => {}),
     stop: (lastMessage) => {

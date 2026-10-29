@@ -201,7 +201,7 @@ test("hooks reach the API in order: a notification, one progress per tool call f
     apiBaseUrl: "https://api.test",
     agentToken: "agent-secret",
     warn: () => {},
-    retryDelayMs: 0,
+    sleep: async () => {},
   });
   const query = scripted([
     init,
@@ -372,6 +372,64 @@ test("runs the session in the agent worktree, resuming the stored session, witho
   } finally {
     delete process.env.AGENT_TOKEN;
   }
+});
+
+test("the session commits as Claude through its env, so nothing writes the clone's git config", async () => {
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.env).toMatchObject({
+    GIT_AUTHOR_NAME: "Claude",
+    GIT_AUTHOR_EMAIL: "noreply@anthropic.com",
+    GIT_COMMITTER_NAME: "Claude",
+    GIT_COMMITTER_EMAIL: "noreply@anthropic.com",
+  });
+});
+
+test("the PreToolUse hook outlasts the longest wait, so a late approval still reaches the tool call", async () => {
+  const query = scripted([init, success]);
+  const waitTimeoutMs = 120 * 60_000;
+  await runSession(
+    { ...config, waitTimeoutMs },
+    {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    },
+  );
+  const matchers = query.calls[0]?.options.hooks?.PreToolUse ?? [];
+  expect(matchers).not.toHaveLength(0);
+  for (const { timeout } of matchers) {
+    // seconds; a call queued behind other waits needs several wait timeouts
+    expect(timeout).toBeGreaterThanOrEqual((10 * waitTimeoutMs) / 1000);
+    // past 2^31-1 ms a Node timer fires at once; a tenth of that leaves room for drift in the SDK
+    expect((timeout ?? 0) * 1000).toBeLessThan(2 ** 31 / 10);
+  }
+});
+
+test("a stop before the session starts still aborts it", async () => {
+  const { posted, post } = recorder();
+  const controller = new AbortController();
+  controller.abort("SIGTERM");
+  const query = scripted([init, success]);
+  expect(
+    await runSession(config, {
+      query,
+      post,
+      signal: controller.signal,
+      awaitDecision: noDecision,
+    }),
+  ).toBe(1);
+  expect(query.calls[0]?.options.abortController?.signal.aborted).toBe(true);
+  expect(posted.at(-1)).toMatchObject({
+    type: "run.failed",
+    payload: { error: "interrupted by SIGTERM" },
+  });
 });
 
 test("a new session passes no resume", async () => {
@@ -593,7 +651,7 @@ function api(...replies: DecisionReply[]) {
       apiBaseUrl: "https://api.test",
       agentToken: "agent-secret",
       warn: () => {},
-      retryDelayMs: 0,
+      sleep: async () => {},
     }),
     awaitDecision: createDecisionWaiter({
       apiBaseUrl: "https://api.test",

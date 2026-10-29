@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { createPoster } from "./events.js";
+import { holdSprite } from "./keepalive.js";
 import { createDecisionWaiter } from "./requests.js";
 import { runSession } from "./session.js";
 
@@ -17,7 +18,7 @@ async function main(): Promise<void> {
     return;
   }
 
-  // the first SIGTERM/SIGINT aborts the session and lets the run report and commit; a second one kills at once
+  // the first SIGTERM/SIGINT/SIGHUP aborts the session and lets the run report and commit; a second one kills at once
   const controller = new AbortController();
   let caught: NodeJS.Signals | undefined;
   const onSignal = (signal: NodeJS.Signals) => {
@@ -26,6 +27,10 @@ async function main(): Promise<void> {
   };
   process.once("SIGTERM", onSignal);
   process.once("SIGINT", onSignal);
+  // a hangup from the exec session that started the runner is a stop, not a death
+  process.once("SIGHUP", onSignal);
+  // held through waits for a decision too: a paused sprite drops the long-poll and the event posts
+  const hold = holdSprite({ name: config.runId, warn });
 
   try {
     process.exitCode = await runSession(config, {
@@ -38,6 +43,8 @@ async function main(): Promise<void> {
   } finally {
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
+    process.off("SIGHUP", onSignal);
+    await hold.release();
   }
   // die by the signal so the caller sees the process was stopped, not that it failed
   if (caught) process.kill(process.pid, caught);
