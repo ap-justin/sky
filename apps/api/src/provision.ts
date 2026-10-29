@@ -6,8 +6,7 @@ import {
 } from "@harness/db";
 import type { EnvironmentId } from "@harness/shared";
 import { eq } from "drizzle-orm";
-import type { Config } from "./config.js";
-import { redact } from "./redact.js";
+import { type KnownSecrets, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
 import {
   checkpointSprite,
@@ -31,7 +30,7 @@ class StepFailed extends Error {}
 
 type Deps = {
   db: Db;
-  config: Config;
+  secrets: KnownSecrets;
   sprites: SpritesClient;
   log: (line: string) => void;
 };
@@ -41,7 +40,7 @@ type Target = { id: EnvironmentId; repo: string; setup: string };
  * Runs provisioning as in-process background jobs. A failure lands in `failure_step` and
  * `failure_stderr`: the failed command's stderr tail, or the Sprites error for create/checkpoint.
  */
-export function createProvisioner({ db, config, sprites, log }: Deps) {
+export function createProvisioner({ db, secrets, sprites, log }: Deps) {
   async function run(env: Target, fresh: boolean): Promise<void> {
     const name = spriteNameFor(env.id);
     const exec = async (argv: [string, ...string[]], cwd?: string) => {
@@ -75,7 +74,7 @@ export function createProvisioner({ db, config, sprites, log }: Deps) {
         .set({
           status: "failed",
           failureStep: step,
-          failureStderr: redact(detail, config).slice(-TAIL_CHARS),
+          failureStderr: redact(detail, secrets.values()).slice(-TAIL_CHARS),
         })
         .where(eq(environments.id, env.id))
         .run();

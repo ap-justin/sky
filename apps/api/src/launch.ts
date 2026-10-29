@@ -7,7 +7,7 @@ import { eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";
 import { REPO_DIR, RUNNER_DIR, WORKTREES_DIR } from "./provision.js";
-import { redact } from "./redact.js";
+import { type KnownSecrets, redact } from "./redact.js";
 import { failRun, isActive } from "./runs.js";
 import { execInSprite, startDetached, writeSpriteFile } from "./sprites.js";
 
@@ -81,6 +81,7 @@ export async function removeWorktree(
 type Deps = {
   db: Db;
   config: Config;
+  secrets: KnownSecrets;
   sprites: SpritesClient;
   log: (line: string) => void;
 };
@@ -94,7 +95,7 @@ export type Launch = {
 };
 
 /** Starts runners in the background; a launch that fails fails its run with a redacted `launch_failed` error. */
-export function createLauncher({ db, config, sprites, log }: Deps) {
+export function createLauncher({ db, config, secrets, sprites, log }: Deps) {
   let bundle: Promise<{ bytes: Buffer; sha256: string }> | undefined;
   // read once: the bundle ships with this build of the API
   const loadBundle = () => {
@@ -168,8 +169,7 @@ export function createLauncher({ db, config, sprites, log }: Deps) {
           // the SDK's socket errors quote the session URL, which carries the env
           const detail = redact(
             err instanceof Error ? err.message : String(err),
-            config,
-            agentToken,
+            [...secrets.values(), agentToken],
           );
           log(`launching ${launch.runId} failed: ${detail}`);
           db.transaction(

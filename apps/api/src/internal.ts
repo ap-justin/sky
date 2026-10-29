@@ -6,10 +6,10 @@ import {
   type RunStatus,
 } from "@harness/shared";
 import { eq, inArray } from "drizzle-orm";
-import { isAgentTokenFor } from "./agent-token.js";
+import { isAgentTokenFor, mintAgentToken } from "./agent-token.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
-import { redact } from "./redact.js";
+import { redactDeep } from "./redact.js";
 import { activeRunStatuses, agentStatusFor, isActive } from "./runs.js";
 import { body, jsonBody } from "./validation.js";
 
@@ -37,7 +37,7 @@ export function internalRoutes() {
     })
     .post("/events", jsonBody, body(RunnerEventPost), (c) => {
       const event = c.req.valid("json");
-      const { db, config } = c.var;
+      const { db, config, secrets } = c.var;
       const token = bearer(c.req.header("authorization")) ?? "";
       const outcome = db.transaction(
         (tx) => {
@@ -61,30 +61,37 @@ export function internalRoutes() {
           if (next && !canTransition(run.status, next)) {
             return { kind: "illegal", from: run.status, to: next } as const;
           }
-          // Claude's output can echo its own environment
-          const payload = JSON.parse(
-            redact(JSON.stringify(event.payload), config, token),
-          ) as object;
+          // Claude's output can echo its own environment, or any other live runner's on its sprite
+          const liveTokens = tx
+            .select({ id: runs.id })
+            .from(runs)
+            .where(inArray(runs.status, activeRunStatuses))
+            .all()
+            .map((r) => mintAgentToken(config.apiKey, r.id));
+          const redacted = redactDeep(event, [
+            ...secrets.values(),
+            ...liveTokens,
+          ]);
           const { id } = tx
             .insert(events)
             .values({
               runId: run.id,
               ts: new Date().toISOString(),
               type: event.type,
-              payload,
+              payload: redacted.payload,
             })
             .returning({ id: events.id })
             .get();
           if (next) {
             const usage =
-              event.type === "run.finished" || event.type === "run.failed"
-                ? event.payload.usage
+              redacted.type === "run.finished" || redacted.type === "run.failed"
+                ? redacted.payload.usage
                 : undefined;
             tx.update(runs)
               .set({
                 status: next,
-                ...(event.type === "run.finished"
-                  ? { summary: redact(event.payload.summary, config, token) }
+                ...(redacted.type === "run.finished"
+                  ? { summary: redacted.payload.summary }
                   : {}),
                 ...(usage ?? {}),
               })

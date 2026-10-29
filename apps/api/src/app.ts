@@ -12,6 +12,7 @@ import { factory } from "./factory.js";
 import { internalRoutes } from "./internal.js";
 import { createLauncher } from "./launch.js";
 import { createProvisioner } from "./provision.js";
+import { KnownSecrets } from "./redact.js";
 
 export type AppDeps = {
   db: Db;
@@ -25,8 +26,9 @@ export function createApp({ db, config, sprites, log }: AppDeps) {
   const unauthorized = (message: string) => (c: Context) =>
     apiError(c, 401, "unauthorized", message);
 
-  const provisioner = createProvisioner({ db, config, sprites, log });
-  const launcher = createLauncher({ db, config, sprites, log });
+  const secrets = KnownSecrets.fromConfig(config);
+  const provisioner = createProvisioner({ db, secrets, sprites, log });
+  const launcher = createLauncher({ db, config, secrets, sprites, log });
   const v1 = factory
     .createApp()
     .route("/environments", environmentRoutes(provisioner, sprites, log))
@@ -38,6 +40,7 @@ export function createApp({ db, config, sprites, log }: AppDeps) {
     .use(async (c, next) => {
       c.set("db", db);
       c.set("config", config);
+      c.set("secrets", secrets);
       await next();
     })
     .get("/healthz", (c) => {

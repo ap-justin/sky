@@ -486,6 +486,34 @@ test("secrets a runner echoes are redacted before the event is stored", async ()
   expect(stored).toContain("AGENT_TOKEN=[redacted]");
 });
 
+test("a credential in a nested payload field is redacted, even at the start of a line", async () => {
+  const { run, token } = await runningRun();
+  const pat = `ghp_${"a1B2".repeat(9)}`;
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: {
+        kind: "question",
+        requestId: "req_1",
+        prompt: `push with which token?\n${pat}`,
+      },
+    },
+  });
+  expect(res.status).toBe(201);
+  const row = db.$client
+    .prepare("select payload from events where type = 'run.waiting'")
+    .get() as { payload: string };
+  expect(JSON.parse(row.payload)).toMatchObject({
+    request: { prompt: "push with which token?\n[redacted]" },
+  });
+});
+
 async function finishedRun() {
   const r = await runningRun();
   await postEvent(r.token, {
@@ -522,6 +550,76 @@ test("GET of an ended run returns its branch and its diff against the env's base
   });
   expect(wire.calls.at(-1)).toBe(
     `exec harness-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
+  );
+});
+
+test("after runs with planted secrets, no stored event, run or agent row holds any of them", async () => {
+  const a = await runningRun();
+  const b = await runningRun();
+  const platform = [
+    "sk-ant-oat01-AbCdEf0123456789_xyz-AbCdEf",
+    "sk-proj-0123456789abcdefABCDEF",
+    `ghp_${"a1B2".repeat(9)}`,
+    `github_pat_11ABC${"x9".repeat(20)}`,
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U",
+    config.apiKey,
+    config.spritesToken,
+    config.claudeOauthToken,
+    config.publicBaseUrl,
+  ];
+  // a runner can read any live runner's env on its sprite, never a token already revoked
+  const whileBothLive = [...platform, a.token, b.token].join("\n");
+  const steps = [
+    [a, { type: "run.started", payload: { sessionId: "s1" } }],
+    [b, { type: "run.started", payload: { sessionId: "s2" } }],
+    [
+      a,
+      {
+        type: "run.waiting",
+        payload: {
+          request: {
+            kind: "approval",
+            requestId: "req_1",
+            toolName: "Bash",
+            toolSummary: whileBothLive,
+          },
+        },
+      },
+    ],
+    [b, { type: "run.progress", payload: { message: whileBothLive } }],
+    [b, { type: "run.finished", payload: { summary: whileBothLive, usage } }],
+    [
+      a,
+      {
+        type: "run.failed",
+        payload: { error: [...platform, a.token].join("\n"), usage },
+      },
+    ],
+  ] as const;
+  for (const [{ run, token }, event] of steps) {
+    const res = await postEvent(token, { runId: run.id, ...event });
+    expect(res.status).toBe(201);
+  }
+  const stored = JSON.stringify([
+    db.$client.prepare("select * from events").all(),
+    db.$client.prepare("select * from runs").all(),
+    db.$client.prepare("select * from agents").all(),
+  ]);
+  for (const secret of [...platform, a.token, b.token]) {
+    expect(stored).not.toContain(secret);
+  }
+  expect(stored).toContain("[redacted]");
+});
+
+test("GET redacts credentials and the run's own agent token from the diff", async () => {
+  const { agent, run, token } = await finishedRun();
+  const key = "sk-proj-0123456789abcdefABCDEF";
+  wire.exec = () => ({
+    exitCode: 0,
+    stdout: `+API_KEY=${key}\n+AGENT_TOKEN=${token}\n+PORT=8080\n`,
+  });
+  expect((await getRun(agent.id, run.id)).body.diff).toBe(
+    "+API_KEY=[redacted]\n+AGENT_TOKEN=[redacted]\n+PORT=8080\n",
   );
 });
 

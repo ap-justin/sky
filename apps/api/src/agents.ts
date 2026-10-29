@@ -5,11 +5,13 @@ import { zValidator } from "@hono/zod-validator";
 import { and, count, eq, inArray } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
+import { mintAgentToken } from "./agent-token.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import { type Launcher, removeWorktree, signalRunner } from "./launch.js";
 import { REPO_DIR } from "./provision.js";
+import { redact } from "./redact.js";
 import {
   activeRunOf,
   activeRunStatuses,
@@ -335,7 +337,13 @@ export function agentRoutes(
             { cwd: REPO_DIR },
           );
           // nonzero: the runner never created the branch (a launch that failed)
-          if (out.exitCode === 0) diff = out.stdout;
+          if (out.exitCode === 0) {
+            // the worktree's files are Claude's to write, and it can write what it read from its env
+            diff = redact(out.stdout, [
+              ...c.var.secrets.values(),
+              mintAgentToken(c.var.config.apiKey, run.id),
+            ]);
+          }
         } catch (err) {
           log(`diff of ${run.id} failed: ${err}`);
           return apiError(
