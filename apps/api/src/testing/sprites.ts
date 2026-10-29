@@ -216,6 +216,14 @@ export function stubSprites() {
         { headers: { "content-type": "application/x-ndjson" } },
       );
     }),
+    http.get(`${SPRITES}/:name`, ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const name = String(params.name);
+      if (!wire.sprites.has(name)) {
+        return HttpResponse.json({ error: "not found" }, { status: 404 });
+      }
+      return HttpResponse.json({ id: `spr_${name}`, name, status: "warm" });
+    }),
     http.delete(`${SPRITES}/:name`, ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const name = String(params.name);

@@ -3,11 +3,17 @@ import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
 /** The one sprite an environment owns. */
 export const spriteNameFor = (envId: string) => `harness-${envId}`;
 
-export async function createSprite(
+/** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
+export async function ensureSprite(
   client: SpritesClient,
   name: string,
 ): Promise<void> {
-  await client.createSprite(name);
+  try {
+    await client.getSprite(name);
+  } catch (err) {
+    if (!(err instanceof APIError && err.statusCode === 404)) throw err;
+    await client.createSprite(name);
+  }
 }
 
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };

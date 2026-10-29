@@ -10,7 +10,7 @@ import { type KnownSecrets, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
 import {
   checkpointSprite,
-  createSprite,
+  ensureSprite,
   execInSprite,
   spriteNameFor,
 } from "./sprites.js";
@@ -41,7 +41,7 @@ type Target = { id: EnvironmentId; repo: string; setup: string };
  * `failure_stderr`: the failed command's stderr tail, or the Sprites error for create/checkpoint.
  */
 export function createProvisioner({ db, secrets, sprites, log }: Deps) {
-  async function run(env: Target, fresh: boolean): Promise<void> {
+  async function run(env: Target): Promise<void> {
     const name = spriteNameFor(env.id);
     const exec = async (argv: [string, ...string[]], cwd?: string) => {
       const out = await execInSprite(sprites, name, argv, { cwd });
@@ -51,7 +51,7 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
     };
     let step: (typeof environmentFailureSteps)[number] = "create";
     try {
-      if (fresh) await createSprite(sprites, name);
+      await ensureSprite(sprites, name);
       step = "clone";
       await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR]);
       await exec(["git", "clone", cloneUrl(env.repo), REPO_DIR]);
@@ -82,9 +82,9 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
   }
 
   return {
-    /** Starts provisioning without waiting; `fresh` creates the sprite first. The caller clears any previous failure. */
-    start(env: Target, { fresh }: { fresh: boolean }): void {
-      run(env, fresh).catch((err: unknown) => {
+    /** Starts provisioning without waiting. The caller clears any previous failure. */
+    start(env: Target): void {
+      run(env).catch((err: unknown) => {
         log(`provisioning ${env.id} could not record its outcome: ${err}`);
       });
     },

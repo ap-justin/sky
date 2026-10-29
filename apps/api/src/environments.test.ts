@@ -3,6 +3,7 @@ import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@harness/db";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
+import { failInterruptedProvisioning } from "./provision.js";
 import {
   type SpritesWire,
   spritesToken,
@@ -533,6 +534,35 @@ test("retry of a create failure recreates the sprite before cloning", async () =
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
   expect(wire.calls[0]).toBe(`create harness-${id}`);
+});
+
+/** A ready env whose provisioning a restart then interrupted, as boot records it: failed, no step. */
+const interruptedAtBoot = async () => {
+  const id = await ready();
+  db.$client
+    .prepare("update environments set status = 'provisioning' where id = ?")
+    .run(id);
+  failInterruptedProvisioning(db);
+  expect((await get(id)).body).toMatchObject({
+    status: "failed",
+    failure: null,
+  });
+  return id;
+};
+
+test("retry after a boot interruption creates the sprite it never got", async () => {
+  const id = await interruptedAtBoot();
+  wire.sprites.delete(`harness-${id}`);
+  expect((await retry(id)).status).toBe(202);
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+  expect(wire.calls[0]).toBe(`create harness-${id}`);
+});
+
+test("retry after a boot interruption keeps the sprite that exists", async () => {
+  const id = await interruptedAtBoot();
+  expect((await retry(id)).status).toBe(202);
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+  expect(wire.calls.filter((c) => c.startsWith("create"))).toEqual([]);
 });
 
 test("retry is 409 not_failed unless failed, 404 for an unknown env, 401 without a bearer", async () => {

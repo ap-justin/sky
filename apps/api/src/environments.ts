@@ -98,10 +98,6 @@ const reprovisioning = {
   failureStderr: null,
 } as const;
 
-// a sprite whose creation failed doesn't exist, so the rerun starts by creating it
-const needsFreshSprite = (env: EnvRow) =>
-  env.status === "failed" && env.failureStep === "create";
-
 const envParam = zValidator(
   "param",
   z.object({ id: EnvironmentId }),
@@ -152,7 +148,7 @@ export function environmentRoutes(
       if ("kind" in row) {
         return apiError(c, 409, "name_taken", nameTakenMessage);
       }
-      provisioner.start(row, { fresh: true });
+      provisioner.start(row);
       c.header("Location", `/v1/environments/${id}`);
       return c.json(present(row), 202);
     })
@@ -183,7 +179,6 @@ export function environmentRoutes(
             ) {
               return nameTakenResult;
             }
-            const fresh = needsFreshSprite(env);
             const changes = reprovision
               ? { ...patch, ...reprovisioning }
               : patch;
@@ -197,7 +192,7 @@ export function environmentRoutes(
                     .where(eq(environments.id, id))
                     .returning()
                     .get();
-            return { kind: "updated", row, reprovision, fresh } as const;
+            return { kind: "updated", row, reprovision } as const;
           },
           { behavior: "immediate" },
         ),
@@ -213,7 +208,7 @@ export function environmentRoutes(
           return apiError(c, 409, "name_taken", nameTakenMessage);
       }
       if (outcome.reprovision) {
-        provisioner.start(outcome.row, { fresh: outcome.fresh });
+        provisioner.start(outcome.row);
         return c.json(present(outcome.row), 202);
       }
       return c.json(present(outcome.row), 200);
@@ -231,11 +226,7 @@ export function environmentRoutes(
             .where(eq(environments.id, id))
             .returning()
             .get();
-          return {
-            kind: "retrying",
-            row,
-            fresh: needsFreshSprite(env),
-          } as const;
+          return { kind: "retrying", row } as const;
         },
         { behavior: "immediate" },
       );
@@ -250,7 +241,7 @@ export function environmentRoutes(
             "only a failed environment can be retried",
           );
       }
-      provisioner.start(outcome.row, { fresh: outcome.fresh });
+      provisioner.start(outcome.row);
       return c.json(present(outcome.row), 202);
     })
     .delete("/:id", envParam, async (c) => {
