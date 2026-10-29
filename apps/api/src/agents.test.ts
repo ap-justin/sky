@@ -1360,3 +1360,145 @@ test("GET agent without a bearer gets 401", async () => {
   const res = await app.request(`/v1/agents/${agent.id}`);
   expect(res.status).toBe(401);
 });
+
+const rawEnvVars = () =>
+  db.$client
+    .prepare("select * from run_env_vars order by run_id, name")
+    .all() as Record<string, unknown>[];
+
+const envVarValue = "opaque-envvar-value-0099";
+
+test("launch envVars reach that run's env file, are stored encrypted until their TTL, and join the audit", async () => {
+  const envId = readyEnv();
+  await putSecret(envId, "B_SECRET", { value: "env-secret-value-1" });
+  const before = Date.now();
+  const res = await launch({
+    envId,
+    prompt: "go",
+    envVars: { A_VAR: envVarValue, B_SECRET: "overrides-the-env-one" },
+    ttlSeconds: 600,
+  });
+  expect(res.status).toBe(202);
+  const { agent, run } = (await res.json()) as Launched;
+  await sessionOpened();
+  expect(envFileOf(wire, wire.sessions[0])).toEqual({
+    A_VAR: envVarValue,
+    B_SECRET: "overrides-the-env-one",
+    CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
+    AGENT_TOKEN: expect.any(String),
+  });
+  const rows = rawEnvVars();
+  expect(rows.map((r) => r.name)).toEqual(["A_VAR", "B_SECRET"]);
+  const expiresAt = Date.parse(String(rows[0]?.expires_at));
+  expect(expiresAt).toBeGreaterThanOrEqual(before + 600_000);
+  expect(expiresAt).toBeLessThanOrEqual(Date.now() + 600_000);
+  const raw = rows
+    .map((r) => (r.ciphertext as Buffer).toString("latin1"))
+    .join();
+  expect(raw).not.toContain(envVarValue);
+  expect(raw).not.toContain("overrides");
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.secretNames).toEqual([
+      "A_VAR",
+      "B_SECRET",
+    ]),
+  );
+});
+
+test("ttlSeconds defaults to an hour", async () => {
+  const before = Date.now();
+  await launch({ envId: readyEnv(), prompt: "go", envVars: { X: "y" } });
+  await sessionOpened();
+  const expiresAt = Date.parse(String(rawEnvVars()[0]?.expires_at));
+  expect(expiresAt).toBeGreaterThanOrEqual(before + 3_600_000);
+  expect(expiresAt).toBeLessThanOrEqual(Date.now() + 3_600_000);
+});
+
+test("follow-up envVars are injected into that run only", async () => {
+  const { agent } = await finishedRun();
+  const res = await followUp(agent.id, {
+    prompt: "more",
+    envVars: { ONLY_HERE: envVarValue },
+  });
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened(2);
+  const second = envFileOf(wire, wire.sessions[1]);
+  expect(second).toMatchObject({ ONLY_HERE: envVarValue });
+  expect(envFileOf(wire, wire.sessions[0])).not.toHaveProperty("ONLY_HERE");
+  await postEvent(second.AGENT_TOKEN ?? "", {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  await postEvent(second.AGENT_TOKEN ?? "", {
+    runId: run.id,
+    type: "run.finished",
+    payload: { summary: "done", usage },
+  });
+  await followUpRun(agent.id, 3);
+  expect(envFileOf(wire, wire.sessions[2])).not.toHaveProperty("ONLY_HERE");
+});
+
+test("an envVar a runner echoes is redacted from the stored event while it is held", async () => {
+  const res = await launch({
+    envId: readyEnv(),
+    prompt: "go",
+    envVars: { TOKEN: envVarValue },
+  });
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened();
+  const token = envFileOf(wire, wire.sessions[0]).AGENT_TOKEN ?? "";
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.progress",
+    payload: { message: `echo ${envVarValue}` },
+  });
+  const stored = JSON.stringify(
+    db.$client.prepare("select * from events").all(),
+  );
+  expect(stored).not.toContain(envVarValue);
+  expect(stored).toContain("echo [redacted]");
+});
+
+test.each([
+  ["a reserved name", { envVars: { PATH: "/evil" } }, "reserved_name"],
+  ["a harness name", { envVars: { AGENT_TOKEN: "x" } }, "reserved_name"],
+  ["an invalid name", { envVars: { "1X": "y" } }, "invalid_body"],
+  [
+    "a TTL over a day",
+    { envVars: { X: "y" }, ttlSeconds: 86_401 },
+    "invalid_body",
+  ],
+  ["a zero TTL", { envVars: { X: "y" }, ttlSeconds: 0 }, "invalid_body"],
+  [
+    "a fractional TTL",
+    { envVars: { X: "y" }, ttlSeconds: 1.5 },
+    "invalid_body",
+  ],
+])(
+  "launch envVars with %s get 400 and launch nothing",
+  async (_, extra, code) => {
+    const envId = readyEnv();
+    const res = await launch({ envId, prompt: "go", ...extra });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: { code } });
+    expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+      n: 0,
+    });
+    expect(rawEnvVars()).toEqual([]);
+  },
+);
+
+test("a follow-up with a reserved envVar name gets 400 and starts nothing", async () => {
+  const { agent } = await finishedRun();
+  const res = await followUp(agent.id, {
+    prompt: "more",
+    envVars: { HOME: "/tmp" },
+  });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toMatchObject({ error: { code: "reserved_name" } });
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+});

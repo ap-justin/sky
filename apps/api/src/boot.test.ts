@@ -12,9 +12,11 @@ import {
 } from "@harness/db";
 import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
 import { HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
+import { mintAgentToken } from "./agent-token.js";
 import { boot, shutdown } from "./boot.js";
+import { runEnvVarAad, seal } from "./crypto.js";
 import { testConfig } from "./testing/sprites.js";
 
 let dir: string;
@@ -25,6 +27,7 @@ beforeEach(() => {
   stops = [];
 });
 afterEach(async () => {
+  vi.useRealTimers();
   for (const stop of stops) await stop();
   if (db?.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
@@ -172,4 +175,62 @@ test("a webhook delivery a previous process left pending is sent after boot", as
   await expect
     .poll(() => db?.select().from(webhookDeliveries).get()?.status)
     .toBe("delivered");
+});
+
+test("the sweep deletes envVars once their TTL passes, and redacts them only while held", async () => {
+  vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+  vi.setSystemTime(new Date("2026-10-30T12:00:00.000Z"));
+  const first = booted().db;
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'harness-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_a', 'env_a', 'claude/agt_a', 'running');
+    insert into runs (id, agent_id, status, created_at) values ('run_a', 'agt_a', 'running', '2026-10-30T12:00:00.000Z');
+  `);
+  const held = (name: string, value: string, expiresAt: string) => {
+    const s = seal(
+      config().secretEncryptionKey,
+      value,
+      runEnvVarAad("run_a", name),
+    );
+    first.$client
+      .prepare(
+        "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at) values ('run_a', ?, ?, ?, ?, ?)",
+      )
+      .run(name, s.ciphertext, s.nonce, s.keyVersion, expiresAt);
+  };
+  held("SHORT", "short-lived-value-01", "2026-10-30T12:00:30.000Z");
+  held("LONG", "long-lived-value-02", "2026-10-30T13:00:00.000Z");
+  first.$client.close();
+
+  // long enough that the run itself stays live across the sweep
+  const b = boot(testConfig({ dataDir: dir }), () => {});
+  stops.push(b.stopSweeping, b.stopDelivering);
+  db = b.db;
+  const echo = async (message: string) => {
+    const res = await b.app.request("/internal/events", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${mintAgentToken(config().apiKey, "run_a")}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        runId: "run_a",
+        type: "run.progress",
+        payload: { message },
+      }),
+    });
+    expect(res.status).toBeLessThan(300);
+    const last = db?.$client
+      .prepare("select payload from events order by id desc limit 1")
+      .get() as { payload: string };
+    return JSON.parse(last.payload).message;
+  };
+  expect(await echo("short-lived-value-01")).toBe("[redacted]");
+
+  vi.advanceTimersByTime(60_000);
+  expect(db.$client.prepare("select name from run_env_vars").all()).toEqual([
+    { name: "LONG" },
+  ]);
+  expect(await echo("short-lived-value-01")).toBe("short-lived-value-01");
+  expect(await echo("long-lived-value-02")).toBe("[redacted]");
 });

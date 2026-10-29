@@ -1,13 +1,20 @@
-import { type Db, environments, secrets } from "@harness/db";
-import { EnvironmentId } from "@harness/shared";
+import { type Db, environments, runEnvVars, secrets } from "@harness/db";
+import { EnvironmentId, type RunId } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
-import { and, asc, eq, isNotNull } from "drizzle-orm";
+import { and, asc, eq, isNotNull, lte } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
-import { envSecretAad, open, type Sealed, seal } from "./crypto.js";
+import {
+  envSecretAad,
+  open,
+  runEnvVarAad,
+  type Sealed,
+  seal,
+} from "./crypto.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import type { KnownSecrets } from "./redact.js";
+import type { Tx } from "./runs.js";
 import { body, jsonBody } from "./validation.js";
 
 /** Matches the DB's name CHECK on `secrets` and `run_env_vars`. */
@@ -91,7 +98,74 @@ export function openEnvSecrets(
   );
 }
 
-/** Registers every stored env value secret with redaction. */
+/** A run's envVars, decrypted; one purged after its TTL is gone. */
+export function openRunEnvVars(
+  db: Db,
+  key: Buffer,
+  runId: RunId,
+): Map<string, string> {
+  const rows = db
+    .select()
+    .from(runEnvVars)
+    .where(eq(runEnvVars.runId, runId))
+    .all();
+  return new Map(
+    rows.map((row) => [
+      row.name,
+      open(key, row, runEnvVarAad(runId, row.name)),
+    ]),
+  );
+}
+
+/** Stores a run's envVars sealed, expiring `ttlSeconds` from now. */
+export function storeRunEnvVars(
+  tx: Tx,
+  key: Buffer,
+  runId: RunId,
+  envVars: Record<string, string>,
+  ttlSeconds: number,
+): void {
+  const entries = Object.entries(envVars);
+  if (entries.length === 0) return;
+  const expiresAt = new Date(Date.now() + ttlSeconds * 1000).toISOString();
+  tx.insert(runEnvVars)
+    .values(
+      entries.map(([name, value]) => ({
+        runId,
+        name,
+        expiresAt,
+        ...seal(key, value, runEnvVarAad(runId, name)),
+      })),
+    )
+    .run();
+}
+
+/** Registers a run's envVars with redaction, until `purgeExpiredEnvVars` drops them. */
+export function registerRunEnvVars(
+  known: KnownSecrets,
+  runId: RunId,
+  envVars: Record<string, string>,
+): void {
+  for (const [name, value] of Object.entries(envVars)) {
+    known.add(runEnvVarAad(runId, name), value);
+  }
+}
+
+/** Deletes envVars past their expiry and drops them from redaction. */
+export function purgeExpiredEnvVars(
+  db: Db,
+  known: KnownSecrets,
+  now: Date,
+): void {
+  const purged = db
+    .delete(runEnvVars)
+    .where(lte(runEnvVars.expiresAt, now.toISOString()))
+    .returning({ runId: runEnvVars.runId, name: runEnvVars.name })
+    .all();
+  for (const { runId, name } of purged) known.remove(runEnvVarAad(runId, name));
+}
+
+/** Registers every stored env value secret and every held run envVar with redaction. */
 export function registerStoredValues(
   db: Db,
   key: Buffer,
@@ -108,6 +182,10 @@ export function registerStoredValues(
       envSecretKey(row.envId, row.name, sealed.nonce),
       open(key, sealed, envSecretAad(row.envId, row.name)),
     );
+  }
+  for (const row of db.select().from(runEnvVars).all()) {
+    const aad = runEnvVarAad(row.runId, row.name);
+    known.add(aad, open(key, row, aad));
   }
 }
 

@@ -31,12 +31,31 @@ import {
   stopActiveRun,
   type Tx,
 } from "./runs.js";
+import {
+  EnvVarName,
+  isReservedName,
+  registerRunEnvVars,
+  reservedName,
+  storeRunEnvVars,
+} from "./secrets.js";
 import { execInSprite } from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
 
 const Prompt = z.string().min(1);
-const LaunchInput = z.strictObject({ envId: EnvironmentId, prompt: Prompt });
-const FollowUpInput = z.strictObject({ prompt: Prompt });
+/** Values injected into one run only, held encrypted until `ttlSeconds` pass. */
+const RunEnv = {
+  envVars: z.record(EnvVarName, z.string()).default({}),
+  ttlSeconds: z.int().min(1).max(86_400).default(3600),
+};
+const LaunchInput = z.strictObject({
+  envId: EnvironmentId,
+  prompt: Prompt,
+  ...RunEnv,
+});
+const FollowUpInput = z.strictObject({ prompt: Prompt, ...RunEnv });
+
+const reservedIn = (envVars: Record<string, string>) =>
+  Object.keys(envVars).find(isReservedName);
 const AnswerInput = z.strictObject({
   requestId: RequestId,
   answer: z.string().min(1),
@@ -197,7 +216,9 @@ export function agentRoutes(
   return factory
     .createApp()
     .post("/", jsonBody, body(LaunchInput), (c) => {
-      const { envId, prompt } = c.req.valid("json");
+      const { envId, prompt, envVars, ttlSeconds } = c.req.valid("json");
+      const reserved = reservedIn(envVars);
+      if (reserved) return reservedName(c, reserved);
       const agentId = mintId("agt");
       const runId = mintId("run");
       const outcome = c.var.db.transaction(
@@ -227,6 +248,13 @@ export function agentRoutes(
             .values({ id: runId, agentId, status: "starting" })
             .returning()
             .get();
+          storeRunEnvVars(
+            tx,
+            c.var.config.secretEncryptionKey,
+            runId,
+            envVars,
+            ttlSeconds,
+          );
           return { kind: "created", env, agent, run } as const;
         },
         { behavior: "immediate" },
@@ -244,6 +272,7 @@ export function agentRoutes(
         case "at_cap":
           return atCap(c, outcome.limit);
       }
+      registerRunEnvVars(c.var.secrets, runId, envVars);
       launcher.start({
         envId,
         spriteName: outcome.env.spriteName,
@@ -264,7 +293,9 @@ export function agentRoutes(
     })
     .post("/:id/runs", agentParam, jsonBody, body(FollowUpInput), (c) => {
       const { id } = c.req.valid("param");
-      const { prompt } = c.req.valid("json");
+      const { prompt, envVars, ttlSeconds } = c.req.valid("json");
+      const reserved = reservedIn(envVars);
+      if (reserved) return reservedName(c, reserved);
       const runId = mintId("run");
       const outcome = c.var.db.transaction(
         (tx) => {
@@ -287,6 +318,13 @@ export function agentRoutes(
             .values({ id: runId, agentId: id, status: "starting" })
             .returning()
             .get();
+          storeRunEnvVars(
+            tx,
+            c.var.config.secretEncryptionKey,
+            runId,
+            envVars,
+            ttlSeconds,
+          );
           const running = tx
             .update(agents)
             .set({ status: "running" })
@@ -319,6 +357,7 @@ export function agentRoutes(
         case "at_cap":
           return atCap(c, outcome.limit);
       }
+      registerRunEnvVars(c.var.secrets, runId, envVars);
       launcher.start({
         envId: outcome.env.id,
         spriteName: outcome.env.spriteName,

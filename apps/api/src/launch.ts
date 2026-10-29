@@ -9,7 +9,7 @@ import type { Config } from "./config.js";
 import { REPO_DIR, RUNNER_DIR, WORKTREES_DIR } from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import { failRun, isActive } from "./runs.js";
-import { openEnvSecrets } from "./secrets.js";
+import { openEnvSecrets, openRunEnvVars } from "./secrets.js";
 import { execInSprite, startDetached, writeSpriteFile } from "./sprites.js";
 
 const RUNNER = `${RUNNER_DIR}/runner.mjs`;
@@ -163,8 +163,13 @@ export function createLauncher({
     }
     const key = config.secretEncryptionKey;
     const envSecrets = openEnvSecrets(db, key, launch.envId);
+    const envVars = openRunEnvVars(db, key, launch.runId);
     db.update(runs)
-      .set({ secretNames: [...envSecrets.keys()].sort() })
+      .set({
+        secretNames: [
+          ...new Set([...envSecrets.keys(), ...envVars.keys()]),
+        ].sort(),
+      })
       .where(eq(runs.id, launch.runId))
       .run();
     const envFilePath = `/workspace/runs/${launch.runId}.env`;
@@ -174,6 +179,7 @@ export function createLauncher({
       envFilePath,
       envFile([
         ...envSecrets,
+        ...envVars,
         ["CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken],
         ["AGENT_TOKEN", agentToken],
       ]),
