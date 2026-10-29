@@ -1,4 +1,10 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  cpSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -6,9 +12,11 @@ import {
   EnvironmentStatus,
   EventType,
   RunStatus,
+  type WebhookId,
 } from "@harness/shared";
+import { migrate as drizzleMigrate } from "drizzle-orm/better-sqlite3/migrator";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { type Db, migrate, openDb } from "./index.js";
+import { type Db, migrate, openDb, webhooks } from "./index.js";
 
 let dir: string;
 let path: string;
@@ -147,4 +155,101 @@ test("migrate refuses a file migrated by newer code", () => {
     Date.now() + 86_400_000,
   );
   expect(() => migrate(db)).toThrow(/newer/);
+});
+
+// a copy of the migrations folder whose journal stops after `tag`, to build a file as an older release left it
+const migrateThrough = (tag: string) => {
+  const folder = join(dir, "drizzle");
+  cpSync(new URL("../drizzle", import.meta.url), folder, { recursive: true });
+  const journalPath = join(folder, "meta", "_journal.json");
+  const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+  const end = journal.entries.findIndex((e: { tag: string }) => e.tag === tag);
+  journal.entries = journal.entries.slice(0, end + 1);
+  writeFileSync(journalPath, JSON.stringify(journal));
+  drizzleMigrate(db, { migrationsFolder: folder });
+};
+
+const count = (table: string) =>
+  (db.$client.prepare(`select count(*) n from ${table}`).get() as { n: number })
+    .n;
+
+test("migrating a populated 0000 file keeps every row, cascade children included", () => {
+  migrateThrough("0000_init");
+  seedRun();
+  insertEvent();
+  run(
+    "insert into secrets (env_id, name, ciphertext, nonce, key_version) values ('env_1', 'K', x'00', x'00', 1)",
+  );
+  run(
+    "insert into webhooks (id, url, event_types) values ('wh_1', 'https://x', '[\"run.started\"]')",
+  );
+
+  migrate(db);
+
+  for (const table of TABLES) expect([table, count(table)]).toEqual([table, 1]);
+  const createdAt = db.$client
+    .prepare("select created_at from environments")
+    .pluck()
+    .get();
+  expect(createdAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+});
+
+test("environment failure columns accept the provisioning steps and stderr up to 4000 chars", () => {
+  migrate(db);
+  seedRun();
+  const fail = (step: string, stderr: string) =>
+    run(
+      "update environments set failure_step = ?, failure_stderr = ?",
+      step,
+      stderr,
+    );
+  for (const step of ["create", "clone", "setup", "checkpoint"])
+    expect(() => fail(step, "x".repeat(4000))).not.toThrow();
+  expect(() => fail("deploy", "")).toThrow(/CHECK constraint failed/);
+  expect(() => fail("setup", "x".repeat(4001))).toThrow(
+    /CHECK constraint failed/,
+  );
+});
+
+test("environment names are unique", () => {
+  migrate(db);
+  seedRun();
+  expect(() =>
+    run(
+      "insert into environments (id, name, repo, setup, status, sprite_name) values ('env_2', 'e', 'o/r', '', 'ready', 's')",
+    ),
+  ).toThrow(/UNIQUE constraint failed: environments.name/);
+});
+
+test("created_at is stamped as UTC ISO-8601 and rejects any other form", () => {
+  migrate(db);
+  seedRun();
+  for (const table of ["environments", "agents", "runs"]) {
+    const at = db.$client
+      .prepare(`select created_at from ${table}`)
+      .pluck()
+      .get();
+    expect(new Date(at as string).toISOString()).toBe(at);
+    expect(() =>
+      run(`update ${table} set created_at = '2026-10-29 12:00:00'`),
+    ).toThrow(/CHECK constraint failed/);
+  }
+  expect(() =>
+    run(
+      "insert into webhooks (id, url, event_types, created_at) values ('wh_1', 'https://x', '[\"run.started\"]', 'yesterday')",
+    ),
+  ).toThrow(/CHECK constraint failed/);
+});
+
+test("drizzle inserts stamp created_at without the caller passing it", () => {
+  migrate(db);
+  db.insert(webhooks)
+    .values({
+      id: "wh_1" as WebhookId,
+      url: "https://x",
+      eventTypes: ["run.started"],
+    })
+    .run();
+  const [row] = db.select().from(webhooks).all();
+  expect(row?.createdAt).toMatch(/Z$/);
 });

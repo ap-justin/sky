@@ -18,10 +18,29 @@ import {
   real,
   sqliteTable,
   text,
+  uniqueIndex,
 } from "drizzle-orm/sqlite-core";
 
 // bare column name: drizzle qualifies `${t.col}` with the table, which breaks the `__new_<table>` copy a rebuild creates
 const c = (column: AnyColumn) => sql.identifier(column.name);
+
+// UTC ISO-8601, the form `z.iso.datetime()` accepts
+const isoUtc = (column: AnyColumn) =>
+  sql`${c(column)} glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'`;
+
+// the provisioning step that failed; the CHECK on `failure_step` spells the same list
+export const environmentFailureSteps = [
+  "create",
+  "clone",
+  "setup",
+  "checkpoint",
+] as const;
+
+// stamped by the database, so no insert path can omit or misformat it
+const createdAt = () =>
+  text("created_at")
+    .notNull()
+    .default(sql`(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`);
 
 export const environments = sqliteTable(
   "environments",
@@ -38,8 +57,13 @@ export const environments = sqliteTable(
       .$type<string[]>()
       .notNull()
       .default([]),
+    failureStep: text("failure_step", { enum: environmentFailureSteps }),
+    // redacted and truncated by the API before it lands here
+    failureStderr: text("failure_stderr"),
+    createdAt: createdAt(),
   },
   (t) => [
+    uniqueIndex("environments_name").on(t.name),
     check(
       "environments_status",
       sql`${c(t.status)} in ('provisioning', 'ready', 'failed')`,
@@ -49,6 +73,15 @@ export const environments = sqliteTable(
       "environments_approval_policy",
       sql`json_type(${c(t.approvalPolicy)}) = 'array'`,
     ),
+    check(
+      "environments_failure_step",
+      sql`${c(t.failureStep)} in ('create', 'clone', 'setup', 'checkpoint')`,
+    ),
+    check(
+      "environments_failure_stderr",
+      sql`length(${c(t.failureStderr)}) <= 4000`,
+    ),
+    check("environments_created_at", isoUtc(t.createdAt)),
   ],
 );
 
@@ -63,6 +96,7 @@ export const agents = sqliteTable(
     sessionId: text("session_id"),
     branch: text().$type<`claude/${AgentId}`>().notNull(),
     status: text().$type<AgentStatus>().notNull(),
+    createdAt: createdAt(),
   },
   (t) => [
     index("agents_env_id").on(t.envId),
@@ -71,6 +105,7 @@ export const agents = sqliteTable(
       sql`${c(t.status)} in ('idle', 'running', 'waiting')`,
     ),
     check("agents_branch", sql`${c(t.branch)} = 'claude/' || ${c(t.id)}`),
+    check("agents_created_at", isoUtc(t.createdAt)),
   ],
 );
 
@@ -90,6 +125,7 @@ export const runs = sqliteTable(
     costUsd: real("cost_usd"),
     turns: integer(),
     durationMs: integer("duration_ms"),
+    createdAt: createdAt(),
   },
   (t) => [
     index("runs_agent_id").on(t.agentId),
@@ -102,6 +138,7 @@ export const runs = sqliteTable(
       sql`(${c(t.inputTokens)} is null and ${c(t.outputTokens)} is null and ${c(t.costUsd)} is null and ${c(t.turns)} is null and ${c(t.durationMs)} is null)
         or (${c(t.inputTokens)} >= 0 and ${c(t.outputTokens)} >= 0 and ${c(t.costUsd)} >= 0 and ${c(t.turns)} >= 0 and ${c(t.durationMs)} >= 0)`,
     ),
+    check("runs_created_at", isoUtc(t.createdAt)),
   ],
 );
 
@@ -125,11 +162,7 @@ export const events = sqliteTable(
       "events_type",
       sql`${c(t.type)} in ('run.started', 'run.progress', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped')`,
     ),
-    // UTC ISO-8601, the form `z.iso.datetime()` accepts
-    check(
-      "events_ts",
-      sql`${c(t.ts)} glob '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]*Z'`,
-    ),
+    check("events_ts", isoUtc(t.ts)),
     check("events_payload", sql`json_type(${c(t.payload)}) = 'object'`),
   ],
 );
@@ -142,12 +175,14 @@ export const webhooks = sqliteTable(
     eventTypes: text("event_types", { mode: "json" })
       .$type<[EventType, ...EventType[]]>()
       .notNull(),
+    createdAt: createdAt(),
   },
   (t) => [
     check(
       "webhooks_event_types",
       sql`json_type(${c(t.eventTypes)}) = 'array' and json_array_length(${c(t.eventTypes)}) > 0`,
     ),
+    check("webhooks_created_at", isoUtc(t.createdAt)),
   ],
 );
 
