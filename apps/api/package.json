@@ -5,10 +5,17 @@
   "exports": {
     ".": "./src/index.ts"
   },
+  "scripts": {
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node22 --external:better-sqlite3 --outfile=dist/bundle/main.js && rm -rf dist/drizzle && cp -R ../../db/drizzle dist/drizzle"
+  },
   "dependencies": {
     "@harness/db": "workspace:*",
     "@hono/node-server": "^2.1.5",
+    "better-sqlite3": "^12.11.1",
     "hono": "^4.13.14",
     "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
   }
 }

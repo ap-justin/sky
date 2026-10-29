@@ -1,0 +1,10 @@
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.git
+.claude
+.env*
+test
+fly.toml
+Dockerfile
+.dockerignore
