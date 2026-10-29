@@ -39,6 +39,43 @@ const activeRunStatuses = RunStatus.options.filter(
 type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type EnvRow = typeof environments.$inferSelect;
 
+const present = (row: EnvRow) => ({
+  ...({
+    id: row.id,
+    name: row.name,
+    repo: row.repo,
+    setup: row.setup,
+    status: row.status,
+    spriteName: row.spriteName,
+    checkpointId: row.checkpointId,
+    concurrency: row.concurrency,
+    approvalPolicy: row.approvalPolicy,
+  } satisfies Environment),
+  failure:
+    row.failureStep === null
+      ? null
+      : { step: row.failureStep, stderr: row.failureStderr ?? "" },
+  createdAt: row.createdAt,
+});
+
+const nameTakenResult = { kind: "name_taken" } as const;
+
+const isNameConflict = (err: unknown): boolean =>
+  err instanceof Error &&
+  (((err as { code?: unknown }).code === "SQLITE_CONSTRAINT_UNIQUE" &&
+    err.message.includes("environments.name")) ||
+    isNameConflict(err.cause));
+
+/** Runs a write, mapping a unique violation on name (a writer that won after our check) to name_taken. */
+function nameTakenOnConflict<T>(write: () => T): T | typeof nameTakenResult {
+  try {
+    return write();
+  } catch (err) {
+    if (isNameConflict(err)) return nameTakenResult;
+    throw err;
+  }
+}
+
 const findEnv = (tx: Db | Tx, id: EnvironmentId) =>
   tx.select().from(environments).where(eq(environments.id, id)).get();
 
@@ -98,42 +135,39 @@ export function environmentRoutes(
   sprites: SpritesClient,
   log: (line: string) => void,
 ) {
-  const present = (row: EnvRow) => ({
-    ...row,
-    failure: row.status === "failed" ? provisioner.failureOf(row.id) : null,
-  });
-
   return factory
     .createApp()
     .get("/", (c) => {
       const rows = c.var.db
         .select()
         .from(environments)
-        .orderBy(asc(environments.name))
+        .orderBy(asc(environments.createdAt), asc(environments.id))
         .all();
       return c.json({ data: rows.map(present) }, 200);
     })
     .post("/", jsonBody, body(EnvironmentInput), (c) => {
       const input = c.req.valid("json");
       const id = mintId("env");
-      const row = c.var.db.transaction(
-        (tx) => {
-          if (nameTaken(tx, input.name)) return undefined;
-          return tx
-            .insert(environments)
-            .values({
-              ...input,
-              id,
-              status: "provisioning",
-              spriteName: spriteNameFor(id),
-              checkpointId: null,
-            })
-            .returning()
-            .get();
-        },
-        { behavior: "immediate" },
+      const row = nameTakenOnConflict(() =>
+        c.var.db.transaction(
+          (tx) => {
+            if (nameTaken(tx, input.name)) return nameTakenResult;
+            return tx
+              .insert(environments)
+              .values({
+                ...input,
+                id,
+                status: "provisioning",
+                spriteName: spriteNameFor(id),
+                checkpointId: null,
+              })
+              .returning()
+              .get();
+          },
+          { behavior: "immediate" },
+        ),
       );
-      if (!row) {
+      if ("kind" in row) {
         return apiError(c, 409, "name_taken", nameTakenMessage);
       }
       provisioner.start(row, { fresh: true });
@@ -148,44 +182,51 @@ export function environmentRoutes(
     .patch("/:id", envParam, jsonBody, body(EnvironmentPatch), (c) => {
       const { id } = c.req.valid("param");
       const patch = c.req.valid("json");
-      const outcome = c.var.db.transaction(
-        (tx) => {
-          const env = findEnv(tx, id);
-          if (!env) return { kind: "not_found" } as const;
-          if (hasActiveRun(tx, id)) return { kind: "run_active" } as const;
-          const reprovision =
-            (patch.repo !== undefined && patch.repo !== env.repo) ||
-            (patch.setup !== undefined && patch.setup !== env.setup);
-          if (reprovision && env.status === "provisioning") {
-            return { kind: "provisioning" } as const;
-          }
-          if (
-            patch.name !== undefined &&
-            patch.name !== env.name &&
-            nameTaken(tx, patch.name)
-          ) {
-            return { kind: "name_taken" } as const;
-          }
-          // a sprite whose creation failed doesn't exist, so the rerun starts by creating it
-          const fresh =
-            env.status === "failed" &&
-            provisioner.failureOf(id)?.step === "create";
-          const changes = reprovision
-            ? { ...patch, status: "provisioning" as const, checkpointId: null }
-            : patch;
-          // drizzle refuses an update with nothing to set
-          const row =
-            Object.keys(changes).length === 0
-              ? env
-              : tx
-                  .update(environments)
-                  .set(changes)
-                  .where(eq(environments.id, id))
-                  .returning()
-                  .get();
-          return { kind: "updated", row, reprovision, fresh } as const;
-        },
-        { behavior: "immediate" },
+      const outcome = nameTakenOnConflict(() =>
+        c.var.db.transaction(
+          (tx) => {
+            const env = findEnv(tx, id);
+            if (!env) return { kind: "not_found" } as const;
+            if (hasActiveRun(tx, id)) return { kind: "run_active" } as const;
+            const reprovision =
+              (patch.repo !== undefined && patch.repo !== env.repo) ||
+              (patch.setup !== undefined && patch.setup !== env.setup);
+            if (reprovision && env.status === "provisioning") {
+              return { kind: "provisioning" } as const;
+            }
+            if (
+              patch.name !== undefined &&
+              patch.name !== env.name &&
+              nameTaken(tx, patch.name)
+            ) {
+              return nameTakenResult;
+            }
+            // a sprite whose creation failed doesn't exist, so the rerun starts by creating it
+            const fresh =
+              env.status === "failed" && env.failureStep === "create";
+            const changes = reprovision
+              ? {
+                  ...patch,
+                  status: "provisioning" as const,
+                  checkpointId: null,
+                  failureStep: null,
+                  failureStderr: null,
+                }
+              : patch;
+            // drizzle refuses an update with nothing to set
+            const row =
+              Object.keys(changes).length === 0
+                ? env
+                : tx
+                    .update(environments)
+                    .set(changes)
+                    .where(eq(environments.id, id))
+                    .returning()
+                    .get();
+            return { kind: "updated", row, reprovision, fresh } as const;
+          },
+          { behavior: "immediate" },
+        ),
       );
       switch (outcome.kind) {
         case "not_found":
@@ -242,7 +283,6 @@ export function environmentRoutes(
         },
         { behavior: "immediate" },
       );
-      provisioner.forget(id);
       return c.body(null, 204);
     });
 }

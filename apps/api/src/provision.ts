@@ -1,5 +1,9 @@
 import type { SpritesClient } from "@fly/sprites";
-import { type Db, environments } from "@harness/db";
+import {
+  type Db,
+  type environmentFailureSteps,
+  environments,
+} from "@harness/db";
 import type { EnvironmentId } from "@harness/shared";
 import { eq } from "drizzle-orm";
 import type { Config } from "./config.js";
@@ -13,11 +17,8 @@ import {
 } from "./sprites.js";
 
 export const REPO_DIR = "/workspace/repo";
+// ≤ the length CHECK on environments.failure_stderr in db/src/schema.ts
 const TAIL_CHARS = 4000;
-
-export type ProvisionStep = "create" | "clone" | "setup" | "checkpoint";
-/** `stderr` is the failed command's stderr tail, or the Sprites error for create/checkpoint; always redacted. */
-export type ProvisionFailure = { step: ProvisionStep; stderr: string };
 
 class StepFailed extends Error {}
 
@@ -30,12 +31,10 @@ type Deps = {
 type Target = { id: EnvironmentId; repo: string; setup: string };
 
 /**
- * Runs provisioning as in-process background jobs. Failures live in memory only (the table has no
- * column for them), so a failure recorded before a restart reads as null afterwards.
+ * Runs provisioning as in-process background jobs. A failure lands in `failure_step` and
+ * `failure_stderr`: the failed command's stderr tail, or the Sprites error for create/checkpoint.
  */
 export function createProvisioner({ db, config, sprites, log }: Deps) {
-  const failures = new Map<EnvironmentId, ProvisionFailure>();
-
   async function run(env: Target, fresh: boolean): Promise<void> {
     const name = spriteNameFor(env.id);
     const exec = async (argv: [string, ...string[]], cwd?: string) => {
@@ -44,7 +43,7 @@ export function createProvisioner({ db, config, sprites, log }: Deps) {
         throw new StepFailed(out.stderr || `exited with code ${out.exitCode}`);
       }
     };
-    let step: ProvisionStep = "create";
+    let step: (typeof environmentFailureSteps)[number] = "create";
     try {
       if (fresh) await createSprite(sprites, name);
       step = "clone";
@@ -64,27 +63,24 @@ export function createProvisioner({ db, config, sprites, log }: Deps) {
         .run();
     } catch (err) {
       const detail = err instanceof Error ? err.message : String(err);
-      failures.set(env.id, {
-        step,
-        stderr: redact(detail, config).slice(-TAIL_CHARS),
-      });
       db.update(environments)
-        .set({ status: "failed" })
+        .set({
+          status: "failed",
+          failureStep: step,
+          failureStderr: redact(detail, config).slice(-TAIL_CHARS),
+        })
         .where(eq(environments.id, env.id))
         .run();
     }
   }
 
   return {
-    /** Starts provisioning without waiting; `fresh` creates the sprite first. */
+    /** Starts provisioning without waiting; `fresh` creates the sprite first. The caller clears any previous failure. */
     start(env: Target, { fresh }: { fresh: boolean }): void {
-      failures.delete(env.id);
       run(env, fresh).catch((err: unknown) => {
         log(`provisioning ${env.id} could not record its outcome: ${err}`);
       });
     },
-    failureOf: (id: EnvironmentId) => failures.get(id) ?? null,
-    forget: (id: EnvironmentId) => failures.delete(id),
   };
 }
 

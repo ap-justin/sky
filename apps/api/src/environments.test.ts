@@ -169,6 +169,9 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     concurrency: 3,
     approvalPolicy: [],
     failure: null,
+    createdAt: expect.stringMatching(
+      /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/,
+    ),
   });
   expect(res.headers.get("location")).toBe(`/v1/environments/${created.id}`);
 
@@ -328,7 +331,7 @@ test.each([
   },
 );
 
-test("GET lists environments by name; an unknown or malformed id is 404", async () => {
+test("GET lists environments oldest first; an unknown or malformed id is 404", async () => {
   const b = (await (await post({ ...kru, name: "b" })).json()) as {
     id: string;
   };
@@ -337,10 +340,17 @@ test("GET lists environments by name; an unknown or malformed id is 404", async 
   };
   await settled(a.id);
   await settled(b.id);
+  // both can land in the same millisecond; pin the order the list must follow
+  db.$client
+    .prepare("update environments set created_at = ? where id = ?")
+    .run("2026-01-02T00:00:00.000Z", a.id);
+  db.$client
+    .prepare("update environments set created_at = ? where id = ?")
+    .run("2026-01-01T00:00:00.000Z", b.id);
   const res = await app.request("/v1/environments", { headers: auth });
   expect(res.status).toBe(200);
   const { data } = (await res.json()) as { data: { id: string }[] };
-  expect(data.map((e) => e.id)).toEqual([a.id, b.id]);
+  expect(data.map((e) => e.id)).toEqual([b.id, a.id]);
   for (const id of ["env_doesNotExist", "not-an-id"]) {
     const missing = await get(id);
     expect(missing.status).toBe(404);
@@ -529,4 +539,66 @@ test("DELETE of an env whose sprite never got created still removes the row", as
   await settled(id);
   expect((await del(id)).status).toBe(204);
   expect((await get(id)).status).toBe(404);
+});
+
+test("a failure is persisted, so it survives the app that recorded it", async () => {
+  wire.exec = (argv) =>
+    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  await settled(id);
+  expect(
+    db.$client
+      .prepare(
+        "select failure_step, failure_stderr from environments where id = ?",
+      )
+      .get(id),
+  ).toEqual({ failure_step: "setup", failure_stderr: "boom\n" });
+});
+
+test("a retry clears the previous failure while it provisions", async () => {
+  wire.exec = (argv) =>
+    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  await settled(id);
+  wire.exec = () => ({ exitCode: 0 });
+  const res = await patch(id, { setup: "true" });
+  expect(await res.json()).toMatchObject({
+    status: "provisioning",
+    failure: null,
+  });
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+});
+
+// stands in for a writer that commits the same name between the check and the write
+const raceOnName = (raced: string) =>
+  db.$client.exec(`
+    create temp trigger race before insert on environments when new.name = '${raced}'
+    begin
+      insert into environments (id, name, repo, setup, status, sprite_name)
+      values ('env_racer', '${raced}', 'acme/kru', '', 'ready', 'harness-env_racer');
+    end;
+    create temp trigger race_rename before update of name on environments when new.name = '${raced}'
+    begin
+      insert into environments (id, name, repo, setup, status, sprite_name)
+      values ('env_racer', '${raced}', 'acme/kru', '', 'ready', 'harness-env_racer');
+    end;`);
+
+test("a name another writer took between check and insert is still 409 name_taken", async () => {
+  raceOnName("kru");
+  const res = await post(kru);
+  expect(res.status).toBe(409);
+  expect(await res.json()).toEqual({
+    error: { code: "name_taken", message: expect.any(String) },
+  });
+  expect(wire.calls).toEqual([]);
+});
+
+test("a rename another writer raced to is still 409 name_taken", async () => {
+  const id = await ready();
+  raceOnName("taken");
+  const res = await patch(id, { name: "taken" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toEqual({
+    error: { code: "name_taken", message: expect.any(String) },
+  });
 });
