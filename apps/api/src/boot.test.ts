@@ -1,4 +1,7 @@
+import { once } from "node:events";
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import type { Server } from "node:http";
+import { type AddressInfo, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +14,9 @@ import {
   webhooks,
 } from "@harness/db";
 import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { serve } from "@hono/node-server";
+import { Hono } from "hono";
+import { streamSSE } from "hono/streaming";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -62,10 +68,35 @@ test("shutdown closes the server before the DB", async () => {
         done();
       }, 1);
     },
+    closeAllConnections() {},
   };
   await shutdown(server, db);
   order.push(`db open: ${db.$client.open}`);
   expect(order).toEqual(["server closed, db open: true", "db open: false"]);
+});
+
+test("shutdown with an open SSE stream closes it after the drain, well inside Fly's kill timeout", async () => {
+  db = booted().db;
+  const app = new Hono().get("/stream", (c) =>
+    streamSSE(c, async (stream) => {
+      await stream.writeSSE({ data: "open" });
+      while (!stream.aborted) await stream.sleep(20);
+    }),
+  );
+  const server = serve({ fetch: app.fetch, port: 0 }) as Server;
+  await once(server, "listening");
+  const { port } = server.address() as AddressInfo;
+  // a raw socket: MSW intercepts http and fetch, and would count the request as a leak
+  const socket = connect(port, "127.0.0.1");
+  socket.write(`GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n`);
+  await once(socket, "data");
+  const closed = once(socket, "close");
+
+  const started = Date.now();
+  await shutdown(server, db, 100);
+  await closed;
+  expect(Date.now() - started).toBeLessThan(1_000);
+  expect(db.$client.open).toBe(false);
 });
 
 test("an env a previous process left provisioning boots as failed; others keep their status", async () => {

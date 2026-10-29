@@ -28,6 +28,8 @@ export type AppDeps = {
   heartbeatMs?: number;
   /** How long the runner's decision long-poll waits before answering pending; 25 s unless a test shortens it. */
   longPollMs?: number;
+  /** How long a launch watches its runner for an exit at start; 3 s unless a test shortens it. */
+  launchWatchMs?: number;
   /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
   secrets?: KnownSecrets;
 };
@@ -40,6 +42,7 @@ export function createApp({
   nudgeDeliveries,
   heartbeatMs = 15_000,
   longPollMs = 25_000,
+  launchWatchMs = 3_000,
   secrets = KnownSecrets.fromConfig(config),
 }: AppDeps) {
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
@@ -55,6 +58,7 @@ export function createApp({
     sprites,
     log,
     nudgeDeliveries,
+    watchMs: launchWatchMs,
   });
   const apiKeyGuard = bearerAuth({
     token: config.apiKey,

@@ -40,6 +40,7 @@ beforeEach(() => {
     sprites: new SpritesClient(spritesToken),
     log: (line) => logs.push(line),
     nudgeDeliveries: () => {},
+    launchWatchMs: 50,
   });
 });
 afterEach(() => {
@@ -132,7 +133,9 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   const sprite = `harness-${envId}`;
   expect(wire.calls).toEqual([
     `exec ${sprite} - sha256sum /opt/harness/runner.mjs`,
-    `write ${sprite} /opt/harness/runner.mjs`,
+    // written beside it, then renamed over it: a node starting on the bundle never reads it half-written
+    `write ${sprite} /opt/harness/runner.mjs.${run.id}`,
+    `exec ${sprite} - mv -f /opt/harness/runner.mjs.${run.id} /opt/harness/runner.mjs`,
     `write ${sprite} /workspace/runs/${run.id}.prompt`,
     `write ${sprite} /workspace/runs/${run.id}.env`,
     expect.stringMatching(`^session ${sprite} /workspace/repo bash -c `),
@@ -147,7 +150,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   ).toBe("fix the flaky test");
 
   const [session] = wire.sessions;
-  // detachable: the process outlives the socket, which the API closes as soon as it opens
+  // detachable: the process outlives the socket, which the API closes once the launch window passes
   expect(session).toMatchObject({ detachable: true, tty: true });
   await vi.waitFor(() => expect(wire.openSockets).toBe(0));
   expect(session?.argv.join(" ")).toContain(
@@ -347,6 +350,45 @@ test("POST without a bearer gets 401 and launches nothing", async () => {
   });
   expect(res.status).toBe(401);
   expect(wire.calls).toEqual([]);
+});
+
+test("a runner that exits at launch fails the run with its exit code and output tail, redacted", async () => {
+  wire.sessionExit = {
+    output: `node: bad option: --frobnicate\r\ntoken ${config.claudeOauthToken}\r\n`,
+    code: 1,
+  };
+  const { agent, run } = await launched(readyEnv());
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
+  );
+  const { error } = (await getRun(agent.id, run.id)).body;
+  expect(error).toMatch(/^launch_failed: runner exited 1 at launch: /);
+  expect(error).toContain("node: bad option: --frobnicate");
+  expect(error).not.toContain(config.claudeOauthToken);
+  expect(
+    db.$client.prepare("select status from agents where id = ?").get(agent.id),
+  ).toEqual({ status: "idle" });
+});
+
+test("a runner that outlives the launch window is left running, with an explicit run-after-disconnect", async () => {
+  const { agent, run } = await launched(readyEnv());
+  await sessionOpened();
+  await vi.waitFor(() => expect(wire.openSockets).toBe(0));
+  expect(
+    new URL(wire.sessions[0]?.url ?? "").searchParams.get(
+      "max_run_after_disconnect",
+    ),
+  ).toBe("24h");
+  expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
+});
+
+test("a runner exiting 0 inside the launch window leaves its run to its own events", async () => {
+  wire.sessionExit = { output: "", code: 0 };
+  const { agent, run } = await launched(readyEnv());
+  await sessionOpened();
+  await vi.waitFor(() => expect(wire.openSockets).toBe(0));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
 });
 
 test("a launch the sprite rejects fails the run with a redacted error and frees the agent", async () => {
@@ -1073,8 +1115,7 @@ const action = (agentId: string, verb: "stop" | "archive") =>
     headers: auth,
   });
 
-const runnerPattern = (runId: string) =>
-  `^node /opt/harness/runner\\.mjs ${runId}$`;
+const runnerPattern = (runId: string) => `/opt/harness/runner\\.mjs ${runId}$`;
 
 test("stop SIGTERMs the run's runner, marks the run stopped and frees its cap slot", async () => {
   const envId = readyEnv({ concurrency: 1 });
@@ -1110,6 +1151,57 @@ test("stop SIGTERMs the run's runner, marks the run stopped and frees its cap sl
   expect((await getRun(agent.id, run.id)).body.status).toBe("stopped");
   await launched(envId);
   await sessionOpened(2);
+});
+
+/** Answers the follow-up's wait for `runId`'s runner: exit 0 once it is gone, 1 while it lives. */
+function runnerAlive(runId: string, alive: () => boolean) {
+  const exec = wire.exec;
+  wire.exec = (argv) =>
+    argv[0] === "bash" && argv.at(-1) === runnerPattern(runId)
+      ? { exitCode: alive() ? 1 : 0 }
+      : exec(argv);
+}
+
+test("a follow-up right after stop waits for the stopped runner; still alive, it gets 409 runner_still_exiting and starts nothing", async () => {
+  const { agent, run, envId } = await runningRun();
+  expect((await action(agent.id, "stop")).status).toBe(200);
+  let alive = true;
+  runnerAlive(run.id, () => alive);
+
+  const res = await followUp(agent.id, { prompt: "go another way" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "runner_still_exiting" },
+  });
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+  expect(
+    db.$client.prepare("select status from agents where id = ?").get(agent.id),
+  ).toEqual({ status: "idle" });
+  // the wait is bounded on the sprite, past the 30 s archive allows
+  const wait = wire.calls.at(-1) ?? "";
+  expect(wait.startsWith(`exec harness-${envId} - bash -c `)).toBe(true);
+  expect(wait).toContain("seq 30");
+
+  alive = false;
+  expect((await followUp(agent.id, { prompt: "go another way" })).status).toBe(
+    202,
+  );
+  await sessionOpened(2);
+});
+
+test("a follow-up whose wait for the previous runner can't reach the sprite gets 502 and starts nothing", async () => {
+  const { agent, envId } = await finishedRun();
+  wire.sprites.delete(`harness-${envId}`);
+  const res = await followUp(agent.id, { prompt: "again" });
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: { code: "sprite_unreachable" },
+  });
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
 });
 
 test("stopping an agent with no active run is a 200 no-op that never wakes the sprite", async () => {

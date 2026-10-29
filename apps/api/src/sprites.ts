@@ -88,31 +88,57 @@ export async function writeSpriteFile(
   await client.sprite(name).filesystem("/").writeFile(path, data, options);
 }
 
+// past any run: the runner holds the sprite itself and exits on its own; the server default is undocumented
+const RUN_AFTER_DISCONNECT = "24h";
+const OUTPUT_TAIL = 2000;
+
 /**
- * Starts `argv` in a detachable session and disconnects as soon as the socket opens: the process
- * keeps running in the sprite with nothing held open to it. A plain exec's process is reaped
- * when its connection drops, so this is the one way to leave a process running.
+ * Starts `argv` in a detachable session, stays attached for `watchMs`, then disconnects: the process
+ * keeps running in the sprite with nothing held open to it. A plain exec's process is reaped when
+ * its connection drops, so this is the one way to leave a process running. Rejects when the process
+ * exits nonzero inside the window, with its exit code and output tail. A TTY merges stderr into
+ * that output, and the SDK reads its exit code from the socket's close, so it is only ever 0 or 1.
  */
 export function startDetached(
   client: SpritesClient,
   name: string,
   [file, ...args]: [string, ...string[]],
-  options: { cwd: string; env: Record<string, string> },
+  options: { cwd: string; env: Record<string, string>; watchMs: number },
 ): Promise<void> {
-  const session = client.sprite(name).createSession(file, args, options);
+  const session = client.sprite(name).createSession(file, args, {
+    cwd: options.cwd,
+    env: options.env,
+    maxRunAfterDisconnect: RUN_AFTER_DISCONNECT,
+  });
   return new Promise((resolve, reject) => {
     let settled = false;
-    session.once("spawn", () => {
-      settled = true;
-      session.close();
-      resolve();
-    });
-    // stays attached: an 'error' emitted with no listener would crash the process
-    session.on("error", (err: Error) => {
+    let watch: NodeJS.Timeout | undefined;
+    let output = "";
+    const settle = (err?: Error) => {
       if (settled) return;
       settled = true;
+      clearTimeout(watch);
       session.close();
-      reject(err);
+      if (err) reject(err);
+      else resolve();
+    };
+    session.stdout.on("data", (chunk: Buffer) => {
+      output = (output + chunk.toString()).slice(-OUTPUT_TAIL);
     });
+    session.once("spawn", () => {
+      watch = setTimeout(() => settle(), options.watchMs);
+    });
+    session.once("exit", (code: number) => {
+      // output pushed to the stream just before 'exit' may not have reached 'data' yet
+      setImmediate(() =>
+        settle(
+          code === 0
+            ? undefined
+            : new Error(`runner exited ${code} at launch: ${output.trim()}`),
+        ),
+      );
+    });
+    // stays attached: an 'error' emitted with no listener would crash the process
+    session.on("error", (err: Error) => settle(err));
   });
 }

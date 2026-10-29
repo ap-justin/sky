@@ -26,9 +26,13 @@ const envFile = (vars: Iterable<[string, string]>) =>
     .map(([name, value]) => `export ${name}=${shellQuote(value)}\n`)
     .join("");
 
-/** `pgrep -f`/`pkill -f` pattern matching only this run's runner, never its Claude child. */
-const runnerPattern = (runId: RunId) =>
-  `^node ${RUNNER.replaceAll(".", "\\.")} ${runId}$`;
+/**
+ * `pgrep -f`/`pkill -f` pattern matching only this run's runner, never its Claude child. Unanchored,
+ * so a node started by its full path matches; the bash parent's argv holds a literal `"$RUN_ID"`,
+ * and the matcher's own argv a `\.` and a trailing `$`, so neither matches.
+ */
+export const runnerPattern = (runId: RunId) =>
+  `${RUNNER.replaceAll(".", "\\.")} ${runId}$`;
 
 /**
  * SIGTERMs the run's runner, which aborts its Claude session and commits before exiting. A failure
@@ -54,6 +58,30 @@ export async function signalRunner(
   } catch (err) {
     log(`signalling the runner of ${runId} failed: ${err}`);
   }
+}
+
+// exit 0 once nothing matches, 1 while a runner still does after 30 s; pgrep's own errors exit 2
+const AWAIT_EXIT_OR_REPORT = `for _ in $(seq 30); do pgrep -f "$1" >/dev/null; case $? in 1) exit 0;; 0) sleep 1;; *) exit 2;; esac; done; exit 1`;
+
+/**
+ * Waits up to 30 s for the run's runner to exit: true once it is gone, false while it lives on.
+ * Throws when the sprite can't answer.
+ */
+export async function awaitRunnerExit(
+  sprites: SpritesClient,
+  spriteName: string,
+  runId: RunId,
+): Promise<boolean> {
+  const out = await execInSprite(sprites, spriteName, [
+    "bash",
+    "-c",
+    AWAIT_EXIT_OR_REPORT,
+    "_",
+    runnerPattern(runId),
+  ]);
+  if (out.exitCode === 0) return true;
+  if (out.exitCode === 1) return false;
+  throw new Error(`exit ${out.exitCode}: ${out.stderr.trim()}`);
 }
 
 // bounded: a runner that outlives the wait loses whatever its commit hadn't written
@@ -95,6 +123,8 @@ type Deps = {
   sprites: SpritesClient;
   log: (line: string) => void;
   nudgeDeliveries: () => void;
+  /** How long a launch stays attached to catch a runner that dies at start. */
+  watchMs: number;
 };
 export type Launch = {
   envId: EnvironmentId;
@@ -116,6 +146,7 @@ export function createLauncher({
   sprites,
   log,
   nudgeDeliveries,
+  watchMs,
 }: Deps) {
   let bundle: Promise<{ bytes: Buffer; sha256: string }> | undefined;
   // read once: the bundle ships with this build of the API
@@ -130,20 +161,33 @@ export function createLauncher({
     return bundle;
   };
 
-  async function ensureBundle(spriteName: string): Promise<void> {
+  async function ensureBundle(spriteName: string, runId: RunId): Promise<void> {
     const { bytes, sha256 } = await loadBundle();
     const current = await execInSprite(sprites, spriteName, [
       "sha256sum",
       RUNNER,
     ]);
     const onSprite = current.exitCode === 0 ? current.stdout.split(" ")[0] : "";
-    if (onSprite !== sha256) {
-      await writeSpriteFile(sprites, spriteName, RUNNER, bytes);
+    if (onSprite === sha256) return;
+    // a rename is atomic, so a concurrent launch's node reads the old bundle or the new, never half
+    // of one; the temp path is per run, so two uploads never write the same file
+    const staged = `${RUNNER}.${runId}`;
+    await writeSpriteFile(sprites, spriteName, staged, bytes);
+    const moved = await execInSprite(sprites, spriteName, [
+      "mv",
+      "-f",
+      staged,
+      RUNNER,
+    ]);
+    if (moved.exitCode !== 0) {
+      throw new Error(
+        `installing the runner bundle failed: ${moved.stderr.trim()}`,
+      );
     }
   }
 
   async function run(launch: Launch, agentToken: string): Promise<void> {
-    await ensureBundle(launch.spriteName);
+    await ensureBundle(launch.spriteName, launch.runId);
     const promptFile = `/workspace/runs/${launch.runId}.prompt`;
     await writeSpriteFile(
       sprites,
@@ -203,6 +247,7 @@ export function createLauncher({
           WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
           ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
         },
+        watchMs,
       },
     ).catch(async (err: unknown) => {
       // the runner never started, so nothing else deletes the file its secrets sit in

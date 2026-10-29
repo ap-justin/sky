@@ -65,15 +65,29 @@ export function boot(config: Config, log: (line: string) => void) {
   };
 }
 
-type Closable = { close(done: (err?: Error) => void): unknown };
+type Closable = {
+  close(done: (err?: Error) => void): unknown;
+  closeAllConnections(): void;
+};
 
-/** Stops accepting requests and lets in-flight ones finish before the DB goes away. */
-export async function shutdown(server: Closable, db: Db): Promise<void> {
+/**
+ * Stops accepting requests and gives in-flight ones `drainMs` before closing every connection still
+ * open, then closes the DB. Run streams and runner long-polls never end on their own; their clients
+ * reconnect (SSE with `Last-Event-ID`) and lose nothing. 5 s keeps the whole of it inside fly.toml's
+ * `kill_timeout`.
+ */
+export async function shutdown(
+  server: Closable,
+  db: Db,
+  drainMs = 5_000,
+): Promise<void> {
+  const cutoff = setTimeout(() => server.closeAllConnections(), drainMs);
   try {
     await new Promise<void>((resolve, reject) =>
       server.close((err) => (err ? reject(err) : resolve())),
     );
   } finally {
+    clearTimeout(cutoff);
     db.$client.close();
   }
 }

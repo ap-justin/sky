@@ -81,7 +81,7 @@ export function stubSprites() {
     sessions: [] as Session[],
     /** WebSocket exec connections the client has not closed. */
     openSockets: 0,
-    // answers `sha256sum <path>` from `files`, as coreutils would
+    // answers `sha256sum <path>` and `mv -f <from> <to>` from `files`, as coreutils would
     exec: (argv: string[]): ExecOutcome => {
       if (argv[0] === "sha256sum" && argv[1]) {
         const bytes = wire.files.get(argv[1]);
@@ -92,8 +92,20 @@ export function stubSprites() {
               stderr: `sha256sum: ${argv[1]}: No such file or directory\n`,
             };
       }
+      if (argv[0] === "mv" && argv[1] === "-f" && argv[2] && argv[3]) {
+        const bytes = wire.files.get(argv[2]);
+        if (!bytes)
+          return { exitCode: 1, stderr: `mv: ${argv[2]}: No such file\n` };
+        wire.files.delete(argv[2]);
+        wire.files.set(argv[3], bytes);
+      }
       return { exitCode: 0 };
     },
+    /**
+     * When set, each session's process prints `output` and exits right after the socket opens; the
+     * SDK reads a TTY session's exit from its close code, 1000 as 0 and any other as 1.
+     */
+    sessionExit: undefined as { output: string; code: 0 | 1 } | undefined,
     createStatus: 201,
     writeStatus: 200,
     checkpointLines: undefined as object[] | undefined,
@@ -200,6 +212,18 @@ export function stubSprites() {
       client.addEventListener("close", () => {
         wire.openSockets -= 1;
       });
+      const exit = wire.sessionExit;
+      if (exit) {
+        // on separate ticks, as the live server sends them: sent in the close's tick, the output never arrives
+        setTimeout(
+          () => client.send(new TextEncoder().encode(exit.output)),
+          10,
+        );
+        setTimeout(
+          () => client.close(exit.code === 0 ? 1000 : 1011, "process exited"),
+          20,
+        );
+      }
     }),
     http.post(`${SPRITES}/:name/checkpoint`, ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });

@@ -16,7 +16,12 @@ import { mintAgentToken } from "./agent-token.js";
 import { apiError } from "./errors.js";
 import { type AppEnv, factory } from "./factory.js";
 import { mintId } from "./ids.js";
-import { type Launcher, removeWorktree, signalRunner } from "./launch.js";
+import {
+  awaitRunnerExit,
+  type Launcher,
+  removeWorktree,
+  signalRunner,
+} from "./launch.js";
 import { REPO_DIR } from "./provision.js";
 import { redact } from "./redact.js";
 import { decideRequest, openRequestOf, requestDecisions } from "./requests.js";
@@ -130,6 +135,28 @@ const agentWithSprite = (tx: Tx, id: AgentId) =>
     .innerJoin(environments, eq(agents.envId, environments.id))
     .where(eq(agents.id, id))
     .get();
+
+/**
+ * The agent's latest run, when it has ended and so may leave a runner still exiting; undefined for
+ * an unknown or archived agent, or one whose latest run is active, which the follow-up refuses.
+ */
+function previousRunnerOf(db: Db, id: AgentId) {
+  const row = db
+    .select({
+      runId: runs.id,
+      status: runs.status,
+      archivedAt: agents.archivedAt,
+      spriteName: environments.spriteName,
+    })
+    .from(runs)
+    .innerJoin(agents, eq(runs.agentId, agents.id))
+    .innerJoin(environments, eq(agents.envId, environments.id))
+    .where(eq(runs.agentId, id))
+    .orderBy(desc(runs.createdAt), desc(sql`${runs}.rowid`))
+    .get();
+  if (!row || row.archivedAt || isActive(row.status)) return undefined;
+  return row;
+}
 
 /** Re-reads an agent this transaction already found. */
 const agentRow = (tx: Tx, id: AgentId) => {
@@ -291,11 +318,39 @@ export function agentRoutes(
         202,
       );
     })
-    .post("/:id/runs", agentParam, jsonBody, body(FollowUpInput), (c) => {
+    .post("/:id/runs", agentParam, jsonBody, body(FollowUpInput), async (c) => {
       const { id } = c.req.valid("param");
       const { prompt, envVars, ttlSeconds } = c.req.valid("json");
       const reserved = reservedIn(envVars);
       if (reserved) return reservedName(c, reserved);
+      // an ended run's runner may still be aborting and committing in the worktree a new one resumes in
+      const previous = previousRunnerOf(c.var.db, id);
+      if (previous) {
+        let exited: boolean;
+        try {
+          exited = await awaitRunnerExit(
+            sprites,
+            previous.spriteName,
+            previous.runId,
+          );
+        } catch (err) {
+          log(`waiting for the runner of ${previous.runId} failed: ${err}`);
+          return apiError(
+            c,
+            502,
+            "sprite_unreachable",
+            "could not check the agent's previous runner on its sprite; retry",
+          );
+        }
+        if (!exited) {
+          return apiError(
+            c,
+            409,
+            "runner_still_exiting",
+            "the agent's previous runner is still exiting; retry shortly",
+          );
+        }
+      }
       const runId = mintId("run");
       const outcome = c.var.db.transaction(
         (tx) => {
