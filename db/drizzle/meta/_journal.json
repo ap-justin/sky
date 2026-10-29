@@ -15,6 +15,13 @@
       "when": 1793286547710,
       "tag": "0001_shallow_talos",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1793288165344,
+      "tag": "0002_remarkable_bishop",
+      "breakpoints": true
     }
   ]
 }

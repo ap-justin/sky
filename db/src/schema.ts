@@ -97,6 +97,8 @@ export const agents = sqliteTable(
     branch: text().$type<`claude/${AgentId}`>().notNull(),
     status: text().$type<AgentStatus>().notNull(),
     createdAt: createdAt(),
+    // no CHECK: adding one makes drizzle-kit rebuild the table; the API writes toISOString() only
+    archivedAt: text("archived_at"),
   },
   (t) => [
     index("agents_env_id").on(t.envId),

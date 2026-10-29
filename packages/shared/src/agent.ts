@@ -15,6 +15,8 @@ export const Agent = z
     sessionId: z.string().min(1).nullable(),
     branch: z.templateLiteral(["claude/", AgentId]),
     status: AgentStatus,
+    /** When the agent was archived; an archived agent takes no more runs. */
+    archivedAt: z.iso.datetime().nullable(),
   })
   .refine((agent) => agent.branch === agentBranch(agent.id), {
     path: ["branch"],
