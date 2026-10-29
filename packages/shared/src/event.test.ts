@@ -28,6 +28,18 @@ test("event types cover the run lifecycle and progress", () => {
   );
 });
 
+test("run.started carries the Claude session id", () => {
+  const post = {
+    runId: "run_1",
+    type: "run.started",
+    payload: { sessionId: "sess-1" },
+  };
+  expect(RunnerEventPost.parse(post)).toEqual(post);
+  expect(RunnerEventPost.safeParse({ ...post, payload: {} }).success).toBe(
+    false,
+  );
+});
+
 test("accepts run.finished carrying summary and usage", () => {
   const event = {
     ...meta,
@@ -74,7 +86,7 @@ test("rejects an unknown type and a non-ISO timestamp", () => {
       ...meta,
       ts: "yesterday",
       type: "run.started",
-      payload: {},
+      payload: { sessionId: "sess-1" },
     }).success,
   ).toBe(false);
 });

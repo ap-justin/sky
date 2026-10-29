@@ -1,0 +1,63 @@
+import { expect, test } from "vitest";
+import { ConfigError, loadConfig } from "./config.js";
+
+const env = {
+  AGENT_ID: "agt_1",
+  RUN_ID: "run_1",
+  PROMPT: "fix the bug",
+  API_BASE_URL: "https://api.test",
+  AGENT_TOKEN: "agent-secret",
+  CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+};
+
+test("reads a run from env, defaulting the sprite paths", () => {
+  expect(loadConfig(env)).toEqual({
+    agentId: "agt_1",
+    runId: "run_1",
+    prompt: "fix the bug",
+    sessionId: undefined,
+    apiBaseUrl: "https://api.test",
+    agentToken: "agent-secret",
+    repoDir: "/workspace/repo",
+    worktreesDir: "/workspace/worktrees",
+  });
+});
+
+test("takes a session id to resume and path overrides", () => {
+  const config = loadConfig({
+    ...env,
+    SESSION_ID: "sess-1",
+    REPO_DIR: "/tmp/r",
+    WORKTREES_DIR: "/tmp/w",
+  });
+  expect(config).toMatchObject({
+    sessionId: "sess-1",
+    repoDir: "/tmp/r",
+    worktreesDir: "/tmp/w",
+  });
+});
+
+test("an empty SESSION_ID is a new session", () => {
+  expect(loadConfig({ ...env, SESSION_ID: "" }).sessionId).toBeUndefined();
+});
+
+test("names every bad key without echoing any value", () => {
+  const error = (() => {
+    try {
+      loadConfig({
+        ...env,
+        RUN_ID: "nope",
+        AGENT_TOKEN: "",
+        CLAUDE_CODE_OAUTH_TOKEN: undefined,
+      });
+    } catch (e) {
+      return e;
+    }
+  })();
+  expect(error).toBeInstanceOf(ConfigError);
+  const message = (error as Error).message;
+  expect(message).toMatch(/RUN_ID/);
+  expect(message).toMatch(/AGENT_TOKEN/);
+  expect(message).toMatch(/CLAUDE_CODE_OAUTH_TOKEN/);
+  expect(message).not.toMatch(/nope|secret/);
+});

@@ -44,7 +44,8 @@ export const EventType = z.enum([
 export type EventType = z.infer<typeof EventType>;
 
 const payloads = {
-  "run.started": z.object({}),
+  /** `sessionId` is the Claude session the API stores to resume the agent's next run. */
+  "run.started": z.object({ sessionId: z.string().min(1) }),
   /** Assistant text or a tool call, as the run goes. */
   "run.progress": z.object({
     message: z.string(),
