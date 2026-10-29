@@ -121,6 +121,14 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
+    async putSecret(envId: string, name: string, body: unknown) {
+      const { json } = await request(
+        "PUT",
+        `/v1/environments/${encodeURIComponent(envId)}/secrets/${encodeURIComponent(name)}`,
+        body,
+      );
+      return json;
+    },
   };
 }
 

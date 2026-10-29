@@ -3,6 +3,7 @@ import { ApiError, createApi } from "./api.js";
 import { apply } from "./apply.js";
 import { configPath, type Env, resolveConfig } from "./config.js";
 import { createOutput, type Output, UsageError } from "./output.js";
+import { secretSet } from "./secret.js";
 
 export interface Io {
   argv: string[];
@@ -25,6 +26,9 @@ const help = (io: Io) => `Usage:
   harness apply <env.yaml> [options]
       Create or update the environment env.yaml describes, wait until it's
       provisioned, and write harness-lock.json beside env.yaml.
+  harness secret set <env> <NAME> [--connector=<name>] [options]
+      Store a secret on an environment (<env> is its id or name). The value
+      is read from stdin, or prompted for without echo on a terminal.
 
 Options:
   --url=<url>            API URL
@@ -63,6 +67,8 @@ export async function run(io: Io): Promise<number> {
     switch (command) {
       case "apply":
         return await runApply(rest, io);
+      case "secret":
+        return await runSecret(rest, io);
       default:
         throw new UsageError(`unknown command '${command}'`, true);
     }
@@ -113,6 +119,41 @@ async function runApply(args: string[], io: Io): Promise<number> {
   const api = connect(values, io);
   try {
     return await apply(file, api, io, out);
+  } catch (err) {
+    if (err instanceof ApiError) return failApi(err, out);
+    throw err;
+  }
+}
+
+async function runSecret(args: string[], io: Io): Promise<number> {
+  const { values, positionals } = parse(args, {
+    ...commonOptions,
+    connector: { type: "string" },
+  });
+  if (values.help) {
+    io.stdout(help(io));
+    return 0;
+  }
+  const [sub, envRef, name, ...extra] = positionals;
+  if (sub !== "set") {
+    throw new UsageError(
+      sub === undefined
+        ? "secret needs a subcommand: set"
+        : `unknown secret subcommand '${sub}'`,
+      true,
+    );
+  }
+  if (envRef === undefined || name === undefined || extra.length > 0) {
+    // never echo the extra arguments: one of them may be a value typed where it doesn't belong
+    throw new UsageError(
+      "secret set takes <env> <NAME>; the value is read from stdin, not argv",
+      true,
+    );
+  }
+  const out = createOutput(values.json ?? false, io.stdout, io.stderr);
+  const api = connect(values, io);
+  try {
+    return await secretSet(envRef, name, values.connector, api, io, out);
   } catch (err) {
     if (err instanceof ApiError) return failApi(err, out);
     throw err;
