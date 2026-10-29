@@ -13,7 +13,7 @@ RUN pnpm fetch
 COPY . .
 # scripts skipped: the bundle needs only esbuild, and the runtime better-sqlite3 is installed below
 RUN pnpm install --frozen-lockfile --offline --ignore-scripts \
-  && pnpm --filter @harness/api build
+  && pnpm --filter '@harness/api...' build
 # runtime tree: the bundle, migrations at ../drizzle from it, and the bundle's one external
 WORKDIR /out
 RUN cp -R /repo/apps/api/dist/bundle /repo/apps/api/dist/drizzle . \

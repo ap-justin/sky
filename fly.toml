@@ -1,18 +1,22 @@
 # Required secrets (fly secrets set; names only, never values here):
-#   HARNESS_API_KEY          bearer key for /v1 and /mcp
-#   CLAUDE_CODE_OAUTH_TOKEN  runner auth for Claude Code
-#   SPRITES_TOKEN            Sprites API token
-#   webhook signing key      name set by the webhook fan-out ticket
-#   secret-encryption key    name set by the secrets ticket
+#   HARNESS_API_KEY          bearer key for /v1 and /mcp, >=32 token68 chars: openssl rand -hex 32
+#   WEBHOOK_SIGNING_KEY      HMAC key for outbound webhooks, >=32 chars: openssl rand -hex 32
+#   SECRET_ENCRYPTION_KEY    AES-256 key, base64 of 32 bytes: openssl rand -base64 32
+#   SPRITES_TOKEN            Sprites API token, from the user's Sprites org
+#   CLAUDE_CODE_OAUTH_TOKEN  runner auth for Claude Code, from the user's `claude setup-token`
 
 app = "REPLACE_ME"            # placeholder: app name chosen at deploy
 primary_region = "REPLACE_ME" # placeholder: region code chosen at deploy, e.g. "iad"
 
 # Fly's default is SIGINT; the API drains only on SIGTERM, and as PID 1 it ignores unhandled signals
 kill_signal = "SIGTERM"
+# >= the runner long-poll hold in apps/api/src/app.ts; open SSE streams outlast it unless the app closes them
+kill_timeout = 30
 
 [env]
   DATA_DIR = "/data"
+  # how a sprite reaches this API; host must match `app` above
+  PUBLIC_BASE_URL = "https://REPLACE_ME.fly.dev"
 
 # single machine + single volume: the SQLite file is one unreplicated copy, so the volume needs snapshots
 [mounts]
