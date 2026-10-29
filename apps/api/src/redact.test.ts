@@ -15,6 +15,10 @@ const credentials = [
   ["an Anthropic OAuth token", "sk-ant-oat01-AbCdEf0123456789_xyz-AbCdEf"],
   ["an sk- key", "sk-proj-0123456789abcdefABCDEF"],
   ["a classic GitHub token", `ghp_${"a1B2".repeat(9)}`],
+  ["a GitHub OAuth token", `gho_${"a1B2".repeat(9)}`],
+  ["a GitHub user-to-server token", `ghu_${"a1B2".repeat(9)}`],
+  ["a GitHub App installation token", `ghs_${"a1B2".repeat(9)}`],
+  ["a GitHub refresh token", `ghr_${"a1B2".repeat(9)}`],
   ["a fine-grained GitHub token", `github_pat_11ABC${"x9".repeat(20)}`],
   [
     "a JWT",
@@ -23,7 +27,6 @@ const credentials = [
   ["the API key", secrets.apiKey],
   ["the Sprites token", secrets.spritesToken],
   ["the Claude OAuth token", secrets.claudeOauthToken],
-  ["the public base URL", secrets.publicBaseUrl],
   ["the webhook signing key", secrets.webhookSigningKey],
   [
     "the secret encryption key, as base64",
@@ -62,6 +65,7 @@ test.each([
   ["an sk- prefix too short for a key", "sk-short123"],
   ["a ghp_ prefix too short for a token", "ghp_abc123"],
   ["a two-segment eyJ string", "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0"],
+  ["the API's public URL", `${secrets.publicBaseUrl}/v1/runs/run_1`],
   ["a prefix of a known value", secrets.spritesToken.slice(0, -1)],
 ])("leaves a near-miss alone: %s", (_, text) => {
   expect(redactDeep({ nested: [text] }, known)).toEqual({ nested: [text] });

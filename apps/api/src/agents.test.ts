@@ -785,7 +785,6 @@ test("after runs with planted secrets, no stored event, run or agent row holds a
     config.apiKey,
     config.spritesToken,
     config.claudeOauthToken,
-    config.publicBaseUrl,
   ];
   // a runner can read any live runner's env on its sprite, never a token already revoked
   const whileBothLive = [...platform, a.token, b.token].join("\n");

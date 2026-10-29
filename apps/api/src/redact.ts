@@ -9,7 +9,7 @@ const MIN_KNOWN_LENGTH = 8;
 const tokenPatterns = [
   /\bsk-ant-oat[0-9A-Za-z_-]+/g,
   /\bsk-[0-9A-Za-z_-]{16,}/g,
-  /\bghp_[0-9A-Za-z]{20,}/g,
+  /\bgh[pousr]_[0-9A-Za-z]{20,}/g,
   /\bgithub_pat_[0-9A-Za-z_]{20,}/g,
   /\beyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+/g,
 ];
@@ -24,7 +24,6 @@ export class KnownSecrets {
       | "apiKey"
       | "spritesToken"
       | "claudeOauthToken"
-      | "publicBaseUrl"
       | "webhookSigningKey"
       | "secretEncryptionKey"
     >,
@@ -33,7 +32,6 @@ export class KnownSecrets {
     secrets.add("HARNESS_API_KEY", config.apiKey);
     secrets.add("SPRITES_TOKEN", config.spritesToken);
     secrets.add("CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken);
-    secrets.add("PUBLIC_BASE_URL", config.publicBaseUrl);
     secrets.add("WEBHOOK_SIGNING_KEY", config.webhookSigningKey);
     secrets.add(
       "SECRET_ENCRYPTION_KEY",

@@ -13,7 +13,7 @@ import type { Tx } from "./runs.js";
 
 const TICK_MS = 5_000;
 const BATCH = 20;
-const TIMEOUT_MS = 10_000;
+const TIMEOUT_MS = 30_000;
 const MAX_ATTEMPTS = 30;
 const FIRST_RETRY_MS = 10_000;
 const MAX_RETRY_MS = 3_600_000;
@@ -79,7 +79,8 @@ export type Dispatcher = ReturnType<typeof createDispatcher>;
 
 /**
  * Sends due webhook deliveries from the DB, one drain at a time: a 2xx delivers, anything else (a
- * redirect included, never followed) retries with backoff until the 8th attempt fails it.
+ * redirect included, never followed) retries with backoff until the 30th attempt fails it. Each
+ * failed attempt logs one line; the one that gives up is prefixed `warn:`.
  */
 export function createDispatcher({
   db,
@@ -101,6 +102,7 @@ export function createDispatcher({
 
   type Due = {
     id: number;
+    webhookId: string;
     attempts: number;
     url: string;
     agentId: AgentId;
@@ -156,6 +158,9 @@ export function createDispatcher({
       })
       .where(eq(webhookDeliveries.id, row.id))
       .run();
+    if (delivered) return;
+    const line = `webhook ${row.webhookId} ${id}: attempt ${attempts}/${MAX_ATTEMPTS} failed: ${status === null ? error : `status ${status}`}`;
+    log(failed ? `warn: ${line}; giving up` : line);
   }
 
   /** Sends one batch of due deliveries; true when the batch was full, so more may be due. */
@@ -163,6 +168,7 @@ export function createDispatcher({
     const due = db
       .select({
         id: webhookDeliveries.id,
+        webhookId: webhookDeliveries.webhookId,
         attempts: webhookDeliveries.attempts,
         url: webhooks.url,
         agentId: runs.agentId,

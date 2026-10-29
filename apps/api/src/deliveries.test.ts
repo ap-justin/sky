@@ -10,7 +10,7 @@ import {
 } from "@harness/db";
 import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
 import { HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
@@ -355,6 +355,61 @@ test("a redirect is a failed attempt, never followed", async () => {
   ]);
 });
 
+test("an attempt is cut off after 30 s and recorded as a timeout", async () => {
+  await subscribe(["run.finished"]);
+  subscriber([200]);
+  const { runId, token } = runningRun();
+  // AbortSignal.timeout runs on Node's own timers, out of reach of fake ones
+  const timeout = vi
+    .spyOn(AbortSignal, "timeout")
+    .mockImplementation(() =>
+      AbortSignal.abort(new DOMException("timed out", "TimeoutError")),
+    );
+  let timeouts: unknown[][];
+  try {
+    // ingestion nudges the dispatcher, so the attempt may start before drain() is called
+    await postEvent(token, {
+      runId,
+      type: "run.finished",
+      payload: { summary: "ok", usage },
+    });
+    await dispatcher.drain();
+  } finally {
+    timeouts = [...timeout.mock.calls];
+    timeout.mockRestore();
+  }
+  expect(timeouts).toEqual([[30_000]]);
+  expect(deliveries()).toEqual([
+    expect.objectContaining({
+      status: "pending",
+      attempts: 1,
+      lastError: "timed out after 30s",
+    }),
+  ]);
+});
+
+test("each failed attempt logs one line naming the webhook, event, attempt and status", async () => {
+  const webhookId = await subscribe(["run.finished"]);
+  server.use(http.post(subscriberUrl, () => HttpResponse.error()));
+  const { runId, token } = runningRun();
+  await postEvent(token, {
+    runId,
+    type: "run.finished",
+    payload: { summary: "ok", usage },
+  });
+  await dispatcher.drain();
+  subscriber([500]);
+  advance(3_600_000);
+  await dispatcher.drain();
+  const eventId = `evt_${deliveries()[0]?.eventId}`;
+  expect(logs).toEqual([
+    expect.stringMatching(
+      new RegExp(`^webhook ${webhookId} ${eventId}: attempt 1/30 failed: \\S`),
+    ),
+    `webhook ${webhookId} ${eventId}: attempt 2/30 failed: status 500`,
+  ]);
+});
+
 test("after 30 failed attempts the delivery is failed and never tried again", async () => {
   await subscribe(["run.finished"]);
   const received = subscriber(Array(31).fill(503));
@@ -376,6 +431,10 @@ test("after 30 failed attempts the delivery is failed and never tried again", as
       lastStatus: 503,
     }),
   ]);
+  expect(logs).toHaveLength(30);
+  expect(logs.at(-1)).toMatch(
+    /^warn: webhook whk_\w+ evt_\d+: attempt 30\/30 failed: status 503; giving up$/,
+  );
 });
 
 test("pending deliveries left by a previous process are sent once a dispatcher starts", async () => {
