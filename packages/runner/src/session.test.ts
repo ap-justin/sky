@@ -2,10 +2,19 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
+import { setImmediate } from "node:timers/promises";
+import type {
+  HookEvent,
+  HookInput,
+  Options,
+  SDKMessage,
+} from "@anthropic-ai/claude-agent-sdk";
 import type { RunnerEventPost } from "@harness/shared";
+import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { server } from "../../../test/msw.js";
 import type { Config } from "./config.js";
+import { createPoster } from "./events.js";
 import { type QueryFn, runSession } from "./session.js";
 
 const git = (cwd: string, ...args: string[]) =>
@@ -70,6 +79,33 @@ const success = {
   session_id: "sess-new",
 };
 
+/** A scripted step that drives the session's options instead of yielding a message, as the SDK does when it fires a hook. */
+type Step = (options: Options) => Promise<void>;
+
+/** Fires the session's registered `event` hook the way the SDK does, and returns what the hook answered. */
+async function fire(options: Options, event: HookEvent, fields: object) {
+  const input = {
+    session_id: "sess-new",
+    transcript_path: "/t.jsonl",
+    cwd: options.cwd ?? "",
+    hook_event_name: event,
+    ...fields,
+  } as HookInput;
+  const answers = [];
+  for (const matcher of options.hooks?.[event] ?? [])
+    for (const hook of matcher.hooks)
+      answers.push(
+        await hook(input, "toolu_1", { signal: new AbortController().signal }),
+      );
+  return answers;
+}
+
+const hook =
+  (event: HookEvent, fields: object): Step =>
+  async (options) => {
+    expect(await fire(options, event, fields)).toEqual([{ continue: true }]);
+  };
+
 /** A scripted SDK stream; `onStart` runs once the session has its cwd, before the first message. */
 function scripted(
   messages: unknown[],
@@ -82,7 +118,8 @@ function scripted(
       onStart?.(params.options.cwd ?? "");
       for (const m of messages) {
         if (m instanceof Error) throw m;
-        yield m as SDKMessage;
+        if (typeof m === "function") await (m as Step)(params.options);
+        else yield m as SDKMessage;
       }
     })();
   };
@@ -94,7 +131,7 @@ const recorder = () => {
   return { posted, post: async (e: RunnerEventPost) => void posted.push(e) };
 };
 
-test("a finished run posts started, progress, then finished with the SDK usage, and exits 0", async () => {
+test("a finished run posts started, assistant text progress, then finished with the SDK usage, and exits 0", async () => {
   const { posted, post } = recorder();
   const query = scripted([
     init,
@@ -124,8 +161,94 @@ test("a finished run posts started, progress, then finished with the SDK usage, 
     },
     {
       runId: "run_1",
+      type: "run.finished",
+      payload: {
+        summary: "Added hello.txt",
+        usage: {
+          inputTokens: 115,
+          outputTokens: 40,
+          costUsd: 0.02,
+          turns: 2,
+          durationMs: 1235,
+        },
+      },
+    },
+  ]);
+});
+
+test("hooks reach the API in order: a notification, one progress per tool call from PreToolUse, and a single run.finished", async () => {
+  const sent: unknown[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      sent.push(await request.json());
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const post = createPoster({
+    apiBaseUrl: "https://api.test",
+    agentToken: "agent-secret",
+    warn: () => {},
+    retryDelayMs: 0,
+  });
+  const query = scripted([
+    init,
+    hook("Notification", {
+      message: "Claude needs your attention",
+      notification_type: "idle_prompt",
+    }),
+    assistant(
+      { type: "text", text: "Looking around." },
+      { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
+    ),
+    hook("PreToolUse", {
+      tool_name: "Bash",
+      tool_input: { command: "ls -la src", description: "" },
+      tool_use_id: "t1",
+    }),
+    assistant({
+      type: "tool_use",
+      id: "t2",
+      name: "Read",
+      input: { file_path: "src/a.ts" },
+    }),
+    hook("PreToolUse", {
+      tool_name: "Read",
+      tool_input: { file_path: "src/a.ts" },
+      tool_use_id: "t2",
+    }),
+    hook("Stop", {
+      stop_hook_active: false,
+      last_assistant_message: "Done.",
+    }),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+  });
+  expect(code).toBe(0);
+  expect(sent).toEqual([
+    { runId: "run_1", type: "run.started", payload: { sessionId: "sess-new" } },
+    {
+      runId: "run_1",
       type: "run.progress",
-      payload: { message: "hello.txt", tool: "Write" },
+      payload: { message: "Claude needs your attention" },
+    },
+    {
+      runId: "run_1",
+      type: "run.progress",
+      payload: { message: "Looking around." },
+    },
+    {
+      runId: "run_1",
+      type: "run.progress",
+      payload: { message: "ls -la src", tool: "Bash" },
+    },
+    {
+      runId: "run_1",
+      type: "run.progress",
+      payload: { message: "src/a.ts", tool: "Read" },
     },
     {
       runId: "run_1",
@@ -141,6 +264,72 @@ test("a finished run posts started, progress, then finished with the SDK usage, 
         },
       },
     },
+  ]);
+});
+
+test("a result with no text takes its summary from the Stop hook's last message", async () => {
+  const { posted, post } = recorder();
+  const query = scripted([
+    init,
+    hook("Stop", {
+      stop_hook_active: false,
+      last_assistant_message: "Added hello.txt and a test.",
+    }),
+    { ...success, result: "" },
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+  });
+  expect(posted.filter((e) => e.type === "run.finished")).toEqual([
+    expect.objectContaining({
+      payload: expect.objectContaining({
+        summary: "Added hello.txt and a test.",
+      }),
+    }),
+  ]);
+});
+
+test("a hook answers continue without waiting on its post, and a post that rejects doesn't fail the tool call", async () => {
+  const posted: RunnerEventPost[] = [];
+  let release = () => {};
+  const held = new Promise<void>((r) => (release = r));
+  const post = async (e: RunnerEventPost) => {
+    if (e.type === "run.progress" && e.payload.tool === "Bash") {
+      await held;
+      throw new Error("post blew up");
+    }
+    posted.push(e);
+  };
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const answers = await fire(options, "PreToolUse", {
+        tool_name: "Bash",
+        tool_input: { command: "ls" },
+        tool_use_id: "t1",
+      });
+      expect(answers).toEqual([{ continue: true }]);
+      release();
+    },
+    hook("PreToolUse", {
+      tool_name: "Read",
+      tool_input: { file_path: "a.ts" },
+      tool_use_id: "t2",
+    }),
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+  });
+  expect(code).toBe(0);
+  expect(posted.map((e) => e.type)).toEqual([
+    "run.started",
+    "run.progress",
+    "run.finished",
   ]);
 });
 
@@ -307,10 +496,29 @@ test("an abort mid-session posts run.failed naming the signal", async () => {
   });
 });
 
+/**
+ * Live resources once handles closed earlier have finished closing: libuv runs close
+ * callbacks after the check phase, so the second `setImmediate` lands past them.
+ */
+async function liveResources() {
+  await setImmediate();
+  await setImmediate();
+  return process.getActiveResourcesInfo().filter((r) => r !== "TTYWrap");
+}
+
+/** What `after` holds beyond `before`; a harness timer that fired meanwhile is not a leak. */
+function added(before: string[], after: string[]) {
+  const unmatched = [...before];
+  return after.filter((r) => {
+    const i = unmatched.indexOf(r);
+    if (i === -1) return true;
+    unmatched.splice(i, 1);
+    return false;
+  });
+}
+
 test("leaves no child process or other handle behind", async () => {
-  const before = process
-    .getActiveResourcesInfo()
-    .filter((r) => r !== "TTYWrap");
+  const before = await liveResources();
   await runSession(config, {
     query: scripted([init, success], (cwd) =>
       writeFileSync(join(cwd, "a.txt"), "a\n"),
@@ -318,6 +526,5 @@ test("leaves no child process or other handle behind", async () => {
     post: recorder().post,
     signal: new AbortController().signal,
   });
-  const after = process.getActiveResourcesInfo().filter((r) => r !== "TTYWrap");
-  expect(after).toEqual(before);
+  expect(added(before, await liveResources())).toEqual([]);
 });

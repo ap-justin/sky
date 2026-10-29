@@ -1,4 +1,8 @@
 import type {
+  HookCallback,
+  HookCallbackMatcher,
+  HookEvent,
+  HookInput,
   Options,
   SDKMessage,
   SDKResultMessage,
@@ -16,11 +20,14 @@ export type QueryFn = (params: {
 
 const MAX_PROGRESS_CHARS = 2000;
 
+type RunnerEvent = Omit<RunnerEventPost, "runId">;
+
 /** Every Agent SDK option a run passes is assembled here. */
 function sessionOptions(
   config: Config,
   cwd: string,
   abortController: AbortController,
+  hooks: Options["hooks"],
 ): Options {
   // the session's tools can read their env; the event token stays with the runner
   const { AGENT_TOKEN: _, ...env } = process.env;
@@ -33,6 +40,44 @@ function sessionOptions(
     // no one is attached to answer a prompt until the approval gate exists
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
+    hooks,
+  };
+}
+
+/**
+ * Hooks forward what Claude is doing without holding it up: the event is queued
+ * behind earlier posts and the hook answers `continue` at once, whatever the post does.
+ */
+function sessionHooks(on: {
+  progress: (event: RunnerEvent) => void;
+  stop: (lastMessage: string | undefined) => void;
+}): Options["hooks"] {
+  const matcher = <E extends HookEvent>(
+    handle: (input: Extract<HookInput, { hook_event_name: E }>) => void,
+  ): HookCallbackMatcher[] => {
+    const hook: HookCallback = async (input) => {
+      handle(input as Extract<HookInput, { hook_event_name: E }>);
+      return { continue: true };
+    };
+    return [{ hooks: [hook] }];
+  };
+  return {
+    Notification: matcher<"Notification">((input) =>
+      on.progress({
+        type: "run.progress",
+        payload: { message: clip(input.message) },
+      }),
+    ),
+    PreToolUse: matcher<"PreToolUse">((input) =>
+      on.progress({
+        type: "run.progress",
+        payload: {
+          message: clip(toolHint(input.tool_input) ?? input.tool_name),
+          tool: input.tool_name,
+        },
+      }),
+    ),
+    Stop: matcher<"Stop">((input) => on.stop(input.last_assistant_message)),
   };
 }
 
@@ -42,10 +87,23 @@ export async function runSession(
   deps: { query: QueryFn; post: PostEvent; signal: AbortSignal },
 ): Promise<0 | 1> {
   const { runId } = config;
-  const post = (event: Omit<RunnerEventPost, "runId">) =>
-    deps.post({ runId, ...event } as RunnerEventPost);
+  // one queue keeps the API's order the order things happened, hooks included
+  let queue = Promise.resolve();
+  const post = (event: RunnerEvent) => {
+    const posted = queue.then(() =>
+      deps.post({ runId, ...event } as RunnerEventPost),
+    );
+    queue = posted.catch(() => {});
+    return posted;
+  };
+  let ended = false;
+  const end = async (event: RunnerEvent) => {
+    if (ended) return;
+    ended = true;
+    await post(event);
+  };
   const fail = async (error: string, usage?: Usage) => {
-    await post({
+    await end({
       type: "run.failed",
       payload: usage ? { error, usage } : { error },
     });
@@ -66,10 +124,18 @@ export async function runSession(
   let result: SDKResultMessage | undefined;
   let streamError: string | undefined;
   let started = false;
+  let stopMessage: string | undefined;
+  const hooks = sessionHooks({
+    // a failed post must not fail the tool call that triggered it
+    progress: (event) => void post(event).catch(() => {}),
+    stop: (lastMessage) => {
+      stopMessage = lastMessage || stopMessage;
+    },
+  });
   try {
     const stream = deps.query({
       prompt: config.prompt,
-      options: sessionOptions(config, cwd, abortController),
+      options: sessionOptions(config, cwd, abortController, hooks),
     });
     for await (const message of stream) {
       if (message.type === "system" && message.subtype === "init" && !started) {
@@ -79,8 +145,8 @@ export async function runSession(
           payload: { sessionId: message.session_id },
         });
       } else if (message.type === "assistant") {
-        for (const event of progressOf(message.message.content))
-          await post(event);
+        for (const text of textOf(message.message.content))
+          await post({ type: "run.progress", payload: { message: text } });
       } else if (message.type === "result") {
         result = message;
       }
@@ -109,9 +175,12 @@ export async function runSession(
     return fail(reason, usage);
   }
   if (commitError) return fail(commitError, usage);
-  await post({
+  await end({
     type: "run.finished",
-    payload: { summary: result.result, usage: usageOf(result) },
+    payload: {
+      summary: result.result || stopMessage || "",
+      usage: usageOf(result),
+    },
   });
   return 0;
 }
@@ -121,27 +190,11 @@ type AssistantContent = Extract<
   { type: "assistant" }
 >["message"]["content"];
 
-function progressOf(
-  content: AssistantContent,
-): Omit<RunnerEventPost, "runId">[] {
-  const events: Omit<RunnerEventPost, "runId">[] = [];
-  for (const block of content) {
-    if (block.type === "text" && block.text.trim()) {
-      events.push({
-        type: "run.progress",
-        payload: { message: clip(block.text.trim()) },
-      });
-    } else if (block.type === "tool_use") {
-      events.push({
-        type: "run.progress",
-        payload: {
-          message: clip(toolHint(block.input) ?? block.name),
-          tool: block.name,
-        },
-      });
-    }
-  }
-  return events;
+/** Assistant text, as progress lines; tool calls report through the PreToolUse hook instead. */
+function textOf(content: AssistantContent): string[] {
+  return content.flatMap((block) =>
+    block.type === "text" && block.text.trim() ? [clip(block.text.trim())] : [],
+  );
 }
 
 /** The one input field that says what a built-in tool call is acting on. */
