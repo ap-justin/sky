@@ -15,6 +15,7 @@ import { redact } from "./redact.js";
 import {
   activeRunOf,
   activeRunStatuses,
+  agentUsage,
   isActive,
   presentRun,
   runError,
@@ -309,6 +310,13 @@ export function agentRoutes(
         );
       }
       return c.json({ agent: presentAgent(agent) }, 200);
+    })
+    .get("/:id", agentParam, (c) => {
+      const { id } = c.req.valid("param");
+      const db = c.var.db;
+      const agent = db.select().from(agents).where(eq(agents.id, id)).get();
+      if (!agent) return apiError(c, 404, "not_found", "no such agent");
+      return c.json({ ...presentAgent(agent), usage: agentUsage(db, id) }, 200);
     })
     .get("/:id/runs/:runId", runParam, async (c) => {
       const { id, runId } = c.req.valid("param");

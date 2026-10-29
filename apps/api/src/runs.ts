@@ -5,8 +5,10 @@ import {
   type RunId,
   RunStatus,
   runTransitions,
+  type Usage,
 } from "@harness/shared";
-import { and, eq, inArray, sql } from "drizzle-orm";
+import { and, count, eq, inArray, sql } from "drizzle-orm";
+import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type RunRow = typeof runs.$inferSelect;
@@ -44,6 +46,29 @@ export const presentRun = (row: RunRow, error: string | null) => ({
   error,
   createdAt: row.createdAt,
 });
+
+const total = (column: SQLiteColumn) =>
+  sql<number>`sum(${column})`.mapWith(Number);
+
+/** Usage summed over the agent's runs that reported it; null when none has. */
+export function agentUsage(tx: Db | Tx, agentId: AgentId): Usage | null {
+  // runs_usage keeps the columns all-or-none, so counting one counts runs with usage
+  const row = tx
+    .select({
+      runs: count(runs.inputTokens),
+      inputTokens: total(runs.inputTokens),
+      outputTokens: total(runs.outputTokens),
+      costUsd: total(runs.costUsd),
+      turns: total(runs.turns),
+      durationMs: total(runs.durationMs),
+    })
+    .from(runs)
+    .where(eq(runs.agentId, agentId))
+    .get();
+  if (!row || row.runs === 0) return null;
+  const { runs: _, ...usage } = row;
+  return usage;
+}
 
 /** The agent's run that hasn't ended, if any; an agent has at most one. */
 export const activeRunOf = (tx: Db | Tx, agentId: AgentId) =>

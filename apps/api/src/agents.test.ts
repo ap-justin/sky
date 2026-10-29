@@ -1024,3 +1024,97 @@ test.each([
   expect(logs.join("\n")).toContain(`removing the worktree of ${agent.id}`);
   expect((await followUp(agent.id, { prompt: "more" })).status).toBe(409);
 });
+
+const getAgent = async (agentId: string) => {
+  const res = await app.request(`/v1/agents/${agentId}`, { headers: auth });
+  return {
+    status: res.status,
+    body: (await res.json()) as Record<string, unknown>,
+  };
+};
+
+/** Starts a follow-up on `agentId` and returns its run id and agent token. */
+async function followUpRun(agentId: string, sessions: number) {
+  const res = await followUp(agentId, { prompt: "more" });
+  expect(res.status).toBe(202);
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened(sessions);
+  return { runId: run.id, token: wire.sessions.at(-1)?.env.AGENT_TOKEN ?? "" };
+}
+
+test("GET agent totals usage across its runs; a stopped run adds nothing", async () => {
+  const { agent } = await finishedRun();
+  const second = await followUpRun(agent.id, 2);
+  await postEvent(second.token, {
+    runId: second.runId,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  await postEvent(second.token, {
+    runId: second.runId,
+    type: "run.finished",
+    payload: {
+      summary: "more",
+      usage: {
+        inputTokens: 800,
+        outputTokens: 60,
+        costUsd: 0.01,
+        turns: 2,
+        durationMs: 9_000,
+      },
+    },
+  });
+  const third = await followUpRun(agent.id, 3);
+  expect((await action(agent.id, "stop")).status).toBe(200);
+  expect((await getRun(agent.id, third.runId)).body.usage).toBeNull();
+
+  const { status, body } = await getAgent(agent.id);
+  expect(status).toBe(200);
+  expect(body).toEqual({
+    id: agent.id,
+    envId: expect.any(String),
+    sessionId: "s",
+    branch: `claude/${agent.id}`,
+    status: "idle",
+    createdAt: expect.any(String),
+    archivedAt: null,
+    usage: {
+      inputTokens: 2000,
+      outputTokens: 400,
+      costUsd: expect.closeTo(0.05),
+      turns: 5,
+      durationMs: 50_000,
+    },
+  });
+});
+
+test("GET agent whose runs never reported usage shows null usage, not zeros", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.failed",
+    payload: { error: "claude exited 1" },
+  });
+  expect((await getAgent(agent.id)).body).toMatchObject({
+    status: "idle",
+    usage: null,
+  });
+  expect(
+    db.$client.prepare("select input_tokens, cost_usd, turns from runs").get(),
+  ).toEqual({ input_tokens: null, cost_usd: null, turns: null });
+});
+
+test.each([
+  ["an unknown agent", "agt_doesnotexist0000000000"],
+  ["a malformed id", "not-an-id"],
+])("GET of %s gets 404", async (_, id) => {
+  const { status, body } = await getAgent(id);
+  expect(status).toBe(404);
+  expect(body).toMatchObject({ error: { code: "not_found" } });
+});
+
+test("GET agent without a bearer gets 401", async () => {
+  const { agent } = await runningRun();
+  const res = await app.request(`/v1/agents/${agent.id}`);
+  expect(res.status).toBe(401);
+});
