@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, environments, migrate, openDb } from "@harness/db";
-import type { EnvironmentId } from "@harness/shared";
+import { type Db, environments, migrate, openDb, runs } from "@harness/db";
+import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
@@ -558,6 +558,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     createdAt: expect.any(String),
     branch: `claude/${agent.id}`,
     diff: patch,
+    pendingRequest: null,
   });
   expect(wire.calls.at(-1)).toBe(
     `exec harness-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
@@ -678,6 +679,67 @@ test("GET without a bearer gets 401", async () => {
   const { agent, run } = await runningRun();
   const res = await app.request(`/v1/agents/${agent.id}/runs/${run.id}`);
   expect(res.status).toBe(401);
+});
+
+const listRuns = async (agentId: string) => {
+  const res = await app.request(`/v1/agents/${agentId}/runs`, {
+    headers: auth,
+  });
+  return {
+    status: res.status,
+    body: (await res.json()) as { data: { id: string }[] },
+  };
+};
+
+test("GET runs lists the agent's runs newest first, ties by id, without diffs or waking the sprite", async () => {
+  const { agent, run } = await finishedRun();
+  await runningRun();
+  const agentId = agent.id as AgentId;
+  const at = (iso: string, suffix: string) => ({
+    id: `run_${suffix.repeat(22)}` as RunId,
+    agentId,
+    status: "stopped" as const,
+    createdAt: iso,
+  });
+  db.insert(runs)
+    .values([
+      at("2000-01-01T00:00:00.000Z", "o"),
+      at("2999-01-01T00:00:00.000Z", "A"),
+      at("2999-01-01T00:00:00.000Z", "B"),
+    ])
+    .run();
+  const calls = wire.calls.length;
+  const { status, body } = await listRuns(agent.id);
+  expect(status).toBe(200);
+  expect(body.data.map((r) => r.id)).toEqual([
+    `run_${"B".repeat(22)}`,
+    `run_${"A".repeat(22)}`,
+    run.id,
+    `run_${"o".repeat(22)}`,
+  ]);
+  for (const item of body.data) {
+    expect(item).toMatchObject({
+      agentId,
+      branch: agent.branch,
+      diff: null,
+      pendingRequest: null,
+    });
+  }
+  expect(body.data[2]).toMatchObject({ summary: "done", status: "finished" });
+  expect(wire.calls).toHaveLength(calls);
+});
+
+test.each([
+  ["an unknown agent", "agt_nope"],
+  ["a malformed id", "nope"],
+])("GET runs of %s gets 404", async (_, id) => {
+  const res = await app.request(`/v1/agents/${id}/runs`, { headers: auth });
+  expect(res.status).toBe(404);
+});
+
+test("GET runs without a bearer gets 401", async () => {
+  const { agent } = await runningRun();
+  expect((await app.request(`/v1/agents/${agent.id}/runs`)).status).toBe(401);
 });
 
 test("a run silent past the timeout is failed with runner_timeout, freeing its cap slot", async () => {

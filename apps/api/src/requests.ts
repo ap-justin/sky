@@ -30,7 +30,7 @@ export const requestDecisions = {
 /** The run's undecided request, if any; a run has at most one. */
 export const openRequestOf = (tx: Db | Tx, runId: RunId) =>
   tx
-    .select({ id: runRequests.id })
+    .select({ request: runRequests.request })
     .from(runRequests)
     .where(and(eq(runRequests.runId, runId), isNull(runRequests.decidedAt)))
     .get();

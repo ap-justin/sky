@@ -382,3 +382,33 @@ test("a run waiting past the wait timeout plus 5 minutes is failed with waiting_
   const res = await decide("answers", { requestId, answer: "a" });
   expect(res.status).toBe(409);
 });
+
+const pendingOf = async () => {
+  const res = await app.request(`/v1/agents/${agentId}/runs/${runId}`, {
+    headers: auth,
+  });
+  expect(res.status).toBe(200);
+  return ((await res.json()) as { pendingRequest: unknown }).pendingRequest;
+};
+
+test.each([
+  ["a question", question, { answer: "main" }, "answers"],
+  ["an approval", approval, { decision: "approve" }, "approvals"],
+] as const)(
+  "GET run shows %s as pendingRequest only while it is undecided",
+  async (_, make, decision, verb) => {
+    runningRun();
+    expect(await pendingOf()).toBeNull();
+    const request = make();
+    const res = await postEvent({
+      runId,
+      type: "run.waiting",
+      payload: { request },
+    });
+    expect(res.status).toBe(201);
+    expect(await pendingOf()).toEqual(request);
+    const { requestId } = request;
+    expect((await decide(verb, { requestId, ...decision })).status).toBe(200);
+    expect(await pendingOf()).toBeNull();
+  },
+);

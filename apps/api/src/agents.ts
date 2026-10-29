@@ -1,5 +1,5 @@
 import type { SpritesClient } from "@fly/sprites";
-import { agents, environments, runs } from "@harness/db";
+import { agents, type Db, environments, runs } from "@harness/db";
 import {
   AgentId,
   agentBranch,
@@ -9,7 +9,7 @@ import {
   RunId,
 } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
-import { and, count, eq, inArray } from "drizzle-orm";
+import { and, count, desc, eq, inArray } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
@@ -19,7 +19,7 @@ import { mintId } from "./ids.js";
 import { type Launcher, removeWorktree, signalRunner } from "./launch.js";
 import { REPO_DIR } from "./provision.js";
 import { redact } from "./redact.js";
-import { decideRequest, requestDecisions } from "./requests.js";
+import { decideRequest, openRequestOf, requestDecisions } from "./requests.js";
 import { streamRunEvents } from "./run-stream.js";
 import {
   activeRunOf,
@@ -51,6 +51,18 @@ const ApprovalInput = z.discriminatedUnion("decision", [
 ]);
 
 type AgentRow = typeof agents.$inferSelect;
+
+const presentRunDetail = (
+  db: Db,
+  run: typeof runs.$inferSelect,
+  branch: string,
+  diff: string | null,
+) => ({
+  ...presentRun(run, runError(db, run.id)),
+  branch,
+  diff,
+  pendingRequest: openRequestOf(db, run.id)?.request ?? null,
+});
 
 const presentAgent = (row: AgentRow) => ({
   id: row.id,
@@ -404,6 +416,23 @@ export function agentRoutes(
       if (!agent) return apiError(c, 404, "not_found", "no such agent");
       return c.json({ ...presentAgent(agent), usage: agentUsage(db, id) }, 200);
     })
+    .get("/:id/runs", agentParam, (c) => {
+      const { id } = c.req.valid("param");
+      const db = c.var.db;
+      const agent = db.select().from(agents).where(eq(agents.id, id)).get();
+      if (!agent) return apiError(c, 404, "not_found", "no such agent");
+      const rows = db
+        .select()
+        .from(runs)
+        .where(eq(runs.agentId, id))
+        .orderBy(desc(runs.createdAt), desc(runs.id))
+        .all();
+      // reading a diff wakes the sprite, so only the single-run GET returns one
+      const data = rows.map((run) =>
+        presentRunDetail(db, run, agent.branch, null),
+      );
+      return c.json({ data }, 200);
+    })
     .get("/:id/runs/:runId", runParam, async (c) => {
       const { id, runId } = c.req.valid("param");
       const db = c.var.db;
@@ -448,14 +477,7 @@ export function agentRoutes(
           );
         }
       }
-      return c.json(
-        {
-          ...presentRun(run, runError(db, run.id)),
-          branch: agent.branch,
-          diff,
-        },
-        200,
-      );
+      return c.json(presentRunDetail(db, run, agent.branch, diff), 200);
     })
     .get("/:id/runs/:runId/stream", runParam, afterQuery, lastEventId, (c) => {
       const { id, runId } = c.req.valid("param");
