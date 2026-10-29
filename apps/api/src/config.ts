@@ -1,4 +1,8 @@
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
+
+// the build copies the runner bundle next to the API bundle, which is where this module lands
+const bundledRunner = fileURLToPath(new URL("./runner.mjs", import.meta.url));
 
 // bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match
 const configSchema = z.object({
@@ -9,6 +13,12 @@ const configSchema = z.object({
   SPRITES_TOKEN: z.string().min(1),
   DATA_DIR: z.string().min(1),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
+  CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1),
+  /** How a sprite reaches this API; the runner posts its events here. */
+  PUBLIC_BASE_URL: z.url({ protocol: /^https?$/ }),
+  RUNNER_BUNDLE_PATH: z.string().min(1).default(bundledRunner),
+  /** A run with no event for this long is failed with `runner_timeout`. */
+  RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
 });
 
 export type Config = {
@@ -16,24 +26,32 @@ export type Config = {
   spritesToken: string;
   dataDir: string;
   port: number;
+  claudeOauthToken: string;
+  publicBaseUrl: string;
+  runnerBundlePath: string;
+  runTimeoutMs: number;
 };
 
 type Env = Record<string, string | undefined>;
 
-/** Names each bad variable; values stay out of the message since one is a secret. */
+/** Names each bad variable; values stay out of the message since some are secrets. */
 export function loadConfig(
   env: Env,
 ): { ok: true; config: Config } | { ok: false; message: string } {
   const parsed = configSchema.safeParse(env);
   if (parsed.success) {
-    const { HARNESS_API_KEY, SPRITES_TOKEN, DATA_DIR, PORT } = parsed.data;
+    const e = parsed.data;
     return {
       ok: true,
       config: {
-        apiKey: HARNESS_API_KEY,
-        spritesToken: SPRITES_TOKEN,
-        dataDir: DATA_DIR,
-        port: PORT,
+        apiKey: e.HARNESS_API_KEY,
+        spritesToken: e.SPRITES_TOKEN,
+        dataDir: e.DATA_DIR,
+        port: e.PORT,
+        claudeOauthToken: e.CLAUDE_CODE_OAUTH_TOKEN,
+        publicBaseUrl: e.PUBLIC_BASE_URL,
+        runnerBundlePath: e.RUNNER_BUNDLE_PATH,
+        runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
       },
     };
   }

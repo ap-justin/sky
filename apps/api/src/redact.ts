@@ -11,13 +11,23 @@ const tokenPatterns = [
   /\beyJ[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+\.[0-9A-Za-z_-]+/g,
 ];
 
-/** Scrubs credential-shaped strings and this deployment's own secrets from text bound for an API response or log. */
+/** Scrubs credential-shaped strings and this deployment's own secrets (plus any `extra`) from text bound for an API response or log. */
 export function redact(
   text: string,
-  secrets: Pick<Config, "apiKey" | "spritesToken">,
+  secrets: Pick<
+    Config,
+    "apiKey" | "spritesToken" | "claudeOauthToken" | "publicBaseUrl"
+  >,
+  ...extra: string[]
 ): string {
   let out = text;
-  for (const secret of [secrets.apiKey, secrets.spritesToken]) {
+  for (const secret of [
+    secrets.apiKey,
+    secrets.spritesToken,
+    secrets.claudeOauthToken,
+    secrets.publicBaseUrl,
+    ...extra,
+  ]) {
     if (secret) out = out.split(secret).join(REDACTED);
   }
   for (const pattern of tokenPatterns) out = out.replace(pattern, REDACTED);

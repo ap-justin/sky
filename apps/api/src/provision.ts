@@ -17,6 +17,13 @@ import {
 } from "./sprites.js";
 
 export const REPO_DIR = "/workspace/repo";
+// the runner's worktrees point at the clone, so they go when it does
+export const WORKTREES_DIR = "/workspace/worktrees";
+export const RUNNER_DIR = "/opt/harness";
+// = the version in packages/runner/package.json; the runner bundle leaves the SDK external
+const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
+// no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep
+const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK}`;
 // ≤ the length CHECK on environments.failure_stderr in db/src/schema.ts
 const TAIL_CHARS = 4000;
 
@@ -47,9 +54,10 @@ export function createProvisioner({ db, config, sprites, log }: Deps) {
     try {
       if (fresh) await createSprite(sprites, name);
       step = "clone";
-      await exec(["rm", "-rf", REPO_DIR]);
+      await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR]);
       await exec(["git", "clone", cloneUrl(env.repo), REPO_DIR]);
       step = "setup";
+      await exec(["sh", "-c", installRunnerSdk]);
       await exec(["bash", "-c", env.setup], REPO_DIR);
       step = "checkpoint";
       const checkpointId = await checkpointSprite(

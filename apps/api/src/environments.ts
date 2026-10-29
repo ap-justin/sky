@@ -1,11 +1,6 @@
 import type { SpritesClient } from "@fly/sprites";
 import { agents, type Db, environments, events, runs } from "@harness/db";
-import {
-  Environment,
-  EnvironmentId,
-  RunStatus,
-  runTransitions,
-} from "@harness/shared";
+import { Environment, EnvironmentId } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
 import { and, asc, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -13,7 +8,9 @@ import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import type { Provisioner } from "./provision.js";
+import { activeRunStatuses, type Tx } from "./runs.js";
 import { destroySprite, spriteNameFor } from "./sprites.js";
+import { body, jsonBody } from "./validation.js";
 
 const { name, repo, setup, concurrency, approvalPolicy } = Environment.shape;
 const EnvironmentInput = z.strictObject({
@@ -32,11 +29,6 @@ const EnvironmentPatch = z.strictObject({
   approvalPolicy: approvalPolicy.unwrap().optional(),
 });
 
-const activeRunStatuses = RunStatus.options.filter(
-  (s) => runTransitions[s].length > 0,
-);
-
-type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type EnvRow = typeof environments.$inferSelect;
 
 const present = (row: EnvRow) => ({
@@ -93,27 +85,6 @@ const hasActiveRun = (tx: Db | Tx, id: EnvironmentId) =>
     .innerJoin(agents, eq(runs.agentId, agents.id))
     .where(and(eq(agents.envId, id), inArray(runs.status, activeRunStatuses)))
     .get() !== undefined;
-
-// validators read the body only under a JSON content type, so anything else would validate as {}
-const jsonBody = factory.createMiddleware(async (c, next) => {
-  const type = c.req.header("content-type") ?? "";
-  if (!/^application\/(?:[\w.-]+\+)?json\b/i.test(type)) {
-    return apiError(c, 415, "unsupported_media_type", "send application/json");
-  }
-  try {
-    await c.req.json();
-  } catch {
-    return apiError(c, 400, "invalid_json", "request body is not valid JSON");
-  }
-  await next();
-});
-
-const body = <T extends z.ZodType>(schema: T) =>
-  zValidator("json", schema, (result, c) => {
-    if (!result.success) {
-      return apiError(c, 400, "invalid_body", z.prettifyError(result.error));
-    }
-  });
 
 const notFound = "no such environment";
 const runActive = "a run on this environment is active";

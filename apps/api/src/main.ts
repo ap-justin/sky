@@ -9,12 +9,13 @@ if (!result.ok) {
 }
 const { config } = result;
 
-const { app, db } = boot(config, console.log);
+const { app, db, stopSweeping } = boot(config, console.log);
 const server = serve({ fetch: app.fetch, port: config.port }, (info) =>
   console.log(`listening on :${info.port}`),
 );
 
 process.once("SIGTERM", () => {
+  stopSweeping();
   shutdown(server, db).then(
     () => process.exit(0),
     (err: unknown) => {

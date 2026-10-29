@@ -3,19 +3,53 @@ import { loadConfig } from "./config.js";
 
 const apiKey = "k".repeat(40);
 const spritesToken = "sprites-token";
+const claudeOauthToken = "sk-ant-oat01-test";
+const required = {
+  HARNESS_API_KEY: apiKey,
+  SPRITES_TOKEN: spritesToken,
+  DATA_DIR: "/data",
+  CLAUDE_CODE_OAUTH_TOKEN: claudeOauthToken,
+  PUBLIC_BASE_URL: "https://harness.example.com",
+};
 
-test("parses the env, defaulting PORT to 8080", () => {
-  expect(
-    loadConfig({
-      HARNESS_API_KEY: apiKey,
-      SPRITES_TOKEN: spritesToken,
-      DATA_DIR: "/data",
-    }),
-  ).toEqual({
+test("parses the env, defaulting PORT, the runner bundle path and the run timeout", () => {
+  expect(loadConfig(required)).toEqual({
     ok: true,
-    config: { apiKey, spritesToken, dataDir: "/data", port: 8080 },
+    config: {
+      apiKey,
+      spritesToken,
+      dataDir: "/data",
+      port: 8080,
+      claudeOauthToken,
+      publicBaseUrl: "https://harness.example.com",
+      runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
+      runTimeoutMs: 30 * 60_000,
+    },
   });
 });
+
+test("RUNNER_BUNDLE_PATH and RUN_TIMEOUT_MINUTES override their defaults", () => {
+  const result = loadConfig({
+    ...required,
+    RUNNER_BUNDLE_PATH: "/opt/api/runner.mjs",
+    RUN_TIMEOUT_MINUTES: "5",
+  });
+  expect(result).toMatchObject({
+    ok: true,
+    config: { runnerBundlePath: "/opt/api/runner.mjs", runTimeoutMs: 300_000 },
+  });
+});
+
+test.each(["CLAUDE_CODE_OAUTH_TOKEN", "PUBLIC_BASE_URL"])(
+  "%s is required",
+  (name) => {
+    const result = loadConfig({ ...required, [name]: undefined });
+    expect(result).toEqual({
+      ok: false,
+      message: expect.stringContaining(`${name} is missing`),
+    });
+  },
+);
 
 test("a missing variable is named in the failure", () => {
   const result = loadConfig({ DATA_DIR: "/data" });

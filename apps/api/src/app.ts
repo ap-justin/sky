@@ -4,10 +4,13 @@ import type { Context } from "hono";
 import { bearerAuth } from "hono/bearer-auth";
 import { HTTPException } from "hono/http-exception";
 import { logger } from "hono/logger";
+import { agentRoutes } from "./agents.js";
 import type { Config } from "./config.js";
 import { environmentRoutes } from "./environments.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
+import { internalRoutes } from "./internal.js";
+import { createLauncher } from "./launch.js";
 import { createProvisioner } from "./provision.js";
 
 export type AppDeps = {
@@ -23,9 +26,11 @@ export function createApp({ db, config, sprites, log }: AppDeps) {
     apiError(c, 401, "unauthorized", message);
 
   const provisioner = createProvisioner({ db, config, sprites, log });
+  const launcher = createLauncher({ db, config, sprites, log });
   const v1 = factory
     .createApp()
-    .route("/environments", environmentRoutes(provisioner, sprites, log));
+    .route("/environments", environmentRoutes(provisioner, sprites, log))
+    .route("/agents", agentRoutes(launcher, sprites, log));
 
   const app = factory
     .createApp()
@@ -43,6 +48,8 @@ export function createApp({ db, config, sprites, log }: AppDeps) {
       }
       return c.json({ status: "ok", db: "ok" } as const, 200);
     })
+    // the runner's own channel, authenticated per run by its agent token rather than the API key
+    .route("/internal", internalRoutes())
     .use(
       "/v1/*",
       bearerAuth({

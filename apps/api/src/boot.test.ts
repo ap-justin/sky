@@ -4,37 +4,42 @@ import { join } from "node:path";
 import type { Db } from "@harness/db";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { boot, shutdown } from "./boot.js";
+import { testConfig } from "./testing/sprites.js";
 
 let dir: string;
 let db: Db | undefined;
+let stops: (() => void)[];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "harness-api-"));
+  stops = [];
 });
 afterEach(() => {
+  for (const stop of stops) stop();
   if (db?.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
 });
 
-const config = () => ({
-  apiKey: "k".repeat(40),
-  spritesToken: "unused",
-  dataDir: dir,
-  port: 8080,
-});
+const config = () => testConfig({ dataDir: dir, runTimeoutMs: 60_000 });
+
+const booted = (log: (line: string) => void = () => {}) => {
+  const b = boot(config(), log);
+  stops.push(b.stopSweeping);
+  return b;
+};
 
 test("booting on an empty data dir creates harness.db with the schema migrated", async () => {
-  const booted = boot(config(), () => {});
-  db = booted.db;
+  const b = booted();
+  db = b.db;
   expect(existsSync(join(dir, "harness.db"))).toBe(true);
   const table = db.$client
     .prepare("select name from sqlite_schema where name = 'environments'")
     .get();
   expect(table).toEqual({ name: "environments" });
-  expect((await booted.app.request("/healthz")).status).toBe(200);
+  expect((await b.app.request("/healthz")).status).toBe(200);
 });
 
 test("shutdown closes the server before the DB", async () => {
-  db = boot(config(), () => {}).db;
+  db = booted().db;
   const order: string[] = [];
   const server = {
     close(done: (err?: Error) => void) {
@@ -50,7 +55,7 @@ test("shutdown closes the server before the DB", async () => {
 });
 
 test("an env a previous process left provisioning boots as failed; others keep their status", async () => {
-  const first = boot(config(), () => {}).db;
+  const first = booted().db;
   const insert = first.$client.prepare(
     "insert into environments (id, name, repo, setup, status, sprite_name) values (?, ?, 'acme/kru', '', ?, ?)",
   );
@@ -58,7 +63,7 @@ test("an env a previous process left provisioning boots as failed; others keep t
   insert.run("env_ok", "ok", "ready", "harness-env_ok");
   first.$client.close();
 
-  db = boot(config(), () => {}).db;
+  db = booted().db;
   const rows = db.$client
     .prepare("select id, status from environments order by id")
     .all();
@@ -66,4 +71,28 @@ test("an env a previous process left provisioning boots as failed; others keep t
     { id: "env_ok", status: "ready" },
     { id: "env_stuck", status: "failed" },
   ]);
+});
+
+test("boot fails runs a previous process left silent past the timeout; fresh ones stay", async () => {
+  const first = booted().db;
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'harness-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_old', 'env_a', 'claude/agt_old', 'running'), ('agt_new', 'env_a', 'claude/agt_new', 'running');
+    insert into runs (id, agent_id, status, created_at) values ('run_old', 'agt_old', 'running', '2026-01-01T00:00:00.000Z'), ('run_new', 'agt_new', 'starting', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+  `);
+  first.$client.close();
+
+  db = booted().db;
+  expect(
+    db.$client.prepare("select id, status from runs order by id").all(),
+  ).toEqual([
+    { id: "run_new", status: "starting" },
+    { id: "run_old", status: "failed" },
+  ]);
+  expect(db.$client.prepare("select type, payload from events").all()).toEqual([
+    { type: "run.failed", payload: '{"error":"runner_timeout"}' },
+  ]);
+  expect(
+    db.$client.prepare("select status from agents where id = 'agt_old'").get(),
+  ).toEqual({ status: "idle" });
 });

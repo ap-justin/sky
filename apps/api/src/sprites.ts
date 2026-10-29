@@ -70,3 +70,42 @@ export async function destroySprite(
     throw err;
   }
 }
+
+/** Writes `data` to an absolute path in the sprite, creating parent directories. */
+export async function writeSpriteFile(
+  client: SpritesClient,
+  name: string,
+  path: string,
+  data: string | Buffer,
+): Promise<void> {
+  await client.sprite(name).filesystem("/").writeFile(path, data);
+}
+
+/**
+ * Starts `argv` in a detachable session and disconnects as soon as the socket opens: the process
+ * keeps running in the sprite with nothing held open to it. A plain exec's process is reaped
+ * when its connection drops, so this is the one way to leave a process running.
+ */
+export function startDetached(
+  client: SpritesClient,
+  name: string,
+  [file, ...args]: [string, ...string[]],
+  options: { cwd: string; env: Record<string, string> },
+): Promise<void> {
+  const session = client.sprite(name).createSession(file, args, options);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    session.once("spawn", () => {
+      settled = true;
+      session.close();
+      resolve();
+    });
+    // stays attached: an 'error' emitted with no listener would crash the process
+    session.on("error", (err: Error) => {
+      if (settled) return;
+      settled = true;
+      session.close();
+      reject(err);
+    });
+  });
+}

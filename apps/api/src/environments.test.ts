@@ -1,125 +1,27 @@
+import { readFileSync } from "node:fs";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@harness/db";
-import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
-import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
+import {
+  type SpritesWire,
+  spritesToken,
+  stubSprites,
+  testConfig,
+} from "./testing/sprites.js";
 
 const apiKey = "k".repeat(40);
-const spritesToken = "sprites-test-token";
-const SPRITES = "https://api.sprites.dev/v1/sprites";
-
-type ExecOutcome = { exitCode: number; stdout?: string; stderr?: string };
-
-/** In-memory Sprites API speaking the wire format @fly/sprites reads. */
-function stubSprites() {
-  const wire = {
-    sprites: new Set<string>(),
-    /** One line per call, in order: `create <name>`, `exec <name> <dir> <argv…>`, `checkpoint <name>`, `delete <name>`. */
-    calls: [] as string[],
-    exec: (_argv: string[]): ExecOutcome => ({ exitCode: 0 }),
-    createStatus: 201,
-    checkpointLines: undefined as object[] | undefined,
-    deleteStatus: 204,
-  };
-  let checkpoints = 0;
-  const authorized = (request: Request) =>
-    request.headers.get("authorization") === `Bearer ${spritesToken}`;
-
-  server.use(
-    http.post(SPRITES, async ({ request }) => {
-      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
-      const { name } = (await request.json()) as { name: string };
-      wire.calls.push(`create ${name}`);
-      if (wire.createStatus !== 201) {
-        return HttpResponse.json(
-          { error: "sprite quota exceeded" },
-          { status: wire.createStatus },
-        );
-      }
-      wire.sprites.add(name);
-      return HttpResponse.json(
-        { id: `spr_${name}`, name, status: "cold" },
-        { status: 201 },
-      );
-    }),
-    http.post(`${SPRITES}/:name/exec`, ({ request, params }) => {
-      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
-      const name = String(params.name);
-      const url = new URL(request.url);
-      const argv = url.searchParams.getAll("cmd");
-      wire.calls.push(
-        `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${argv.join(" ")}`,
-      );
-      if (!wire.sprites.has(name)) {
-        return HttpResponse.json({ error: "not found" }, { status: 404 });
-      }
-      const outcome = wire.exec(argv);
-      const enc = new TextEncoder();
-      // one frame per chunk: a stream-id byte, then the payload; exit is [3, code]
-      const frames = [
-        ...(outcome.stdout ? [[1, ...enc.encode(outcome.stdout)]] : []),
-        ...(outcome.stderr ? [[2, ...enc.encode(outcome.stderr)]] : []),
-        [3, outcome.exitCode],
-      ];
-      // the SDK splits frames on read boundaries, so each goes out on its own tick, as the
-      // live server flushes them; enqueued together they coalesce into one read
-      const body = new ReadableStream<Uint8Array>({
-        async pull(controller) {
-          const frame = frames.shift();
-          if (!frame) return controller.close();
-          await new Promise((resolve) => setTimeout(resolve, 0));
-          controller.enqueue(new Uint8Array(frame));
-        },
-      });
-      return new HttpResponse(body, {
-        headers: { "content-type": "application/octet-stream" },
-      });
-    }),
-    http.post(`${SPRITES}/:name/checkpoint`, ({ request, params }) => {
-      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
-      const name = String(params.name);
-      wire.calls.push(`checkpoint ${name}`);
-      checkpoints += 1;
-      const time = "2026-10-29T00:00:00Z";
-      const lines = wire.checkpointLines ?? [
-        { type: "info", data: "Creating checkpoint...", time },
-        { type: "complete", data: `Checkpoint v${checkpoints} created`, time },
-      ];
-      return new HttpResponse(
-        `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`,
-        { headers: { "content-type": "application/x-ndjson" } },
-      );
-    }),
-    http.delete(`${SPRITES}/:name`, ({ request, params }) => {
-      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
-      const name = String(params.name);
-      wire.calls.push(`delete ${name}`);
-      if (wire.deleteStatus !== 204) {
-        return HttpResponse.json(
-          { error: "upstream unavailable" },
-          { status: wire.deleteStatus },
-        );
-      }
-      if (!wire.sprites.delete(name)) {
-        return HttpResponse.json({ error: "not found" }, { status: 404 });
-      }
-      return new HttpResponse(null, { status: 204 });
-    }),
-  );
-  return wire;
-}
 
 let db: Db;
 let app: ReturnType<typeof createApp>;
-let wire: ReturnType<typeof stubSprites>;
+let wire: SpritesWire;
 beforeEach(() => {
   db = openDb(":memory:");
   migrate(db);
   wire = stubSprites();
   app = createApp({
     db,
-    config: { apiKey, spritesToken, dataDir: "/unused", port: 8080 },
+    config: testConfig(),
     sprites: new SpritesClient(spritesToken),
     log: () => {},
   });
@@ -156,6 +58,15 @@ const settled = (id: string) =>
 
 const kru = { name: "kru", repo: "acme/kru", setup: "pnpm install" };
 
+// the runner bundle externalizes the Agent SDK, so the sprite installs the exact version the runner builds against
+const runnerSdk = JSON.parse(
+  readFileSync(
+    new URL("../../../packages/runner/package.json", import.meta.url),
+    "utf8",
+  ),
+).dependencies["@anthropic-ai/claude-agent-sdk"];
+const installRunnerSdk = `[ -w /opt/harness ] || sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/harness; npm install --prefix /opt/harness --no-audit --no-fund @anthropic-ai/claude-agent-sdk@${runnerSdk}`;
+
 test("POST returns 202 provisioning, then the sprite is created, cloned, set up and checkpointed", async () => {
   const res = await post(kru);
   expect(res.status).toBe(202);
@@ -183,8 +94,9 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
   const sprite = `harness-${created.id}`;
   expect(wire.calls).toEqual([
     `create ${sprite}`,
-    `exec ${sprite} - rm -rf /workspace/repo`,
+    `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo`,
+    `exec ${sprite} - sh -c ${installRunnerSdk}`,
     `exec ${sprite} /workspace/repo bash -c pnpm install`,
     `checkpoint ${sprite}`,
   ]);
@@ -248,6 +160,19 @@ test.each([
     });
   },
 );
+
+test("a runner SDK install that fails ends failed at the setup step", async () => {
+  wire.exec = (argv) =>
+    argv[0] === "sh"
+      ? { exitCode: 1, stderr: "npm ERR! network\n" }
+      : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  expect(await settled(id)).toMatchObject({
+    status: "failed",
+    failure: { step: "setup", stderr: "npm ERR! network\n" },
+  });
+  expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
+});
 
 test("a setup that fails with no stderr names its exit code", async () => {
   wire.exec = (argv) =>
@@ -415,8 +340,9 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
   });
   const sprite = `harness-${id}`;
   expect(wire.calls).toEqual([
-    `exec ${sprite} - rm -rf /workspace/repo`,
+    `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo`,
+    `exec ${sprite} - sh -c ${installRunnerSdk}`,
     `exec ${sprite} /workspace/repo bash -c pnpm install --frozen-lockfile`,
     `checkpoint ${sprite}`,
   ]);
