@@ -1,3 +1,4 @@
+import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@harness/db";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { createApp } from "./app.js";
@@ -12,7 +13,8 @@ beforeEach(() => {
   logs = [];
   app = createApp({
     db,
-    config: { apiKey, dataDir: "/unused", port: 8080 },
+    config: { apiKey, spritesToken: "unused", dataDir: "/unused", port: 8080 },
+    sprites: new SpritesClient("unused"),
     log: (line) => logs.push(line),
   });
 });

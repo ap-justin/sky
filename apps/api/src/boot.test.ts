@@ -15,7 +15,12 @@ afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
 });
 
-const config = () => ({ apiKey: "k".repeat(40), dataDir: dir, port: 8080 });
+const config = () => ({
+  apiKey: "k".repeat(40),
+  spritesToken: "unused",
+  dataDir: dir,
+  port: 8080,
+});
 
 test("booting on an empty data dir creates harness.db with the schema migrated", async () => {
   const booted = boot(config(), () => {});
@@ -42,4 +47,23 @@ test("shutdown closes the server before the DB", async () => {
   await shutdown(server, db);
   order.push(`db open: ${db.$client.open}`);
   expect(order).toEqual(["server closed, db open: true", "db open: false"]);
+});
+
+test("an env a previous process left provisioning boots as failed; others keep their status", async () => {
+  const first = boot(config(), () => {}).db;
+  const insert = first.$client.prepare(
+    "insert into environments (id, name, repo, setup, status, sprite_name) values (?, ?, 'acme/kru', '', ?, ?)",
+  );
+  insert.run("env_stuck", "stuck", "provisioning", "harness-env_stuck");
+  insert.run("env_ok", "ok", "ready", "harness-env_ok");
+  first.$client.close();
+
+  db = boot(config(), () => {}).db;
+  const rows = db.$client
+    .prepare("select id, status from environments order by id")
+    .all();
+  expect(rows).toEqual([
+    { id: "env_ok", status: "ready" },
+    { id: "env_stuck", status: "failed" },
+  ]);
 });

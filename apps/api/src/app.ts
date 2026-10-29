@@ -1,20 +1,31 @@
+import type { SpritesClient } from "@fly/sprites";
 import type { Db } from "@harness/db";
 import type { Context } from "hono";
 import { bearerAuth } from "hono/bearer-auth";
 import { HTTPException } from "hono/http-exception";
 import { logger } from "hono/logger";
 import type { Config } from "./config.js";
+import { environmentRoutes } from "./environments.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
+import { createProvisioner } from "./provision.js";
 
-export type AppDeps = { db: Db; config: Config; log: (line: string) => void };
+export type AppDeps = {
+  db: Db;
+  config: Config;
+  sprites: SpritesClient;
+  log: (line: string) => void;
+};
 
-export function createApp({ db, config, log }: AppDeps) {
+export function createApp({ db, config, sprites, log }: AppDeps) {
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
   const unauthorized = (message: string) => (c: Context) =>
     apiError(c, 401, "unauthorized", message);
 
-  const v1 = factory.createApp();
+  const provisioner = createProvisioner({ db, config, sprites, log });
+  const v1 = factory
+    .createApp()
+    .route("/environments", environmentRoutes(provisioner, sprites, log));
 
   const app = factory
     .createApp()

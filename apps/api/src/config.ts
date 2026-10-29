@@ -6,11 +6,17 @@ const configSchema = z.object({
     .string()
     .min(32)
     .regex(/^[A-Za-z0-9._~+/-]+=*$/),
+  SPRITES_TOKEN: z.string().min(1),
   DATA_DIR: z.string().min(1),
   PORT: z.coerce.number().int().min(1).max(65535).default(8080),
 });
 
-export type Config = { apiKey: string; dataDir: string; port: number };
+export type Config = {
+  apiKey: string;
+  spritesToken: string;
+  dataDir: string;
+  port: number;
+};
 
 type Env = Record<string, string | undefined>;
 
@@ -20,10 +26,15 @@ export function loadConfig(
 ): { ok: true; config: Config } | { ok: false; message: string } {
   const parsed = configSchema.safeParse(env);
   if (parsed.success) {
-    const { HARNESS_API_KEY, DATA_DIR, PORT } = parsed.data;
+    const { HARNESS_API_KEY, SPRITES_TOKEN, DATA_DIR, PORT } = parsed.data;
     return {
       ok: true,
-      config: { apiKey: HARNESS_API_KEY, dataDir: DATA_DIR, port: PORT },
+      config: {
+        apiKey: HARNESS_API_KEY,
+        spritesToken: SPRITES_TOKEN,
+        dataDir: DATA_DIR,
+        port: PORT,
+      },
     };
   }
   // zod's default issue messages describe the rule, never the input
