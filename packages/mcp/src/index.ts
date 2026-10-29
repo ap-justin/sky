@@ -94,11 +94,19 @@ function apiClient({
 const { name, repo, setup } = Environment.shape;
 const nonEmpty = z.string().min(1);
 
+const DIFF_LIMIT = 20_000;
+
 const StatusInput = z
   .strictObject({
     agentId: AgentId.optional(),
     runId: RunId.optional(),
     envId: EnvironmentId.optional(),
+    includeDiff: z
+      .boolean()
+      .optional()
+      .describe(
+        `With agentId: also return the branch's diff, cut at ${DIFF_LIMIT} chars.`,
+      ),
   })
   .refine((i) => (i.agentId === undefined) !== (i.envId === undefined), {
     message: "pass exactly one of agentId or envId",
@@ -106,9 +114,22 @@ const StatusInput = z
   .refine((i) => i.runId === undefined || i.agentId !== undefined, {
     message: "runId goes with agentId",
     path: ["runId"],
+  })
+  .refine((i) => i.includeDiff === undefined || i.agentId !== undefined, {
+    message: "includeDiff goes with agentId",
+    path: ["includeDiff"],
   });
 
 const RunList = z.object({ data: z.array(z.object({ id: RunId })) });
+const RunDetail = z.looseObject({
+  diff: z.string().nullish(),
+  compareUrl: z.string().nullish(),
+});
+
+const clip = (diff?: string | null, compareUrl?: string | null) =>
+  !diff || diff.length <= DIFF_LIMIT
+    ? diff
+    : `${diff.slice(0, DIFF_LIMIT)}\n[diff truncated: ${DIFF_LIMIT} of ${diff.length} chars shown; full diff at ${compareUrl ?? "the agent's branch"}]`;
 
 function buildServer(call: Call) {
   const api = async (...args: Parameters<Call>) => {
@@ -116,17 +137,50 @@ function buildServer(call: Call) {
     return outcome.ok ? text(outcome.value) : outcome.result;
   };
 
-  /** runId's run, else the newest one re-read singly, since the list omits the diff and pending request. */
-  const runOf = async (agentId: AgentId, runId: RunId | undefined) => {
-    if (runId) return api("GET", `/v1/agents/${agentId}/runs/${runId}`);
+  /** The id of the agent's newest run, which the list returns first. */
+  const newestRun = async (
+    agentId: AgentId,
+  ): Promise<
+    { ok: true; value: RunId } | { ok: false; result: CallToolResult }
+  > => {
     const list = await call("GET", `/v1/agents/${agentId}/runs`);
-    if (!list.ok) return list.result;
+    if (!list.ok) return list;
     const runs = RunList.safeParse(list.value);
-    if (!runs.success)
-      return failure(200, "unexpected_response", z.prettifyError(runs.error));
+    if (!runs.success) {
+      const message = z.prettifyError(runs.error);
+      return {
+        ok: false,
+        result: failure(200, "unexpected_response", message),
+      };
+    }
     const newest = runs.data.data[0];
-    if (!newest) return failure(404, "no_runs", `${agentId} has no runs`);
-    return api("GET", `/v1/agents/${agentId}/runs/${newest.id}`);
+    if (!newest)
+      return {
+        ok: false,
+        result: failure(404, "no_runs", `${agentId} has no runs`),
+      };
+    return { ok: true, value: newest.id };
+  };
+
+  /** runId's run, else the newest one re-read singly, since the list omits the diff and pending request; the diff goes out only with includeDiff. */
+  const runOf = async (
+    agentId: AgentId,
+    runId: RunId | undefined,
+    includeDiff: boolean,
+  ) => {
+    const id = runId
+      ? ({ ok: true, value: runId } as const)
+      : await newestRun(agentId);
+    if (!id.ok) return id.result;
+    const run = await call("GET", `/v1/agents/${agentId}/runs/${id.value}`);
+    if (!run.ok) return run.result;
+    const detail = RunDetail.safeParse(run.value);
+    if (!detail.success)
+      return failure(200, "unexpected_response", z.prettifyError(detail.error));
+    const { diff, ...rest } = detail.data;
+    return text(
+      includeDiff ? { ...rest, diff: clip(diff, rest.compareUrl) } : rest,
+    );
   };
 
   const server = new McpServer({ name: "harness", version: "0.0.0" });
@@ -173,11 +227,16 @@ function buildServer(call: Call) {
         agentId: AgentId,
         requestId: RequestId,
         decision: z.enum(["approve", "deny"]),
-        reason: nonEmpty.optional(),
+        reason: nonEmpty
+          .optional()
+          .describe("Why the call is denied; sent only with deny."),
       },
     },
-    ({ agentId, ...body }) =>
-      api("POST", `/v1/agents/${agentId}/approvals`, body),
+    ({ agentId, reason, ...body }) =>
+      api("POST", `/v1/agents/${agentId}/approvals`, {
+        ...body,
+        ...(body.decision === "deny" && reason !== undefined && { reason }),
+      }),
   );
   server.registerTool(
     "stop",
@@ -192,12 +251,14 @@ function buildServer(call: Call) {
     "status",
     {
       description:
-        "With agentId: a run (runId, or the newest) with its diff and any pending request. With envId: the environment, e.g. to poll provisioning.",
+        "With agentId: a run (runId, or the newest) with its rollup, compareUrl and any pending request; its diff only with includeDiff. With envId: the environment, e.g. to poll provisioning.",
       inputSchema: StatusInput,
       annotations: { readOnlyHint: true },
     },
-    ({ agentId, runId, envId }) =>
-      agentId ? runOf(agentId, runId) : api("GET", `/v1/environments/${envId}`),
+    ({ agentId, runId, envId, includeDiff = false }) =>
+      agentId
+        ? runOf(agentId, runId, includeDiff)
+        : api("GET", `/v1/environments/${envId}`),
   );
   return server;
 }
@@ -211,6 +272,16 @@ export function createMcpHandler(
     throw new TypeError(`createMcpHandler: ${z.prettifyError(checked.error)}`);
   const api = apiClient(options);
   return async (request) => {
+    // stateless: a GET stream would sit on a server that never emits, and there is no session to DELETE
+    if (request.method !== "POST")
+      return Response.json(
+        {
+          jsonrpc: "2.0",
+          error: { code: -32000, message: "Method not allowed." },
+          id: null,
+        },
+        { status: 405, headers: { allow: "POST" } },
+      );
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined,
       enableJsonResponse: true,

@@ -153,7 +153,7 @@ function runningRun() {
     })
     .run();
   db.insert(runs).values({ id: runId, agentId, status: "running" }).run();
-  return { runId, token: mintAgentToken(config.apiKey, runId) };
+  return { agentId, runId, token: mintAgentToken(config.apiKey, runId) };
 }
 
 const postEvent = (token: string, event: unknown) =>
@@ -193,7 +193,7 @@ const deliveries = () => db.select().from(webhookDeliveries).all();
 test("a subscriber answering 500, 500, 200 gets three signed attempts of one event, then it is delivered", async () => {
   await subscribe(["run.finished"]);
   const received = subscriber([500, 500, 200]);
-  const { runId, token } = runningRun();
+  const { agentId, runId, token } = runningRun();
   const planted = [
     config.claudeOauthToken,
     config.spritesToken,
@@ -251,6 +251,7 @@ test("a subscriber answering 500, 500, 200 gets three signed attempts of one eve
     expect(await verify(signature, body, lastSentAt)).toBe(true);
     expect(JSON.parse(body)).toEqual({
       id: `evt_${eventId}`,
+      agentId,
       runId,
       ts: expect.stringMatching(/Z$/),
       type: "run.finished",

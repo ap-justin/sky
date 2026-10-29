@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { EventId, RequestId, RunId } from "./ids.js";
+import { AgentId, EventId, RequestId, RunId } from "./ids.js";
 import { Usage } from "./run.js";
 
 /** What a run is blocked on: a question from Claude, or a tool call the environment's approval policy holds. */
@@ -114,6 +114,7 @@ export type RunnerEventPost = z.infer<typeof RunnerEventPost>;
 const stored = <T extends EventType>(type: T) =>
   z.object({
     id: EventId,
+    agentId: AgentId,
     runId: RunId,
     ts: z.iso.datetime(),
     type: z.literal(type),

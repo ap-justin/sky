@@ -53,20 +53,21 @@ export function streamRunEvents(
           .orderBy(asc(events.id))
           .all();
         const run = db
-          .select({ status: runs.status })
+          .select({ agentId: runs.agentId, status: runs.status })
           .from(runs)
           .where(eq(runs.id, runId))
           .get();
+        if (!run) return;
         for (const row of rows) {
           await stream.writeSSE({
             id: String(row.id),
             event: row.type,
-            data: JSON.stringify(presentEvent(row)),
+            data: JSON.stringify(presentEvent(row, run.agentId)),
           });
           cursor = row.id;
         }
         // an ended run's terminal event is its last row, so it went out in `rows` or before `after`
-        if (!run || !isActive(run.status)) return;
+        if (!isActive(run.status)) return;
       }
     } catch (err) {
       log(`streaming ${runId} failed: ${err}`);

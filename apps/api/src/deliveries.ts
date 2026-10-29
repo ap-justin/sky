@@ -1,6 +1,12 @@
 import { createHmac } from "node:crypto";
-import { type Db, events, webhookDeliveries, webhooks } from "@harness/db";
-import type { EventType } from "@harness/shared";
+import {
+  type Db,
+  events,
+  runs,
+  webhookDeliveries,
+  webhooks,
+} from "@harness/db";
+import type { AgentId, EventType } from "@harness/shared";
 import { and, asc, eq, lte } from "drizzle-orm";
 import { presentEvent } from "./run-events.js";
 import type { Tx } from "./runs.js";
@@ -97,13 +103,14 @@ export function createDispatcher({
     id: number;
     attempts: number;
     url: string;
+    agentId: AgentId;
     event: typeof events.$inferSelect;
   };
 
   async function attempt(row: Due): Promise<void> {
     const { event } = row;
     const id = `evt_${event.id}` as const;
-    const body = JSON.stringify(presentEvent(event));
+    const body = JSON.stringify(presentEvent(event, row.agentId));
     const t = Math.floor(now().getTime() / 1000);
     let status: number | null = null;
     let error: string | null = null;
@@ -158,11 +165,13 @@ export function createDispatcher({
         id: webhookDeliveries.id,
         attempts: webhookDeliveries.attempts,
         url: webhooks.url,
+        agentId: runs.agentId,
         event: events,
       })
       .from(webhookDeliveries)
       .innerJoin(webhooks, eq(webhookDeliveries.webhookId, webhooks.id))
       .innerJoin(events, eq(webhookDeliveries.eventId, events.id))
+      .innerJoin(runs, eq(events.runId, runs.id))
       .where(
         and(
           eq(webhookDeliveries.status, "pending"),

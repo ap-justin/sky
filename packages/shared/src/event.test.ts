@@ -15,7 +15,12 @@ const usage = {
   turns: 1,
   durationMs: 900,
 };
-const meta = { id: "evt_1", runId: "run_1", ts: "2026-10-29T12:00:00.000Z" };
+const meta = {
+  id: "evt_1",
+  agentId: "agt_1",
+  runId: "run_1",
+  ts: "2026-10-29T12:00:00.000Z",
+};
 
 test("event types cover the run lifecycle and progress", () => {
   expect(EventType.options).toEqual(
@@ -216,4 +221,17 @@ test("a rollup caps its commit list at 50 and each subject at 200 characters", (
     }).success,
   ).toBe(false);
   expect(Rollup.safeParse({ ...rollup.run, added: -1 }).success).toBe(false);
+});
+
+test("a stored event names its agent, so a run.waiting can be answered from the event alone", () => {
+  const waiting = {
+    ...meta,
+    type: "run.waiting",
+    payload: {
+      request: { kind: "question", requestId: "req_1", prompt: "which db?" },
+    },
+  };
+  expect(Event.parse(waiting)).toEqual(waiting);
+  const { agentId: _, ...anonymous } = waiting;
+  expect(Event.safeParse(anonymous).success).toBe(false);
 });

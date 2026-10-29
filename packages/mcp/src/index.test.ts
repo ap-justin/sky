@@ -213,6 +213,27 @@ test("approve posts a deny decision with its reason", async () => {
   ]);
 });
 
+test("approve sends no reason with an approve, which the API rejects", async () => {
+  const decided = { id: "req_2", decision: { decision: "approve" } };
+  const seen = route("post", "/v1/agents/agt_1/approvals", 200, decided);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "approve",
+    arguments: {
+      agentId: "agt_1",
+      requestId: "req_2",
+      decision: "approve",
+      reason: "looks fine",
+    },
+  });
+
+  expect(result.isError).toBeFalsy();
+  expect(seen.map((s) => s.body)).toEqual([
+    { requestId: "req_2", decision: "approve" },
+  ]);
+});
+
 test("stop posts to the agent's stop route", async () => {
   const stopped = { id: "agt_1", status: "idle" };
   const seen = route("post", "/v1/agents/agt_1/stop", 200, stopped);
@@ -227,14 +248,14 @@ test("stop posts to the agent's stop route", async () => {
   expect(seen).toHaveLength(1);
 });
 
-test("status with a runId returns that run", async () => {
+test("status with a runId returns that run without its diff", async () => {
   const run = {
     id: "run_1",
     status: "waiting",
-    diff: "+x",
     pendingRequest: { id: "req_1" },
+    compareUrl: null,
   };
-  route("get", "/v1/agents/agt_1/runs/run_1", 200, run);
+  route("get", "/v1/agents/agt_1/runs/run_1", 200, { ...run, diff: "+x" });
   const client = await connect();
 
   const result = await client.callTool({
@@ -245,17 +266,49 @@ test("status with a runId returns that run", async () => {
   expect(textOf(result)).toEqual(run);
 });
 
-test("status without a runId fetches the newest run singly", async () => {
+test("status with includeDiff returns the diff, cut at 20 000 chars with a pointer to compareUrl", async () => {
+  const compareUrl = "https://github.com/acme/web/compare/abc...claude/agt_1";
+  route("get", "/v1/agents/agt_1/runs/run_1", 200, {
+    id: "run_1",
+    diff: `${"a".repeat(20_000)}${"b".repeat(5)}`,
+    compareUrl,
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "status",
+    arguments: { agentId: "agt_1", runId: "run_1", includeDiff: true },
+  });
+
+  const { diff } = textOf(result);
+  expect(diff.startsWith("a".repeat(20_000))).toBe(true);
+  expect(diff).not.toContain("bbbbb");
+  expect(diff).toContain("truncated");
+  expect(diff).toContain(compareUrl);
+});
+
+test("status with includeDiff returns a short diff whole", async () => {
+  route("get", "/v1/agents/agt_1/runs/run_1", 200, {
+    id: "run_1",
+    diff: "+x",
+    compareUrl: null,
+  });
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "status",
+    arguments: { agentId: "agt_1", runId: "run_1", includeDiff: true },
+  });
+
+  expect(textOf(result)).toEqual({ id: "run_1", diff: "+x", compareUrl: null });
+});
+
+test("status without a runId fetches the newest run singly, without its diff", async () => {
   route("get", "/v1/agents/agt_1/runs", 200, {
     data: [{ id: "run_9" }, { id: "run_3" }],
   });
-  const run = {
-    id: "run_9",
-    status: "succeeded",
-    diff: "+y",
-    pendingRequest: null,
-  };
-  route("get", "/v1/agents/agt_1/runs/run_9", 200, run);
+  const run = { id: "run_9", status: "succeeded", pendingRequest: null };
+  route("get", "/v1/agents/agt_1/runs/run_9", 200, { ...run, diff: "+y" });
   const client = await connect();
 
   const result = await client.callTool({
@@ -283,6 +336,7 @@ test.each([
   [{ agentId: "agt_1", envId: "env_1" }, /exactly one of agentId or envId/],
   [{}, /exactly one of agentId or envId/],
   [{ envId: "env_1", runId: "run_1" }, /runId goes with agentId/],
+  [{ envId: "env_1", includeDiff: true }, /includeDiff goes with agentId/],
 ])("status rejects %j before any API call", async (args, message) => {
   const client = await connect();
 
@@ -298,3 +352,21 @@ test.each([
 ])("createMcpHandler rejects bad options %j", (options, message) => {
   expect(() => createMcpHandler(options)).toThrow(message);
 });
+
+test.each(["GET", "DELETE"])(
+  "%s on the endpoint is 405 with Allow: POST, opening no stream",
+  async (method) => {
+    const handler = createMcpHandler({ baseUrl: API, apiKey: KEY });
+
+    const res = await handler(
+      new Request("http://mcp.test/mcp", {
+        method,
+        headers: { accept: "text/event-stream" },
+      }),
+    );
+
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("POST");
+    expect(res.headers.get("content-type")).not.toMatch(/event-stream/);
+  },
+);

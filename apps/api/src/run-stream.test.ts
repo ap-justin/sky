@@ -171,6 +171,7 @@ test("a reconnect with Last-Event-ID continues at the next event with no gap or 
   });
   expect(JSON.parse(fourth?.data ?? "")).toEqual({
     id: `evt_${ids[3]}`,
+    agentId,
     runId,
     ts: expect.any(String),
     type: "run.progress",

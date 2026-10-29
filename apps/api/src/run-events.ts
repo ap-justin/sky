@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { events } from "@harness/db";
-import type { Event, RunId } from "@harness/shared";
+import type { AgentId, Event, RunId } from "@harness/shared";
 
 const emitter = new EventEmitter().setMaxListeners(0);
 
@@ -22,10 +22,14 @@ export const runEvents = {
   listenerCount: (runId: RunId) => emitter.listenerCount(runId),
 };
 
-/** The shared Event shape webhooks and the run stream send for a stored row. */
-export const presentEvent = (row: typeof events.$inferSelect): Event =>
+/** The shared Event shape webhooks and the run stream send for a stored row of `agentId`'s run. */
+export const presentEvent = (
+  row: typeof events.$inferSelect,
+  agentId: AgentId,
+): Event =>
   ({
     id: `evt_${row.id}`,
+    agentId,
     runId: row.runId,
     ts: row.ts,
     type: row.type,
