@@ -1,9 +1,12 @@
 import type {
   AgentId,
   AgentStatus,
+  Decision,
   EnvironmentId,
   EnvironmentStatus,
   EventType,
+  PendingRequest,
+  RequestId,
   RunId,
   RunStatus,
   WebhookId,
@@ -38,6 +41,9 @@ export const environmentFailureSteps = [
 
 // a webhook delivery's lifecycle; the CHECK on `status` spells the same list
 export const deliveryStatuses = ["pending", "delivered", "failed"] as const;
+
+// what a run waits on; the CHECK on `kind` spells the same list
+export const requestKinds = ["question", "approval"] as const;
 
 // stamped by the database, so no insert path can omit or misformat it
 const createdAt = () =>
@@ -236,6 +242,49 @@ export const webhookDeliveries = sqliteTable(
       sql`length(${c(t.lastError)}) <= 1000`,
     ),
     check("webhook_deliveries_created_at", isoUtc(t.createdAt)),
+  ],
+);
+
+// a run's question or approval; the decision lives here so a long-polling runner survives an API restart
+export const runRequests = sqliteTable(
+  "run_requests",
+  {
+    id: text().$type<RequestId>().primaryKey(),
+    runId: text("run_id")
+      .$type<RunId>()
+      .notNull()
+      .references(() => runs.id),
+    kind: text({ enum: requestKinds }).notNull(),
+    request: text({ mode: "json" }).$type<PendingRequest>().notNull(),
+    decision: text({ mode: "json" }).$type<Decision>(),
+    decidedAt: text("decided_at"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    // the run's open request: `run_id = ? and decided_at is null`; also serves the run_id foreign key
+    index("run_requests_run_id_decided_at").on(t.runId, t.decidedAt),
+    // at most one undecided request per run
+    uniqueIndex("run_requests_run_id_open")
+      .on(t.runId)
+      .where(sql`${c(t.decidedAt)} is null`),
+    check("run_requests_kind", sql`${c(t.kind)} in ('question', 'approval')`),
+    check(
+      "run_requests_request",
+      sql`json_valid(${c(t.request)}) and json_type(${c(t.request)}) = 'object'
+        and json_extract(${c(t.request)}, '$.kind') = ${c(t.kind)}
+        and json_extract(${c(t.request)}, '$.requestId') = ${c(t.id)}`,
+    ),
+    check(
+      "run_requests_decision",
+      sql`json_valid(${c(t.decision)}) and json_type(${c(t.decision)}) = 'object'
+        and json_extract(${c(t.decision)}, '$.requestId') = ${c(t.id)}`,
+    ),
+    check(
+      "run_requests_decided",
+      sql`(${c(t.decision)} is null) = (${c(t.decidedAt)} is null)`,
+    ),
+    check("run_requests_decided_at", isoUtc(t.decidedAt)),
+    check("run_requests_created_at", isoUtc(t.createdAt)),
   ],
 );
 

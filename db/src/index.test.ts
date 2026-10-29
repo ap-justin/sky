@@ -11,6 +11,8 @@ import {
   AgentStatus,
   EnvironmentStatus,
   EventType,
+  type RequestId,
+  type RunId,
   RunStatus,
   type WebhookId,
 } from "@harness/shared";
@@ -21,6 +23,8 @@ import {
   deliveryStatuses,
   migrate,
   openDb,
+  requestKinds,
+  runRequests,
   webhookDeliveries,
   webhooks,
 } from "./index.js";
@@ -72,6 +76,7 @@ const TABLES = [
   "agents",
   "environments",
   "events",
+  "run_requests",
   "runs",
   "secrets",
   "webhook_deliveries",
@@ -194,7 +199,9 @@ test("migrating a populated 0000 file keeps every row, cascade children included
 
   migrate(db);
 
-  const atInit = TABLES.filter((t) => t !== "webhook_deliveries");
+  const atInit = TABLES.filter(
+    (t) => t !== "webhook_deliveries" && t !== "run_requests",
+  );
   for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
   const createdAt = db.$client
     .prepare("select created_at from environments")
@@ -354,4 +361,165 @@ test("migrating a populated 0002 file adds an empty deliveries table and keeps e
 
   for (const table of ["events", "webhooks"]) expect(count(table)).toBe(1);
   expect(count("webhook_deliveries")).toBe(0);
+});
+
+const question = (id: string) =>
+  JSON.stringify({ kind: "question", requestId: id, prompt: "which branch?" });
+
+const insertRequest = (id: string, request = question(id), kind = "question") =>
+  run(
+    "insert into run_requests (id, run_id, kind, request) values (?, 'run_1', ?, ?)",
+    id,
+    kind,
+    request,
+  );
+
+const decide = (id: string, decision: unknown, decidedAt: unknown) =>
+  run(
+    "update run_requests set decision = ?, decided_at = ? where id = ?",
+    decision,
+    decidedAt,
+    id,
+  );
+
+const answer = (id: string) =>
+  JSON.stringify({ requestId: id, decision: "answer", answer: "main" });
+
+test("a run has at most one undecided request; deciding it frees the slot", () => {
+  migrate(db);
+  seedRun();
+  insertRequest("req_1");
+  expect(() => insertRequest("req_2")).toThrow(
+    /UNIQUE constraint failed: run_requests.run_id/,
+  );
+  decide("req_1", answer("req_1"), "2026-10-29T12:00:00.000Z");
+  expect(() => insertRequest("req_2")).not.toThrow();
+});
+
+test("decision and decided_at are set together, and the decision names its request", () => {
+  migrate(db);
+  seedRun();
+  insertRequest("req_1");
+  expect(() => decide("req_1", answer("req_1"), null)).toThrow(
+    /CHECK constraint failed: run_requests_decided/,
+  );
+  expect(() => decide("req_1", null, "2026-10-29T12:00:00.000Z")).toThrow(
+    /CHECK constraint failed: run_requests_decided/,
+  );
+  expect(() =>
+    decide("req_1", answer("req_other"), "2026-10-29T12:00:00.000Z"),
+  ).toThrow(/CHECK constraint failed: run_requests_decision/);
+  expect(() => decide("req_1", "not json", "2026-10-29T12:00:00.000Z")).toThrow(
+    /CHECK constraint failed: run_requests_decision/,
+  );
+  expect(() => decide("req_1", answer("req_1"), "2026-10-29 12:00")).toThrow(
+    /CHECK constraint failed: run_requests_decided_at/,
+  );
+});
+
+test("a request's kind and id match its stored PendingRequest", () => {
+  migrate(db);
+  seedRun();
+  const approval = JSON.stringify({
+    kind: "approval",
+    requestId: "req_1",
+    toolName: "Bash",
+    toolSummary: "rm -rf build",
+  });
+  const valid = { question: question("req_1"), approval };
+  for (const kind of requestKinds) {
+    expect(() => insertRequest("req_1", valid[kind], kind)).not.toThrow();
+    run("delete from run_requests");
+  }
+  expect(() => insertRequest("req_1", approval, "question")).toThrow(
+    /CHECK constraint failed: run_requests_request/,
+  );
+  expect(() => insertRequest("req_1", question("req_2"))).toThrow(
+    /CHECK constraint failed: run_requests_request/,
+  );
+  expect(() => insertRequest("req_1", "[]")).toThrow(
+    /CHECK constraint failed: run_requests_request/,
+  );
+  expect(() => insertRequest("req_1", question("req_1"), "bogus")).toThrow(
+    /CHECK constraint failed/,
+  );
+});
+
+test("a request needs an existing run, and pins the run against deletion", () => {
+  migrate(db);
+  seedRun();
+  expect(() =>
+    run(
+      "insert into run_requests (id, run_id, kind, request) values ('req_1', 'run_missing', 'question', ?)",
+      question("req_1"),
+    ),
+  ).toThrow(/FOREIGN KEY constraint failed/);
+  insertRequest("req_1");
+  expect(() => run("delete from runs")).toThrow(
+    /FOREIGN KEY constraint failed/,
+  );
+});
+
+test("drizzle round-trips the request and decision as parsed objects", () => {
+  migrate(db);
+  seedRun();
+  const requestId = "req_1" as RequestId;
+  db.insert(runRequests)
+    .values({
+      id: requestId,
+      runId: "run_1" as RunId,
+      kind: "approval",
+      request: {
+        kind: "approval",
+        requestId,
+        toolName: "Bash",
+        toolSummary: "ls",
+      },
+    })
+    .run();
+  const [open] = db.select().from(runRequests).all();
+  expect(open).toMatchObject({ decision: null, decidedAt: null });
+  expect(open?.request).toEqual({
+    kind: "approval",
+    requestId,
+    toolName: "Bash",
+    toolSummary: "ls",
+  });
+  expect(open?.createdAt).toMatch(/Z$/);
+
+  db.update(runRequests)
+    .set({
+      decision: { requestId, decision: "deny", reason: "no" },
+      decidedAt: "2026-10-29T12:00:00.000Z",
+    })
+    .run();
+  const [decided] = db.select().from(runRequests).all();
+  expect(decided?.decision).toEqual({
+    requestId,
+    decision: "deny",
+    reason: "no",
+  });
+});
+
+test("the run's open request is found through the partial unique index", () => {
+  migrate(db);
+  const plan = db.$client
+    .prepare(
+      "explain query plan select * from run_requests where run_id = ? and decided_at is null",
+    )
+    .all("run_1") as { detail: string }[];
+  expect(plan.map((p) => p.detail).join("\n")).toMatch(
+    /USING INDEX run_requests_run_id_(open|decided_at) \(run_id=\?/,
+  );
+});
+
+test("migrating a populated 0003 file adds an empty run_requests table and keeps every row", () => {
+  migrateThrough("0003_nosy_miek");
+  seedRun();
+  insertEvent();
+
+  migrate(db);
+
+  for (const table of ["runs", "events"]) expect(count(table)).toBe(1);
+  expect(count("run_requests")).toBe(0);
 });
