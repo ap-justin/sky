@@ -192,6 +192,79 @@ test("a failed reprovision exits 1 with the step and the stderr tail, and leaves
   expect(lock().specHash).toBe("old");
 });
 
+const failed = env({
+  status: "failed",
+  checkpointId: null,
+  failure: { step: "clone", stderr: "fatal: repository not found\n" },
+});
+const retry = (response: Record<string, unknown>) =>
+  http.post(`${apiUrl}/v1/environments/:id/retry`, ({ params }) => {
+    writes.push({ method: "RETRY", body: params.id });
+    return HttpResponse.json(response, { status: 202 });
+  });
+
+test("an unchanged spec on a failed env retries it and waits for ready", async () => {
+  server.use(
+    list(failed),
+    retry(env({ status: "provisioning", checkpointId: null, failure: null })),
+    getSequence(env()),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([{ method: "RETRY", body: "env_1" }]);
+  expect(r.stderr).toContain("retrying web (last failed at clone)");
+  expect(r.stdout).toBe("ready web env_1\n");
+  expect(lock().checkpointId).toBe("ckpt_1");
+});
+
+test("a retry that fails again exits 1 with the new failure", async () => {
+  server.use(
+    list(failed),
+    retry(env({ status: "provisioning", checkpointId: null, failure: null })),
+    getSequence(
+      env({
+        status: "failed",
+        checkpointId: null,
+        failure: { step: "setup", stderr: "ERR_PNPM_NO_LOCKFILE\n" },
+      }),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(1);
+  expect(writes).toEqual([{ method: "RETRY", body: "env_1" }]);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toMatch(/failed at step setup/);
+  expect(r.stderr).toContain("ERR_PNPM_NO_LOCKFILE");
+  expect(existsSync(lockFile)).toBe(false);
+});
+
+test("a changed concurrency on a failed env patches it, then retries", async () => {
+  writeFileSync(file, `${yaml}concurrency: 5\n`);
+  server.use(
+    list(failed),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, { ...failed, concurrency: 5 }),
+    ),
+    retry(
+      env({
+        status: "provisioning",
+        concurrency: 5,
+        checkpointId: null,
+        failure: null,
+      }),
+    ),
+    getSequence(env({ concurrency: 5 })),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([
+    { method: "PATCH", body: { concurrency: 5 } },
+    { method: "RETRY", body: "env_1" },
+  ]);
+  expect(r.stdout).toBe("ready web env_1\n");
+});
+
 test("an API error exits 1 with its message", async () => {
   writeFileSync(file, yaml.replace("pnpm install", "make"));
   server.use(

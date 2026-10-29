@@ -121,6 +121,14 @@ export function createApi(config: Config) {
       );
       return env(status, json);
     },
+    /** Reruns provisioning on a failed env; 409 `not_failed` otherwise. */
+    async retryEnvironment(id: string) {
+      const { status, json } = await request(
+        "POST",
+        `/v1/environments/${encodeURIComponent(id)}/retry`,
+      );
+      return env(status, json);
+    },
     async putSecret(envId: string, name: string, body: unknown) {
       const { json } = await request(
         "PUT",

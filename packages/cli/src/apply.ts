@@ -51,6 +51,14 @@ export async function apply(
     }
   }
 
+  // an unchanged spec, or a PATCH of fields that don't reprovision, leaves a failed env failed
+  if (current.env.status === "failed") {
+    const step = current.env.failure?.step ?? "unknown";
+    out.progress(`retrying ${spec.name} (last failed at ${step})`);
+    current = await api.retryEnvironment(current.env.id);
+    changed = true;
+  }
+
   if (current.env.status === "provisioning") {
     const done = await waitForProvisioned(api, current, io, out);
     if (done === undefined) {
