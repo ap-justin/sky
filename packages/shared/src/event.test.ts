@@ -4,6 +4,7 @@ import {
   Event,
   EventType,
   PendingRequest,
+  Rollup,
   RunnerEventPost,
 } from "./event.js";
 
@@ -155,4 +156,64 @@ test("runner posts an event without id or timestamp; the API assigns those", () 
       payload: {},
     }).success,
   ).toBe(false);
+});
+
+const sha = (c: string) => c.repeat(40);
+const rollup = {
+  base: sha("a"),
+  run: {
+    commits: [{ sha: sha("c"), subject: "add hello" }],
+    files: 1,
+    added: 3,
+    removed: 0,
+  },
+  cumulative: {
+    commits: [
+      { sha: sha("c"), subject: "add hello" },
+      { sha: sha("b"), subject: "" },
+    ],
+    files: 2,
+    added: 5,
+    removed: 1,
+  },
+};
+
+test("run.finished and run.failed may carry the diff rollup; it stays optional", () => {
+  const finished = {
+    runId: "run_1",
+    type: "run.finished",
+    payload: { summary: "done", usage, rollup },
+  };
+  const failed = {
+    runId: "run_1",
+    type: "run.failed",
+    payload: { error: "exit 1", rollup },
+  };
+  expect(RunnerEventPost.parse(finished)).toEqual(finished);
+  expect(RunnerEventPost.parse(failed)).toEqual(failed);
+  expect(Event.parse({ ...meta, ...finished })).toEqual({
+    ...meta,
+    ...finished,
+  });
+});
+
+test("a rollup caps its commit list at 50 and each subject at 200 characters", () => {
+  const commits = Array.from({ length: 51 }, () => ({
+    sha: sha("c"),
+    subject: "x",
+  }));
+  expect(Rollup.safeParse({ ...rollup.run, commits }).success).toBe(false);
+  expect(
+    Rollup.safeParse({
+      ...rollup.run,
+      commits: [{ sha: sha("c"), subject: "x".repeat(201) }],
+    }).success,
+  ).toBe(false);
+  expect(
+    Rollup.safeParse({
+      ...rollup.run,
+      commits: [{ sha: "HEAD", subject: "x" }],
+    }).success,
+  ).toBe(false);
+  expect(Rollup.safeParse({ ...rollup.run, added: -1 }).success).toBe(false);
 });

@@ -18,13 +18,14 @@ import type {
   PendingRequest,
   RequestId,
   RunnerEventPost,
+  RunRollup,
   Usage,
 } from "@harness/shared";
 import type { Config } from "./config.js";
 import type { PostEvent } from "./events.js";
 import { matchesPolicy } from "./policy.js";
 import type { AwaitDecision } from "./requests.js";
-import { commitAll, ensureWorktree } from "./worktree.js";
+import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
 
 /** The Agent SDK's `query`, narrowed to what the runner calls; tests feed it scripted streams. */
 export type QueryFn = (params: {
@@ -121,6 +122,7 @@ export async function runSession(
     post: PostEvent;
     awaitDecision: AwaitDecision;
     signal: AbortSignal;
+    warn?: (line: string) => void;
   },
 ): Promise<0 | 1> {
   const { runId } = config;
@@ -139,10 +141,10 @@ export async function runSession(
     ended = true;
     await post(event);
   };
-  const fail = async (error: string, usage?: Usage) => {
+  const fail = async (error: string, usage?: Usage, rollup?: RunRollup) => {
     await end({
       type: "run.failed",
-      payload: usage ? { error, usage } : { error },
+      payload: { error, ...(usage && { usage }), ...(rollup && { rollup }) },
     });
     return 1 as const;
   };
@@ -153,6 +155,10 @@ export async function runSession(
   } catch (error) {
     return fail(`worktree setup failed: ${messageOf(error)}`);
   }
+  // what HEAD holds before Claude touches the worktree; the run's commits are the ones after it
+  const runStart = await headSha(cwd).catch((error: unknown) =>
+    error instanceof Error ? error : new Error(String(error)),
+  );
 
   const abortController = new AbortController();
   const forward = () => abortController.abort(deps.signal.reason);
@@ -327,25 +333,41 @@ export async function runSession(
     commitError = `commit failed: ${messageOf(error)}`;
   }
 
+  // a run the API already ended posts nothing, so it needs no rollup
+  const rollup = ended ? undefined : await rollupOf(cwd, runStart);
   const usage = result && usageOf(result);
   const failure = stopReason ?? streamError;
-  if (failure) return fail(failure, usage);
-  if (!result) return fail("session ended without a result");
+  if (failure) return fail(failure, usage, rollup);
+  if (!result) return fail("session ended without a result", undefined, rollup);
   if (result.subtype !== "success" || result.is_error) {
     const reason =
       ("errors" in result && result.errors.join("; ")) || result.subtype;
-    return fail(reason, usage);
+    return fail(reason, usage, rollup);
   }
-  if (commitError) return fail(commitError, usage);
+  if (commitError) return fail(commitError, usage, rollup);
   await end({
     type: "run.finished",
     payload: {
       summary: result.result || stopMessage || "",
       usage: usageOf(result),
+      ...(rollup && { rollup }),
     },
   });
   return 0;
+
+  /** The rollup is a nice-to-have on the result: when git can't produce it, the run reports without it. */
+  async function rollupOf(cwd: string, since: string | Error) {
+    try {
+      if (since instanceof Error) throw since;
+      return await diffRollup({ cwd, since });
+    } catch (error) {
+      (deps.warn ?? warnStderr)(`runner: rollup skipped: ${messageOf(error)}`);
+      return undefined;
+    }
+  }
 }
+
+const warnStderr = (line: string) => process.stderr.write(`${line}\n`);
 
 type AssistantContent = Extract<
   SDKMessage,

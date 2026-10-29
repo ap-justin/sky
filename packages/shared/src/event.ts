@@ -43,6 +43,34 @@ export const EventType = z.enum([
 ]);
 export type EventType = z.infer<typeof EventType>;
 
+/** SHA-1 or SHA-256 object name. */
+const GitSha = z.string().regex(/^[0-9a-f]{40}([0-9a-f]{24})?$/);
+
+/** A diffstat and the commits behind it; `commits` is newest first, capped at 50. */
+export const Rollup = z.object({
+  commits: z
+    .array(
+      z.object({
+        sha: GitSha,
+        subject: z.string().max(200),
+      }),
+    )
+    .max(50),
+  /** binary files count here with 0 lines added and removed */
+  files: z.number().int().nonnegative(),
+  added: z.number().int().nonnegative(),
+  removed: z.number().int().nonnegative(),
+});
+export type Rollup = z.infer<typeof Rollup>;
+
+/** What the agent branch holds at run end: `run` since the run started, `cumulative` since `base`, its merge-base with `origin/HEAD`. */
+export const RunRollup = z.object({
+  base: GitSha,
+  run: Rollup,
+  cumulative: Rollup,
+});
+export type RunRollup = z.infer<typeof RunRollup>;
+
 const payloads = {
   /** `sessionId` is the Claude session the API stores to resume the agent's next run. */
   "run.started": z.object({ sessionId: z.string().min(1) }),
@@ -52,8 +80,16 @@ const payloads = {
     tool: z.string().min(1).optional(),
   }),
   "run.waiting": z.object({ request: PendingRequest }),
-  "run.finished": z.object({ summary: z.string(), usage: Usage }),
-  "run.failed": z.object({ error: z.string().min(1), usage: Usage.optional() }),
+  "run.finished": z.object({
+    summary: z.string(),
+    usage: Usage,
+    rollup: RunRollup.optional(),
+  }),
+  "run.failed": z.object({
+    error: z.string().min(1),
+    usage: Usage.optional(),
+    rollup: RunRollup.optional(),
+  }),
   "run.stopped": z.object({}),
 } satisfies Record<EventType, z.ZodType>;
 

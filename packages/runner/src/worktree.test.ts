@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { commitAll, ensureWorktree } from "./worktree.js";
+import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -104,4 +104,135 @@ test("a clean worktree makes no commit", async () => {
     false,
   );
   expect(git(path, "rev-parse", "HEAD")).toBe(head);
+});
+
+const commit = (cwd: string, subject: string) => {
+  git(cwd, "add", "--all");
+  git(
+    cwd,
+    "-c",
+    "user.name=t",
+    "-c",
+    "user.email=t@t",
+    "commit",
+    "-qm",
+    subject,
+  );
+  return git(cwd, "rev-parse", "HEAD");
+};
+
+test("a run's rollup lists its commits newest first with their diffstat; cumulative matches on a first run", async () => {
+  const path = await ensureWorktree({
+    repoDir,
+    worktreesDir,
+    agentId: "agt_1",
+  });
+  const since = await headSha(path);
+  writeFileSync(join(path, "a.txt"), "1\n2\n3\n");
+  const first = commit(path, "add a");
+  writeFileSync(join(path, "README"), "bye\n");
+  writeFileSync(join(path, "a.txt"), "1\n3\n");
+  const second = commit(path, "edit a and README");
+  const rollup = await diffRollup({ cwd: path, since });
+  const run = {
+    commits: [
+      { sha: second, subject: "edit a and README" },
+      { sha: first, subject: "add a" },
+    ],
+    files: 2,
+    added: 3,
+    removed: 1,
+  };
+  expect(rollup).toEqual({
+    base: git(origin, "rev-parse", "trunk"),
+    run,
+    cumulative: run,
+  });
+});
+
+test("a follow-up run's rollup covers only its own commits; cumulative covers the branch since base", async () => {
+  const path = await ensureWorktree({
+    repoDir,
+    worktreesDir,
+    agentId: "agt_1",
+  });
+  writeFileSync(join(path, "a.txt"), "a\n");
+  const first = commit(path, "add a");
+  writeFileSync(join(path, "b.txt"), "b\n");
+  const second = commit(path, "add b");
+  const since = await headSha(path);
+  writeFileSync(join(path, "a.txt"), "a2\n");
+  const third = commit(path, "change a");
+  const rollup = await diffRollup({ cwd: path, since });
+  expect(rollup.run).toEqual({
+    commits: [{ sha: third, subject: "change a" }],
+    files: 1,
+    added: 1,
+    removed: 1,
+  });
+  expect(rollup.cumulative).toEqual({
+    commits: [
+      { sha: third, subject: "change a" },
+      { sha: second, subject: "add b" },
+      { sha: first, subject: "add a" },
+    ],
+    files: 2,
+    added: 2,
+    removed: 0,
+  });
+});
+
+test("a run that changed nothing has an empty run rollup", async () => {
+  const path = await ensureWorktree({
+    repoDir,
+    worktreesDir,
+    agentId: "agt_1",
+  });
+  writeFileSync(join(path, "a.txt"), "a\n");
+  commit(path, "add a");
+  const since = await headSha(path);
+  const rollup = await diffRollup({ cwd: path, since });
+  expect(rollup.run).toEqual({ commits: [], files: 0, added: 0, removed: 0 });
+  expect(rollup.cumulative.commits).toHaveLength(1);
+});
+
+test("a binary file counts as a file with no lines, and a subject clips to 200 characters", async () => {
+  const path = await ensureWorktree({
+    repoDir,
+    worktreesDir,
+    agentId: "agt_1",
+  });
+  const since = await headSha(path);
+  writeFileSync(join(path, "blob.bin"), Buffer.from([0, 1, 2, 0, 255]));
+  commit(path, "x".repeat(300));
+  const { run } = await diffRollup({ cwd: path, since });
+  expect(run).toMatchObject({ files: 1, added: 0, removed: 0 });
+  expect(run.commits[0]?.subject).toBe(`${"x".repeat(199)}…`);
+});
+
+test("the commit list keeps the newest 50", async () => {
+  const path = await ensureWorktree({
+    repoDir,
+    worktreesDir,
+    agentId: "agt_1",
+  });
+  const since = await headSha(path);
+  for (let i = 1; i <= 51; i++)
+    git(
+      path,
+      "-c",
+      "user.name=t",
+      "-c",
+      "user.email=t@t",
+      "commit",
+      "-q",
+      "--allow-empty",
+      "-m",
+      `empty ${i}`,
+    );
+  const { run, cumulative } = await diffRollup({ cwd: path, since });
+  expect(run.commits).toHaveLength(50);
+  expect(run.commits[0]?.subject).toBe("empty 51");
+  expect(run.commits.at(-1)?.subject).toBe("empty 2");
+  expect(cumulative.commits).toHaveLength(50);
 });

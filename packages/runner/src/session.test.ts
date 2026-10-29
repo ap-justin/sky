@@ -183,6 +183,7 @@ test("a finished run posts started, assistant text progress, then finished with 
           turns: 2,
           durationMs: 1235,
         },
+        rollup: expect.any(Object),
       },
     },
   ]);
@@ -275,6 +276,7 @@ test("hooks reach the API in order: a notification, one progress per tool call f
           turns: 2,
           durationMs: 1235,
         },
+        rollup: expect.any(Object),
       },
     },
   ]);
@@ -433,6 +435,7 @@ test("an SDK error result posts run.failed with its errors and usage, still comm
         turns: 2,
         durationMs: 1235,
       },
+      rollup: expect.any(Object),
     },
   });
   expect(git(join(root, "worktrees", "agt_1"), "status", "--porcelain")).toBe(
@@ -457,7 +460,10 @@ test("an SDK that throws posts run.failed and exits 1", async () => {
   expect(posted.at(-1)).toEqual({
     runId: "run_1",
     type: "run.failed",
-    payload: { error: "Claude Code process exited with code 1" },
+    payload: {
+      error: "Claude Code process exited with code 1",
+      rollup: expect.any(Object),
+    },
   });
 });
 
@@ -523,7 +529,7 @@ test("an abort mid-session posts run.failed naming the signal", async () => {
   expect(posted.at(-1)).toEqual({
     runId: "run_1",
     type: "run.failed",
-    payload: { error: "interrupted by SIGTERM" },
+    payload: { error: "interrupted by SIGTERM", rollup: expect.any(Object) },
   });
 });
 
@@ -788,7 +794,7 @@ test("a wait past the max aborts the session, commits, and fails the run with wa
   expect(sent.at(-1)).toEqual({
     runId: "run_1",
     type: "run.failed",
-    payload: { error: "waiting_timeout" },
+    payload: { error: "waiting_timeout", rollup: expect.any(Object) },
   });
   expect(git(join(root, "worktrees", "agt_1"), "status", "--porcelain")).toBe(
     "",
@@ -811,5 +817,133 @@ test("a run the API already ended stops the session and posts nothing terminal",
     "run.started",
     "run.progress",
     "run.waiting",
+  ]);
+});
+
+const rollupOf = (event: RunnerEventPost | undefined) =>
+  event?.type === "run.finished" || event?.type === "run.failed"
+    ? event.payload.rollup
+    : undefined;
+
+test("run.finished carries the rollup: this run's commit, and the branch's commits since base", async () => {
+  const worktree = join(root, "worktrees", "agt_1");
+  const base = git(join(root, "repo"), "rev-parse", "origin/HEAD");
+  const first = recorder();
+  await runSession(config, {
+    query: scripted([init, success], (cwd) =>
+      writeFileSync(join(cwd, "hello.txt"), "hi\n"),
+    ),
+    post: first.post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  const firstSha = git(worktree, "rev-parse", "HEAD");
+  const firstRun = {
+    commits: [{ sha: firstSha, subject: "agent agt_1 run run_1" }],
+    files: 1,
+    added: 1,
+    removed: 0,
+  };
+  expect(rollupOf(first.posted.at(-1))).toEqual({
+    base,
+    run: firstRun,
+    cumulative: firstRun,
+  });
+
+  const second = recorder();
+  await runSession(
+    { ...config, runId: "run_2" },
+    {
+      query: scripted([init, success], (cwd) =>
+        writeFileSync(join(cwd, "hello.txt"), "hello\n"),
+      ),
+      post: second.post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    },
+  );
+  const secondSha = git(worktree, "rev-parse", "HEAD");
+  expect(rollupOf(second.posted.at(-1))).toEqual({
+    base,
+    run: {
+      commits: [{ sha: secondSha, subject: "agent agt_1 run run_2" }],
+      files: 1,
+      added: 1,
+      removed: 1,
+    },
+    cumulative: {
+      commits: [
+        { sha: secondSha, subject: "agent agt_1 run run_2" },
+        { sha: firstSha, subject: "agent agt_1 run run_1" },
+      ],
+      files: 1,
+      added: 1,
+      removed: 0,
+    },
+  });
+});
+
+test("a run that changed nothing finishes with an empty run rollup", async () => {
+  const { posted, post } = recorder();
+  await runSession(config, {
+    query: scripted([init, success]),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  const empty = { commits: [], files: 0, added: 0, removed: 0 };
+  expect(rollupOf(posted.at(-1))).toEqual({
+    base: git(join(root, "repo"), "rev-parse", "origin/HEAD"),
+    run: empty,
+    cumulative: empty,
+  });
+});
+
+test("run.failed still carries the rollup of what the run committed", async () => {
+  const { posted, post } = recorder();
+  const code = await runSession(config, {
+    query: scripted(
+      [init, new Error("Claude Code process exited with code 1")],
+      (cwd) => writeFileSync(join(cwd, "partial.txt"), "x\n"),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(code).toBe(1);
+  expect(posted.at(-1)).toMatchObject({
+    type: "run.failed",
+    payload: {
+      error: "Claude Code process exited with code 1",
+      rollup: {
+        run: {
+          commits: [{ subject: "agent agt_1 run run_1" }],
+          files: 1,
+          added: 1,
+          removed: 0,
+        },
+      },
+    },
+  });
+});
+
+test("a rollup that can't be computed is left off with one warning; the run still finishes", async () => {
+  const { posted, post } = recorder();
+  const warnings: string[] = [];
+  const code = await runSession(config, {
+    // without origin/HEAD there is no base to diff against
+    query: scripted([init, success], () =>
+      git(join(root, "repo"), "remote", "set-head", "origin", "--delete"),
+    ),
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+    warn: (line) => warnings.push(line),
+  });
+  expect(code).toBe(0);
+  expect(posted.at(-1)?.type).toBe("run.finished");
+  expect(rollupOf(posted.at(-1))).toBeUndefined();
+  expect(warnings).toEqual([
+    expect.stringMatching(/^runner: rollup skipped: /),
   ]);
 });

@@ -33,6 +33,7 @@ async function main(): Promise<void> {
       post: createPoster({ ...config, warn }),
       awaitDecision: createDecisionWaiter(config),
       signal: controller.signal,
+      warn,
     });
   } finally {
     process.off("SIGTERM", onSignal);
