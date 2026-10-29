@@ -103,6 +103,7 @@ test("POST returns 202 with the agent on claude/<agentId> and a starting run", a
       branch: `claude/${body.agent.id}`,
       status: "running",
       createdAt: iso,
+      archivedAt: null,
     },
     run: {
       id: expect.stringMatching(/^run_[0-9A-Za-z]+$/),
@@ -599,4 +600,329 @@ test("a run silent past the timeout is failed with runner_timeout, freeing its c
   ).toBe(401);
   await launched(envId);
   await sessionOpened(2);
+});
+
+const followUp = (agentId: string, body: unknown) =>
+  app.request(`/v1/agents/${agentId}/runs`, {
+    method: "POST",
+    headers: json,
+    body: JSON.stringify(body),
+  });
+
+test("a follow-up run resumes the agent's session in the same worktree", async () => {
+  const { agent, run: first } = await finishedRun();
+  const res = await followUp(agent.id, { prompt: "now add a test" });
+  expect(res.status).toBe(202);
+  const body = (await res.json()) as Launched;
+  expect(body.agent).toMatchObject({ id: agent.id, status: "running" });
+  expect(body.run).toMatchObject({ agentId: agent.id, status: "starting" });
+  expect(body.run.id).not.toBe(first.id);
+  expect(res.headers.get("location")).toBe(
+    `/v1/agents/${agent.id}/runs/${body.run.id}`,
+  );
+  await sessionOpened(2);
+  expect(wire.sessions[1]?.env).toMatchObject({
+    AGENT_ID: agent.id,
+    RUN_ID: body.run.id,
+    SESSION_ID: "s",
+    PROMPT_FILE: `/workspace/runs/${body.run.id}.prompt`,
+  });
+  expect(
+    new TextDecoder().decode(
+      wire.files.get(`/workspace/runs/${body.run.id}.prompt`),
+    ),
+  ).toBe("now add a test");
+});
+
+test("a follow-up on an agent whose first run never started a session starts a fresh one", async () => {
+  const { agent, run, token } = await runningRun();
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.failed",
+    payload: { error: "worktree setup failed" },
+  });
+  expect((await followUp(agent.id, { prompt: "retry" })).status).toBe(202);
+  await sessionOpened(2);
+  expect(wire.sessions[1]?.env).not.toHaveProperty("SESSION_ID");
+});
+
+test("a follow-up while the agent has an active run gets 409 agent_busy and starts nothing", async () => {
+  const { agent } = await runningRun();
+  const res = await followUp(agent.id, { prompt: "again" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({ error: { code: "agent_busy" } });
+  expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+    n: 1,
+  });
+});
+
+test("a follow-up counts against the env's concurrency cap", async () => {
+  const envId = readyEnv({ concurrency: 1 });
+  const { agent, run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.stopped",
+    payload: {},
+  });
+  // the slot run 1 freed is taken by another agent
+  await runningRun(envId);
+  const res = await followUp(agent.id, { prompt: "more" });
+  expect(res.status).toBe(409);
+  expect(await res.json()).toMatchObject({
+    error: { code: "concurrency_cap", limit: 1 },
+  });
+});
+
+test("GET of a follow-up run shows its own summary and the cumulative branch diff", async () => {
+  const { agent, run: first } = await finishedRun();
+  const res = await followUp(agent.id, { prompt: "add a test" });
+  const { run } = (await res.json()) as Launched;
+  await sessionOpened(2);
+  const token = wire.sessions[1]?.env.AGENT_TOKEN ?? "";
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.finished",
+    payload: { summary: "added the test", usage },
+  });
+  wire.exec = (argv) =>
+    argv[0] === "git" ? { exitCode: 0, stdout: patch } : { exitCode: 0 };
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    id: run.id,
+    summary: "added the test",
+    diff: patch,
+  });
+  // against the base branch, not run 1's end: the diff spans every run on the branch
+  expect(wire.calls.at(-1)).toMatch(
+    new RegExp(`git diff origin/HEAD\\.\\.\\.claude/${agent.id}$`),
+  );
+  expect((await getRun(agent.id, first.id)).body.summary).toBe("done");
+});
+
+test.each([
+  ["an unknown agent", "agt_nope"],
+  ["a malformed id", "nope"],
+])("a follow-up on %s gets 404", async (_, id) => {
+  expect((await followUp(id, { prompt: "go" })).status).toBe(404);
+});
+
+test.each([
+  ["no prompt", {}],
+  ["an empty prompt", { prompt: "" }],
+  ["an unknown key", { prompt: "go", envId: "env_x" }],
+])("a follow-up body with %s gets 400", async (_, body) => {
+  const { agent } = await finishedRun();
+  expect((await followUp(agent.id, body)).status).toBe(400);
+});
+
+test("a follow-up without a bearer gets 401 and starts nothing", async () => {
+  const { agent } = await finishedRun();
+  const res = await app.request(`/v1/agents/${agent.id}/runs`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ prompt: "go" }),
+  });
+  expect(res.status).toBe(401);
+  expect(wire.sessions).toHaveLength(1);
+});
+
+const action = (agentId: string, verb: "stop" | "archive") =>
+  app.request(`/v1/agents/${agentId}/${verb}`, {
+    method: "POST",
+    headers: auth,
+  });
+
+const runnerPattern = (runId: string) =>
+  `^node /opt/harness/runner\\.mjs ${runId}$`;
+
+test("stop SIGTERMs the run's runner, marks the run stopped and frees its cap slot", async () => {
+  const envId = readyEnv({ concurrency: 1 });
+  const { agent, run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const res = await action(agent.id, "stop");
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({
+    agent: { id: agent.id, status: "idle", archivedAt: null },
+    run: { id: run.id, status: "stopped" },
+  });
+  // the runner's argv carries its run id, so the match signals this run's runner only
+  expect(wire.sessions[0]?.argv.join(" ")).toContain(
+    'exec node /opt/harness/runner.mjs "$RUN_ID"',
+  );
+  expect(wire.calls.at(-1)).toBe(
+    `exec harness-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+  );
+  expect(
+    db.$client.prepare("select type from events order by id").all(),
+  ).toEqual([{ type: "run.started" }, { type: "run.stopped" }]);
+  // the runner reports its interrupt after the run has ended
+  const late = await postEvent(token, {
+    runId: run.id,
+    type: "run.failed",
+    payload: { error: "interrupted by SIGTERM" },
+  });
+  expect(late.status).toBe(401);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("stopped");
+  await launched(envId);
+  await sessionOpened(2);
+});
+
+test("stopping an agent with no active run is a 200 no-op that never wakes the sprite", async () => {
+  const { agent } = await finishedRun();
+  const calls = wire.calls.length;
+  for (let i = 0; i < 2; i++) {
+    const res = await action(agent.id, "stop");
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      agent: { id: agent.id, status: "idle" },
+      run: null,
+    });
+  }
+  expect(wire.calls).toHaveLength(calls);
+});
+
+test("a stop whose signal can't reach the sprite still stops the run, and logs it", async () => {
+  const { agent, run, envId } = await runningRun();
+  wire.sprites.delete(`harness-${envId}`);
+  const res = await action(agent.id, "stop");
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ run: { status: "stopped" } });
+  expect(logs.join("\n")).toContain(
+    `signalling the runner of ${run.id} failed`,
+  );
+});
+
+test("a run stopped before its launch opens a session never gets a runner", async () => {
+  const { agent, run } = await launched(readyEnv());
+  expect((await action(agent.id, "stop")).status).toBe(200);
+  await vi.waitFor(() =>
+    expect(logs).toContain(`${run.id} ended before its runner started`),
+  );
+  expect(wire.sessions).toEqual([]);
+});
+
+test.each([
+  ["an unknown agent", "agt_nope"],
+  ["a malformed id", "nope"],
+])("stop or archive of %s gets 404", async (_, id) => {
+  expect((await action(id, "stop")).status).toBe(404);
+  expect((await action(id, "archive")).status).toBe(404);
+});
+
+test("stop or archive without a bearer gets 401 and touches nothing", async () => {
+  const { agent, run } = await runningRun();
+  const calls = wire.calls.length;
+  for (const verb of ["stop", "archive"]) {
+    const res = await app.request(`/v1/agents/${agent.id}/${verb}`, {
+      method: "POST",
+    });
+    expect(res.status).toBe(401);
+  }
+  expect(wire.calls).toHaveLength(calls);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("starting");
+});
+
+const worktreeRemoval = (envId: string, agentId: string) =>
+  new RegExp(
+    `^exec harness-${envId} /workspace/repo bash -c .*git worktree remove --force "\\$1".* _ /workspace/worktrees/${agentId}`,
+  );
+
+test("archive stops the active run, waits for its runner, then removes the worktree and keeps the branch", async () => {
+  const { agent, run, envId } = await runningRun();
+  const res = await action(agent.id, "archive");
+  expect(res.status).toBe(200);
+  const body = (await res.json()) as { agent: Record<string, unknown> };
+  expect(body.agent).toMatchObject({
+    id: agent.id,
+    status: "idle",
+    branch: `claude/${agent.id}`,
+    archivedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT[\d:.]+Z$/),
+  });
+  const [signal, removal] = wire.calls.slice(-2);
+  expect(signal).toBe(
+    `exec harness-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+  );
+  expect(removal).toMatch(worktreeRemoval(envId, agent.id));
+  // the runner commits after SIGTERM, so removal waits until no process matches it
+  expect(removal).toContain('pgrep -f "$2"');
+  expect(removal?.endsWith(` ${runnerPattern(run.id)}`)).toBe(true);
+  expect(wire.calls.join("\n")).not.toMatch(/git branch/);
+  expect((await getRun(agent.id, run.id)).body.status).toBe("stopped");
+});
+
+test("archiving an idle agent removes its worktree without signalling anything", async () => {
+  const { agent, envId } = await finishedRun();
+  const calls = wire.calls.length;
+  expect((await action(agent.id, "archive")).status).toBe(200);
+  const made = wire.calls.slice(calls);
+  expect(made).toHaveLength(1);
+  expect(made[0]).toMatch(worktreeRemoval(envId, agent.id));
+  expect(made[0]).not.toContain("pgrep");
+});
+
+test("an archived agent refuses follow-ups and stops with 409 agent_archived", async () => {
+  const { agent } = await finishedRun();
+  await action(agent.id, "archive");
+  for (const res of [
+    await followUp(agent.id, { prompt: "more" }),
+    await action(agent.id, "stop"),
+  ]) {
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({
+      error: { code: "agent_archived" },
+    });
+  }
+  expect(wire.sessions).toHaveLength(1);
+});
+
+test("archiving twice keeps the first archivedAt and retries the worktree removal", async () => {
+  const { agent, envId } = await finishedRun();
+  const first = (await (await action(agent.id, "archive")).json()) as {
+    agent: { archivedAt: string };
+  };
+  const calls = wire.calls.length;
+  const again = await action(agent.id, "archive");
+  expect(again.status).toBe(200);
+  expect(await again.json()).toMatchObject({
+    agent: { archivedAt: first.agent.archivedAt },
+  });
+  expect(wire.calls.slice(calls)).toEqual([
+    expect.stringMatching(worktreeRemoval(envId, agent.id)),
+  ]);
+});
+
+test.each([
+  [
+    "the removal fails",
+    (w: SpritesWire) => {
+      w.exec = (argv) =>
+        argv[0] === "bash"
+          ? { exitCode: 128, stderr: "fatal: worktree is locked\n" }
+          : { exitCode: 0 };
+    },
+  ],
+  [
+    "the sprite is unreachable",
+    (w: SpritesWire, envId: string) => {
+      w.sprites.delete(`harness-${envId}`);
+    },
+  ],
+])("an archive where %s gets 502 and stays archived", async (_, breakIt) => {
+  const { agent, envId } = await finishedRun();
+  breakIt(wire, envId);
+  const res = await action(agent.id, "archive");
+  expect(res.status).toBe(502);
+  expect(await res.json()).toMatchObject({
+    error: { code: "worktree_remove_failed" },
+  });
+  expect(logs.join("\n")).toContain(`removing the worktree of ${agent.id}`);
+  expect((await followUp(agent.id, { prompt: "more" })).status).toBe(409);
 });
