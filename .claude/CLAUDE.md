@@ -10,7 +10,7 @@ team works.
 
 Repo is pre-scaffold; every line below cites the decision standing in for a manifest (`← decided 2026-10-29 · /brief`).
 
-- **api** → `kru:hono-builder` — `apps/api`: routes, SSE, webhook fan-out, `@fly/sprites` calls; Hono on `@hono/node-server`, Node 22
+- **api** → `kru:hono-builder` — `apps/api`: routes, SSE, webhook fan-out, `@fly/sprites` calls; Hono on `@hono/node-server`, Node 24 (`@fly/sprites` requires ≥24)
 - **data** → `kru:sqlite-architect` — `db/`: SQLite on the API machine's Fly volume via `better-sqlite3`, Drizzle `sqlite` dialect, migrations at boot
 - **platform** → `kru:fly-platform-engineer` — `fly.toml`, `Dockerfile`, the volume, `fly secrets`, Sprites org + connectors
 - **programs** → `kru:node-developer` — `packages/runner` (exec'd inside a sprite, Agent SDK), `packages/cli` (`harness apply`, `harness secret set`)

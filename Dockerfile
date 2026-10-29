@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1
 # check=error=true
 
-FROM node:22-bookworm-slim AS build
+FROM node:24-bookworm-slim AS build
 # toolchain for better-sqlite3's node-gyp fallback when no prebuilt binary matches the target arch
 RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ \
@@ -21,7 +21,7 @@ RUN cp -R /repo/apps/api/dist/bundle /repo/apps/api/dist/drizzle . \
   && npm install --omit=dev --no-package-lock --no-audit --no-fund \
     "better-sqlite3@$(node -p 'require("/repo/apps/api/node_modules/better-sqlite3/package.json").version')"
 
-FROM node:22-bookworm-slim
+FROM node:24-bookworm-slim
 ENV NODE_ENV=production \
   DATA_DIR=/data
 WORKDIR /app
