@@ -91,7 +91,7 @@ export function createApp({
       return c.json({ status: "ok", db: "ok" } as const, 200);
     })
     // the runner's own channel, authenticated per run by its agent token rather than the API key
-    .route("/internal", internalRoutes(longPollMs))
+    .route("/internal", internalRoutes(longPollMs, log))
     .use("/v1/*", apiKeyGuard)
     .route("/v1", v1)
     .use("/mcp", apiKeyGuard)

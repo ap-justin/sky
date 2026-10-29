@@ -5,6 +5,7 @@ import {
   RequestId,
   RunId,
   RunnerEventPost,
+  RunRollup,
   type RunStatus,
 } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
@@ -62,8 +63,30 @@ const requestParam = zValidator(
   },
 );
 
+const isRecord = (v: unknown): v is Record<string, unknown> =>
+  typeof v === "object" && v !== null && !Array.isArray(v);
+
+/** `RunnerEventPost`, except a rollup that fails `RunRollup` is dropped with a log line rather than failing the event. */
+const eventPost = (log: (line: string) => void) =>
+  z.preprocess((raw) => {
+    if (!isRecord(raw) || !isRecord(raw.payload)) return raw;
+    if (raw.type !== "run.finished" && raw.type !== "run.failed") return raw;
+    const { rollup, ...payload } = raw.payload;
+    if (rollup === undefined) return raw;
+    const parsed = RunRollup.safeParse(rollup);
+    if (parsed.success) return raw;
+    // runs before the token check, so the unverified runId is quoted to keep it on one line
+    log(
+      `dropped unparseable rollup on ${raw.type} for ${JSON.stringify(raw.runId)}: ${z.prettifyError(parsed.error)}`,
+    );
+    return { ...raw, payload };
+  }, RunnerEventPost);
+
 /** `longPollMs`: how long the decision long-poll waits before answering pending. */
-export function internalRoutes(longPollMs: number) {
+export function internalRoutes(
+  longPollMs: number,
+  log: (line: string) => void,
+) {
   const requireToken = factory.createMiddleware(async (c, next) => {
     if (!bearer(c.req.header("authorization"))) {
       return apiError(c, 401, "unauthorized", "missing agent token");
@@ -74,7 +97,7 @@ export function internalRoutes(longPollMs: number) {
     .createApp()
     .use("/events", requireToken)
     .use("/runs/*", requireToken)
-    .post("/events", jsonBody, body(RunnerEventPost), (c) => {
+    .post("/events", jsonBody, body(eventPost(log)), (c) => {
       const event = c.req.valid("json");
       const { db, config, secrets } = c.var;
       const token = bearer(c.req.header("authorization")) ?? "";
@@ -112,9 +135,9 @@ export function internalRoutes(longPollMs: number) {
             redacted.payload,
           );
           if (next) {
-            const usage =
+            const ended =
               redacted.type === "run.finished" || redacted.type === "run.failed"
-                ? redacted.payload.usage
+                ? redacted.payload
                 : undefined;
             tx.update(runs)
               .set({
@@ -122,7 +145,8 @@ export function internalRoutes(longPollMs: number) {
                 ...(redacted.type === "run.finished"
                   ? { summary: redacted.payload.summary }
                   : {}),
-                ...(usage ?? {}),
+                ...(ended?.usage ?? {}),
+                ...(ended?.rollup ? { rollup: ended.rollup } : {}),
               })
               .where(eq(runs.id, run.id))
               .run();

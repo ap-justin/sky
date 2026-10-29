@@ -56,12 +56,17 @@ const presentRunDetail = (
   db: Db,
   run: typeof runs.$inferSelect,
   branch: string,
+  repo: string,
   diff: string | null,
 ) => ({
   ...presentRun(run, runError(db, run.id)),
   branch,
   diff,
   pendingRequest: openRequestOf(db, run.id)?.request ?? null,
+  rollup: run.rollup,
+  compareUrl: run.rollup
+    ? `https://github.com/${repo}/compare/${run.rollup.base}...${branch}`
+    : null,
 });
 
 const presentAgent = (row: AgentRow) => ({
@@ -419,8 +424,13 @@ export function agentRoutes(
     .get("/:id/runs", agentParam, (c) => {
       const { id } = c.req.valid("param");
       const db = c.var.db;
-      const agent = db.select().from(agents).where(eq(agents.id, id)).get();
-      if (!agent) return apiError(c, 404, "not_found", "no such agent");
+      const found = db
+        .select({ branch: agents.branch, repo: environments.repo })
+        .from(agents)
+        .innerJoin(environments, eq(agents.envId, environments.id))
+        .where(eq(agents.id, id))
+        .get();
+      if (!found) return apiError(c, 404, "not_found", "no such agent");
       const rows = db
         .select()
         .from(runs)
@@ -429,7 +439,7 @@ export function agentRoutes(
         .all();
       // reading a diff wakes the sprite, so only the single-run GET returns one
       const data = rows.map((run) =>
-        presentRunDetail(db, run, agent.branch, null),
+        presentRunDetail(db, run, found.branch, found.repo, null),
       );
       return c.json({ data }, 200);
     })
@@ -441,6 +451,7 @@ export function agentRoutes(
           run: runs,
           agent: agents,
           spriteName: environments.spriteName,
+          repo: environments.repo,
         })
         .from(runs)
         .innerJoin(agents, eq(runs.agentId, agents.id))
@@ -448,7 +459,7 @@ export function agentRoutes(
         .where(and(eq(runs.id, runId), eq(runs.agentId, id)))
         .get();
       if (!found) return apiError(c, 404, "not_found", "no such run");
-      const { run, agent, spriteName } = found;
+      const { run, agent, spriteName, repo } = found;
       // the runner commits at run end, so an active run's branch doesn't hold its work yet
       let diff: string | null = null;
       if (!isActive(run.status)) {
@@ -477,7 +488,7 @@ export function agentRoutes(
           );
         }
       }
-      return c.json(presentRunDetail(db, run, agent.branch, diff), 200);
+      return c.json(presentRunDetail(db, run, agent.branch, repo, diff), 200);
     })
     .get("/:id/runs/:runId/stream", runParam, afterQuery, lastEventId, (c) => {
       const { id, runId } = c.req.valid("param");

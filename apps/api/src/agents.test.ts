@@ -559,9 +559,101 @@ test("GET of an ended run returns its branch and its diff against the env's base
     branch: `claude/${agent.id}`,
     diff: patch,
     pendingRequest: null,
+    rollup: null,
+    compareUrl: null,
   });
   expect(wire.calls.at(-1)).toBe(
     `exec harness-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
+  );
+});
+
+const sha = (c: string) => c.repeat(40);
+const rollupWith = (subject: string) => ({
+  base: sha("b"),
+  run: {
+    commits: [{ sha: sha("1"), subject }],
+    files: 2,
+    added: 10,
+    removed: 3,
+  },
+  cumulative: {
+    commits: [
+      { sha: sha("1"), subject },
+      { sha: sha("0"), subject: "earlier run" },
+    ],
+    files: 3,
+    added: 14,
+    removed: 3,
+  },
+});
+
+async function endedWith(type: "run.finished" | "run.failed", rollup: unknown) {
+  const r = await runningRun();
+  await postEvent(r.token, {
+    runId: r.run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const res = await postEvent(r.token, {
+    runId: r.run.id,
+    type,
+    payload:
+      type === "run.finished"
+        ? { summary: "done", usage, rollup }
+        : { error: "boom", usage, rollup },
+  });
+  return { ...r, res };
+}
+
+test("a finished run's rollup and compare URL show on GET and on the list, which never wakes the sprite", async () => {
+  const rollup = rollupWith("fix the flaky test");
+  const { agent, run, res } = await endedWith("run.finished", rollup);
+  expect(res.status).toBe(201);
+  const compareUrl = `https://github.com/acme/kru/compare/${sha("b")}...claude/${agent.id}`;
+  wire.exec = () => ({ exitCode: 0, stdout: patch });
+  expect((await getRun(agent.id, run.id)).body).toMatchObject({
+    rollup,
+    compareUrl,
+    diff: patch,
+  });
+  const calls = wire.calls.length;
+  expect((await listRuns(agent.id)).body.data).toEqual([
+    expect.objectContaining({ id: run.id, rollup, compareUrl, diff: null }),
+  ]);
+  expect(wire.calls).toHaveLength(calls);
+});
+
+test("a failed run's rollup is stored with its commit subjects redacted", async () => {
+  const key = "sk-proj-0123456789abcdefABCDEF";
+  const { agent, run, res } = await endedWith(
+    "run.failed",
+    rollupWith(`add API_KEY=${key}`),
+  );
+  expect(res.status).toBe(201);
+  expect(
+    JSON.stringify(db.$client.prepare("select * from runs").all()),
+  ).not.toContain(key);
+  expect((await listRuns(agent.id)).body.data[0]).toMatchObject({
+    id: run.id,
+    status: "failed",
+    rollup: { run: { commits: [{ subject: "add API_KEY=[redacted]" }] } },
+  });
+});
+
+test("an unparseable rollup is dropped with a log line and the event still lands", async () => {
+  const { agent, run, res } = await endedWith("run.finished", {
+    base: "not-a-sha",
+  });
+  expect(res.status).toBe(201);
+  expect((await listRuns(agent.id)).body.data[0]).toMatchObject({
+    id: run.id,
+    status: "finished",
+    summary: "done",
+    rollup: null,
+    compareUrl: null,
+  });
+  expect(logs.some((l) => l.includes("rollup") && l.includes(run.id))).toBe(
+    true,
   );
 });
 
