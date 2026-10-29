@@ -91,6 +91,17 @@ const runActive = "a run on this environment is active";
 const nameTakenMessage = "an environment with this name exists";
 const stillProvisioning = "environment is still provisioning";
 
+const reprovisioning = {
+  status: "provisioning",
+  checkpointId: null,
+  failureStep: null,
+  failureStderr: null,
+} as const;
+
+// a sprite whose creation failed doesn't exist, so the rerun starts by creating it
+const needsFreshSprite = (env: EnvRow) =>
+  env.status === "failed" && env.failureStep === "create";
+
 const envParam = zValidator(
   "param",
   z.object({ id: EnvironmentId }),
@@ -172,17 +183,9 @@ export function environmentRoutes(
             ) {
               return nameTakenResult;
             }
-            // a sprite whose creation failed doesn't exist, so the rerun starts by creating it
-            const fresh =
-              env.status === "failed" && env.failureStep === "create";
+            const fresh = needsFreshSprite(env);
             const changes = reprovision
-              ? {
-                  ...patch,
-                  status: "provisioning" as const,
-                  checkpointId: null,
-                  failureStep: null,
-                  failureStderr: null,
-                }
+              ? { ...patch, ...reprovisioning }
               : patch;
             // drizzle refuses an update with nothing to set
             const row =
@@ -214,6 +217,41 @@ export function environmentRoutes(
         return c.json(present(outcome.row), 202);
       }
       return c.json(present(outcome.row), 200);
+    })
+    .post("/:id/retry", envParam, (c) => {
+      const { id } = c.req.valid("param");
+      const outcome = c.var.db.transaction(
+        (tx) => {
+          const env = findEnv(tx, id);
+          if (!env) return { kind: "not_found" } as const;
+          if (env.status !== "failed") return { kind: "not_failed" } as const;
+          const row = tx
+            .update(environments)
+            .set(reprovisioning)
+            .where(eq(environments.id, id))
+            .returning()
+            .get();
+          return {
+            kind: "retrying",
+            row,
+            fresh: needsFreshSprite(env),
+          } as const;
+        },
+        { behavior: "immediate" },
+      );
+      switch (outcome.kind) {
+        case "not_found":
+          return apiError(c, 404, "not_found", notFound);
+        case "not_failed":
+          return apiError(
+            c,
+            409,
+            "not_failed",
+            "only a failed environment can be retried",
+          );
+      }
+      provisioner.start(outcome.row, { fresh: outcome.fresh });
+      return c.json(present(outcome.row), 202);
     })
     .delete("/:id", envParam, async (c) => {
       const { id } = c.req.valid("param");

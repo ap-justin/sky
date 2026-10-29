@@ -496,6 +496,70 @@ test("a retry clears the previous failure while it provisions", async () => {
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
 });
 
+const retry = (id: string, headers: Record<string, string> = auth) =>
+  app.request(`/v1/environments/${id}/retry`, { method: "POST", headers });
+
+test("retry of a setup failure reruns provisioning on the same spec and ends ready", async () => {
+  wire.exec = (argv) =>
+    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  await settled(id);
+  wire.exec = () => ({ exitCode: 0 });
+  wire.calls.length = 0;
+  const res = await retry(id);
+  expect(res.status).toBe(202);
+  expect(await res.json()).toMatchObject({
+    status: "provisioning",
+    setup: kru.setup,
+    failure: null,
+  });
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+  const sprite = `harness-${id}`;
+  expect(wire.calls).toEqual([
+    `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo`,
+    `exec ${sprite} - sh -c ${installRunnerSdk}`,
+    `exec ${sprite} /workspace/repo bash -c pnpm install`,
+    `checkpoint ${sprite}`,
+  ]);
+});
+
+test("retry of a create failure recreates the sprite before cloning", async () => {
+  wire.createStatus = 500;
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  await settled(id);
+  wire.createStatus = 201;
+  wire.calls.length = 0;
+  expect((await retry(id)).status).toBe(202);
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+  expect(wire.calls[0]).toBe(`create harness-${id}`);
+});
+
+test("retry is 409 not_failed unless failed, 404 for an unknown env, 401 without a bearer", async () => {
+  const id = await ready();
+  const res = await retry(id);
+  expect(res.status).toBe(409);
+  expect(await res.json()).toEqual({
+    error: { code: "not_failed", message: expect.any(String) },
+  });
+  expect((await retry("env_nope")).status).toBe(404);
+  expect((await retry(id, {})).status).toBe(401);
+  expect(wire.calls).toEqual([]);
+});
+
+test("a second retry while the first provisions is 409 and starts nothing", async () => {
+  wire.exec = (argv) =>
+    argv[0] === "bash" ? { exitCode: 1 } : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  await settled(id);
+  wire.exec = () => ({ exitCode: 0 });
+  wire.calls.length = 0;
+  const [first, second] = await Promise.all([retry(id), retry(id)]);
+  expect([first.status, second.status].sort()).toEqual([202, 409]);
+  await settled(id);
+  expect(wire.calls.filter((c) => c.startsWith("checkpoint"))).toHaveLength(1);
+});
+
 // stands in for a writer that commits the same name between the check and the write
 const raceOnName = (raced: string) =>
   db.$client.exec(`
