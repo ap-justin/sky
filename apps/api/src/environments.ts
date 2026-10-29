@@ -1,8 +1,16 @@
 import type { SpritesClient } from "@fly/sprites";
-import { agents, type Db, environments, events, runs } from "@harness/db";
+import {
+  agents,
+  type Db,
+  environments,
+  events,
+  runRequests,
+  runs,
+  webhookDeliveries,
+} from "@harness/db";
 import { Environment, EnvironmentId } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, eq, inArray, isNull, sql } from "drizzle-orm";
 import { z } from "zod";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
@@ -85,6 +93,15 @@ const hasActiveRun = (tx: Db | Tx, id: EnvironmentId) =>
     .innerJoin(agents, eq(runs.agentId, agents.id))
     .where(and(eq(agents.envId, id), inArray(runs.status, activeRunStatuses)))
     .get() !== undefined;
+
+const unarchivedAgentIds = (tx: Tx, id: EnvironmentId) =>
+  tx
+    .select({ id: agents.id })
+    .from(agents)
+    .where(and(eq(agents.envId, id), isNull(agents.archivedAt)))
+    .orderBy(asc(agents.createdAt), asc(sql`rowid`))
+    .all()
+    .map((a) => a.id);
 
 const notFound = "no such environment";
 const runActive = "a run on this environment is active";
@@ -173,6 +190,11 @@ export function environmentRoutes(
             if (reprovision && env.status === "provisioning") {
               return { kind: "provisioning" } as const;
             }
+            // reprovisioning removes the repo and every worktree, and the agents' branches exist nowhere else
+            const agentIds = reprovision ? unarchivedAgentIds(tx, id) : [];
+            if (agentIds.length > 0) {
+              return { kind: "agents_exist", agentIds } as const;
+            }
             if (
               patch.name !== undefined &&
               patch.name !== env.name &&
@@ -207,6 +229,13 @@ export function environmentRoutes(
           return apiError(c, 409, "provisioning", stillProvisioning);
         case "name_taken":
           return apiError(c, 409, "name_taken", nameTakenMessage);
+        case "agents_exist":
+          return apiError(
+            c,
+            409,
+            "agents_exist",
+            `changing repo or setup replaces every agent's worktree and branch; archive agents ${outcome.agentIds.join(", ")} first`,
+          );
       }
       if (outcome.reprovision) {
         provisioner.start(outcome.row);
@@ -267,6 +296,11 @@ export function environmentRoutes(
           "could not destroy the environment's sprite; retry the delete",
         );
       }
+      // committed on its own: if the row delete below fails, the env must not stay ready on a destroyed sprite
+      db.update(environments)
+        .set({ status: "failed" })
+        .where(eq(environments.id, id))
+        .run();
       db.transaction(
         (tx) => {
           const envAgents = tx
@@ -277,6 +311,17 @@ export function environmentRoutes(
             .select({ id: runs.id })
             .from(runs)
             .where(inArray(runs.agentId, envAgents));
+          const envEvents = tx
+            .select({ id: events.id })
+            .from(events)
+            .where(inArray(events.runId, envRuns));
+          // both pin their parent without cascade (db/src/schema.ts), so they go first
+          tx.delete(webhookDeliveries)
+            .where(inArray(webhookDeliveries.eventId, envEvents))
+            .run();
+          tx.delete(runRequests)
+            .where(inArray(runRequests.runId, envRuns))
+            .run();
           tx.delete(events).where(inArray(events.runId, envRuns)).run();
           tx.delete(runs).where(inArray(runs.agentId, envAgents)).run();
           tx.delete(agents).where(eq(agents.envId, id)).run();

@@ -407,6 +407,30 @@ test("PATCH is 409 while a run is active, and a finished run doesn't block it", 
   expect((await patch(other, { concurrency: 4 })).status).toBe(200);
 });
 
+test("PATCH of repo or setup is 409 agents_exist while an agent is unarchived, and proceeds once all are archived", async () => {
+  const id = await ready();
+  seedRun(id, "finished");
+  const agentId = `agt_${id.slice(4)}`;
+  for (const change of [{ setup: "make" }, { repo: "acme/kru-next" }]) {
+    const res = await patch(id, change);
+    expect(res.status).toBe(409);
+    const { error } = (await res.json()) as {
+      error: { code: string; message: string };
+    };
+    expect(error.code).toBe("agents_exist");
+    expect(error.message).toContain(agentId);
+    expect(error.message).toMatch(/archive/);
+  }
+  expect((await patch(id, { concurrency: 4 })).status).toBe(200);
+  expect(wire.calls).toEqual([]);
+
+  db.$client
+    .prepare("update agents set archived_at = ? where id = ?")
+    .run("2026-10-29T12:00:00.000Z", agentId);
+  expect((await patch(id, { setup: "make" })).status).toBe(202);
+  expect(await settled(id)).toMatchObject({ status: "ready", setup: "make" });
+});
+
 test("PATCH of repo or setup is 409 while provisioning; a rename is not", async () => {
   const { id } = (await (await post(kru)).json()) as { id: string };
   const res = await patch(id, { setup: "make" });
@@ -445,6 +469,57 @@ test("DELETE destroys the sprite, then the row and its agents' history", async (
   expect(db.$client.prepare("select count(*) as n from agents").get()).toEqual({
     n: 0,
   });
+});
+
+test("DELETE removes the env's webhook deliveries and run requests with its runs", async () => {
+  const id = await ready();
+  seedRun(id, "finished");
+  const runId = `run_${id.slice(4)}`;
+  const sql = (statement: string, ...params: unknown[]) =>
+    db.$client.prepare(statement).run(...params);
+  const eventId = sql(
+    "insert into events (run_id, ts, type, payload) values (?, '2026-10-29T12:00:00.000Z', 'run.finished', '{}')",
+    runId,
+  ).lastInsertRowid;
+  sql(
+    "insert into webhooks (id, url, event_types) values ('wh_1', 'https://x', '[\"run.finished\"]')",
+  );
+  sql(
+    "insert into webhook_deliveries (webhook_id, event_id, status, next_attempt_at) values ('wh_1', ?, 'pending', '2026-10-29T12:00:00.000Z')",
+    eventId,
+  );
+  sql(
+    "insert into run_requests (id, run_id, kind, request) values ('req_1', ?, 'question', ?)",
+    runId,
+    JSON.stringify({ kind: "question", requestId: "req_1", prompt: "which?" }),
+  );
+  expect((await del(id)).status).toBe(204);
+  const count = (table: string) =>
+    db.$client.prepare(`select count(*) as n from ${table}`).get();
+  for (const table of [
+    "environments",
+    "agents",
+    "runs",
+    "events",
+    "webhook_deliveries",
+    "run_requests",
+  ]) {
+    expect(count(table), table).toEqual({ n: 0 });
+  }
+  expect(count("webhooks")).toEqual({ n: 1 });
+});
+
+test("DELETE whose row delete fails after the sprite is gone leaves the env failed, and a retry removes it", async () => {
+  const id = await ready();
+  db.$client.exec(
+    "create trigger refuse before delete on environments begin select raise(abort, 'refused'); end",
+  );
+  expect((await del(id)).status).toBe(500);
+  expect(wire.sprites.size).toBe(0);
+  expect((await get(id)).body).toMatchObject({ status: "failed" });
+  db.$client.exec("drop trigger refuse");
+  expect((await del(id)).status).toBe(204);
+  expect((await get(id)).status).toBe(404);
 });
 
 test("DELETE is 409 while a run is active and while provisioning, and keeps the sprite", async () => {
