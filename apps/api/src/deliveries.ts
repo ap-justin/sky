@@ -7,7 +7,7 @@ import type { Tx } from "./runs.js";
 const TICK_MS = 5_000;
 const BATCH = 20;
 const TIMEOUT_MS = 10_000;
-const MAX_ATTEMPTS = 8;
+const MAX_ATTEMPTS = 30;
 const FIRST_RETRY_MS = 10_000;
 const MAX_RETRY_MS = 3_600_000;
 // the CHECK on webhook_deliveries.last_error

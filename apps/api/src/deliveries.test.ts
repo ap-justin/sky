@@ -352,22 +352,26 @@ test("a redirect is a failed attempt, never followed", async () => {
   ]);
 });
 
-test("after 8 failed attempts the delivery is failed and never tried again", async () => {
+test("after 30 failed attempts the delivery is failed and never tried again", async () => {
   await subscribe(["run.finished"]);
-  const received = subscriber(Array(9).fill(503));
+  const received = subscriber(Array(31).fill(503));
   const { runId, token } = runningRun();
   await postEvent(token, {
     runId,
     type: "run.finished",
     payload: { summary: "ok", usage },
   });
-  for (let i = 0; i < 9; i++) {
+  for (let i = 0; i < 31; i++) {
     await dispatcher.drain();
     advance(3_600_000);
   }
-  expect(received).toHaveLength(8);
+  expect(received).toHaveLength(30);
   expect(deliveries()).toEqual([
-    expect.objectContaining({ status: "failed", attempts: 8, lastStatus: 503 }),
+    expect.objectContaining({
+      status: "failed",
+      attempts: 30,
+      lastStatus: 503,
+    }),
   ]);
 });
 
