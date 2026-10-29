@@ -18,10 +18,15 @@ export function boot(config: Config, log: (line: string) => void) {
   const db = openDb(join(config.dataDir, "harness.db"));
   migrate(db);
   failInterruptedProvisioning(db);
+  const dispatcher = createDispatcher({
+    db,
+    signingKey: config.webhookSigningKey,
+    log,
+  });
   const sweep = () => {
-    for (const id of failStaleRuns(db, config.runTimeoutMs)) {
-      log(`run ${id} failed: runner_timeout`);
-    }
+    const failed = failStaleRuns(db, config.runTimeoutMs);
+    for (const id of failed) log(`run ${id} failed: runner_timeout`);
+    if (failed.length > 0) dispatcher.nudge();
   };
   sweep();
   const sweeper = setInterval(
@@ -36,11 +41,6 @@ export function boot(config: Config, log: (line: string) => void) {
   );
   sweeper.unref();
   const sprites = new SpritesClient(config.spritesToken);
-  const dispatcher = createDispatcher({
-    db,
-    signingKey: config.webhookSigningKey,
-    log,
-  });
   dispatcher.start();
   return {
     db,

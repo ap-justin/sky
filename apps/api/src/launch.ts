@@ -84,6 +84,7 @@ type Deps = {
   secrets: KnownSecrets;
   sprites: SpritesClient;
   log: (line: string) => void;
+  nudgeDeliveries: () => void;
 };
 export type Launch = {
   spriteName: string;
@@ -95,7 +96,14 @@ export type Launch = {
 };
 
 /** Starts runners in the background; a launch that fails fails its run with a redacted `launch_failed` error. */
-export function createLauncher({ db, config, secrets, sprites, log }: Deps) {
+export function createLauncher({
+  db,
+  config,
+  secrets,
+  sprites,
+  log,
+  nudgeDeliveries,
+}: Deps) {
   let bundle: Promise<{ bytes: Buffer; sha256: string }> | undefined;
   // read once: the bundle ships with this build of the API
   const loadBundle = () => {
@@ -176,6 +184,7 @@ export function createLauncher({ db, config, secrets, sprites, log }: Deps) {
             (tx) => failRun(tx, launch.runId, `launch_failed: ${detail}`),
             { behavior: "immediate" },
           );
+          nudgeDeliveries();
         })
         .catch((err: unknown) => {
           log(`launching ${launch.runId} could not record its outcome: ${err}`);

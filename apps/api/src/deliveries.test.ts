@@ -20,7 +20,8 @@ import {
   retryDelayMs,
   signatureHeader,
 } from "./deliveries.js";
-import { testConfig } from "./testing/sprites.js";
+import { failStaleRuns } from "./runs.js";
+import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
 
 const key = "webhook-signing-key-for-tests-0123456789";
 
@@ -98,10 +99,11 @@ beforeEach(() => {
     now: () => clock,
     random: () => 0.5,
   });
+  stubSprites();
   app = createApp({
     db,
     config,
-    sprites: new SpritesClient("unused"),
+    sprites: new SpritesClient(spritesToken),
     log: () => {},
     nudgeDeliveries: dispatcher.nudge,
   });
@@ -397,4 +399,36 @@ test("pending deliveries left by a previous process are sent once a dispatcher s
   await dispatcher.drain();
   expect(received).toHaveLength(1);
   expect(deliveries()[0]?.status).toBe("delivered");
+});
+
+test("stopping a run delivers its run.stopped event to a subscriber", async () => {
+  await subscribe(["run.stopped"]);
+  const received = subscriber([200]);
+  const { runId } = runningRun();
+  const res = await app.request("/v1/agents/agt_test/stop", {
+    method: "POST",
+    headers: auth,
+  });
+  expect(res.status).toBe(200);
+  // no drain: the stop itself wakes the dispatcher
+  await expect.poll(() => received.length).toBe(1);
+  expect(JSON.parse(received[0]?.body ?? "")).toMatchObject({
+    runId,
+    type: "run.stopped",
+  });
+});
+
+test("a run the sweep times out delivers its run.failed event to a subscriber", async () => {
+  await subscribe(["run.failed"]);
+  const received = subscriber([200]);
+  const { runId } = runningRun();
+  expect(failStaleRuns(db, 0, Date.now() + 1000)).toEqual([runId]);
+  await dispatcher.drain();
+  expect(received.map((r) => JSON.parse(r.body))).toEqual([
+    expect.objectContaining({
+      runId,
+      type: "run.failed",
+      payload: { error: "runner_timeout" },
+    }),
+  ]);
 });

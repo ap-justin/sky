@@ -289,6 +289,7 @@ export function agentRoutes(
           return archived(c);
       }
       const { run, spriteName } = outcome;
+      if (run) c.var.nudgeDeliveries();
       // the run is stopped either way: a runner that missed the signal is refused its next post
       if (run) await signalRunner(sprites, spriteName, run.id, log);
       return c.json(
@@ -320,7 +321,10 @@ export function agentRoutes(
       );
       if (!outcome) return apiError(c, 404, "not_found", "no such agent");
       const { agent, run, spriteName } = outcome;
-      if (run) await signalRunner(sprites, spriteName, run.id, log);
+      if (run) {
+        c.var.nudgeDeliveries();
+        await signalRunner(sprites, spriteName, run.id, log);
+      }
       try {
         await removeWorktree(sprites, spriteName, id, run?.id ?? null);
       } catch (err) {

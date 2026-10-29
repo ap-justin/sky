@@ -40,7 +40,14 @@ export function createApp({
 
   const secrets = KnownSecrets.fromConfig(config);
   const provisioner = createProvisioner({ db, secrets, sprites, log });
-  const launcher = createLauncher({ db, config, secrets, sprites, log });
+  const launcher = createLauncher({
+    db,
+    config,
+    secrets,
+    sprites,
+    log,
+    nudgeDeliveries,
+  });
   const v1 = factory
     .createApp()
     .route("/environments", environmentRoutes(provisioner, sprites, log))
@@ -54,6 +61,7 @@ export function createApp({
       c.set("db", db);
       c.set("config", config);
       c.set("secrets", secrets);
+      c.set("nudgeDeliveries", nudgeDeliveries);
       await next();
     })
     .get("/healthz", (c) => {
@@ -65,7 +73,7 @@ export function createApp({
       return c.json({ status: "ok", db: "ok" } as const, 200);
     })
     // the runner's own channel, authenticated per run by its agent token rather than the API key
-    .route("/internal", internalRoutes(nudgeDeliveries))
+    .route("/internal", internalRoutes())
     .use(
       "/v1/*",
       bearerAuth({

@@ -2,6 +2,7 @@ import { agents, type Db, events, runs } from "@harness/db";
 import {
   type AgentId,
   type AgentStatus,
+  type EventType,
   type RunId,
   RunStatus,
   runTransitions,
@@ -9,6 +10,7 @@ import {
 } from "@harness/shared";
 import { and, count, eq, inArray, sql } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
+import { enqueueDeliveries } from "./deliveries.js";
 import { runEvents } from "./run-events.js";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
@@ -91,6 +93,26 @@ export function runError(tx: Db | Tx, runId: RunId): string | null {
   return row ? (row.payload as { error: string }).error : null;
 }
 
+/**
+ * Stores one of the run's events, wakes its streams and enqueues its webhook deliveries, all in `tx`;
+ * the caller nudges the dispatcher once `tx` commits when any were enqueued.
+ */
+export function recordEvent(
+  tx: Tx,
+  runId: RunId,
+  type: EventType,
+  payload: unknown,
+): { id: number; enqueued: number } {
+  const ts = new Date().toISOString();
+  const { id } = tx
+    .insert(events)
+    .values({ runId, ts, type, payload })
+    .returning({ id: events.id })
+    .get();
+  runEvents.publish(runId);
+  return { id, enqueued: enqueueDeliveries(tx, id, type, ts) };
+}
+
 /** Ends a still-active run as `status`, recording `payload` as its event; the ended row, or undefined on an ended run. */
 function endRun(
   tx: Tx,
@@ -106,15 +128,12 @@ function endRun(
     .where(eq(runs.id, runId))
     .returning()
     .get();
-  tx.insert(events)
-    .values({
-      runId,
-      ts: new Date().toISOString(),
-      type: status === "failed" ? "run.failed" : "run.stopped",
-      payload,
-    })
-    .run();
-  runEvents.publish(runId);
+  recordEvent(
+    tx,
+    runId,
+    status === "failed" ? "run.failed" : "run.stopped",
+    payload,
+  );
   tx.update(agents)
     .set({ status: "idle" })
     .where(eq(agents.id, run.agentId))

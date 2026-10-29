@@ -1,4 +1,4 @@
-import { agents, events, runs } from "@harness/db";
+import { agents, runs } from "@harness/db";
 import {
   canTransition,
   type EventType,
@@ -7,12 +7,15 @@ import {
 } from "@harness/shared";
 import { eq, inArray } from "drizzle-orm";
 import { isAgentTokenFor, mintAgentToken } from "./agent-token.js";
-import { enqueueDeliveries } from "./deliveries.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { redactDeep } from "./redact.js";
-import { runEvents } from "./run-events.js";
-import { activeRunStatuses, agentStatusFor, isActive } from "./runs.js";
+import {
+  activeRunStatuses,
+  agentStatusFor,
+  isActive,
+  recordEvent,
+} from "./runs.js";
 import { body, jsonBody } from "./validation.js";
 
 // the status each event moves its run to; progress leaves it where it is
@@ -28,7 +31,7 @@ const statusAfter: Record<EventType, RunStatus | null> = {
 const bearer = (header: string | undefined) =>
   /^Bearer ([A-Za-z0-9_-]+)$/.exec(header ?? "")?.[1];
 
-export function internalRoutes(nudgeDeliveries: () => void) {
+export function internalRoutes() {
   return factory
     .createApp()
     .use("/events", async (c, next) => {
@@ -74,19 +77,12 @@ export function internalRoutes(nudgeDeliveries: () => void) {
             ...secrets.values(),
             ...liveTokens,
           ]);
-          const ts = new Date().toISOString();
-          const { id } = tx
-            .insert(events)
-            .values({
-              runId: run.id,
-              ts,
-              type: event.type,
-              payload: redacted.payload,
-            })
-            .returning({ id: events.id })
-            .get();
-          runEvents.publish(run.id);
-          const enqueued = enqueueDeliveries(tx, id, event.type, ts);
+          const { id, enqueued } = recordEvent(
+            tx,
+            run.id,
+            event.type,
+            redacted.payload,
+          );
           if (next) {
             const usage =
               redacted.type === "run.finished" || redacted.type === "run.failed"
@@ -132,7 +128,7 @@ export function internalRoutes(nudgeDeliveries: () => void) {
           );
       }
       // after the commit, so the dispatcher sees the rows; never awaited, so delivery can't slow the runner
-      if (outcome.enqueued > 0) nudgeDeliveries();
+      if (outcome.enqueued > 0) c.var.nudgeDeliveries();
       return c.json({ id: outcome.id }, 201);
     });
 }
