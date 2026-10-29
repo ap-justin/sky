@@ -20,7 +20,34 @@ test("reads a run from env, defaulting the sprite paths", () => {
     agentToken: "agent-secret",
     repoDir: "/workspace/repo",
     worktreesDir: "/workspace/worktrees",
+    approvalPolicy: [],
+    waitTimeoutMs: 120 * 60_000,
   });
+});
+
+test("reads the approval policy and the max wait", () => {
+  const config = loadConfig({
+    ...env,
+    APPROVAL_POLICY: '["Bash(git push:*)", "Write"]',
+    WAIT_TIMEOUT_MINUTES: "5",
+  });
+  expect(config).toMatchObject({
+    approvalPolicy: ["Bash(git push:*)", "Write"],
+    waitTimeoutMs: 300_000,
+  });
+});
+
+test.each([
+  ["APPROVAL_POLICY", "not json"],
+  ["APPROVAL_POLICY", '"Bash"'],
+  ["APPROVAL_POLICY", '["WebFetch(https:*)"]'],
+  ["APPROVAL_POLICY", '["Bash("]'],
+  ["WAIT_TIMEOUT_MINUTES", "0"],
+  ["WAIT_TIMEOUT_MINUTES", "soon"],
+])("rejects %s=%s", (key, value) => {
+  expect(() => loadConfig({ ...env, [key]: value })).toThrow(
+    new ConfigError(`missing or invalid env: ${key}`),
+  );
 });
 
 test("takes a session id to resume and path overrides", () => {

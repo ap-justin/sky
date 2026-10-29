@@ -1,5 +1,15 @@
 import { AgentId, RunId } from "@harness/shared";
 import { z } from "zod";
+import { PolicyPattern } from "./policy.js";
+
+const json = z.string().transform((s, ctx) => {
+  try {
+    return JSON.parse(s) as unknown;
+  } catch {
+    ctx.issues.push({ code: "custom", message: "expected JSON", input: s });
+    return z.NEVER;
+  }
+});
 
 const Env = z.object({
   AGENT_ID: AgentId,
@@ -15,6 +25,8 @@ const Env = z.object({
   CLAUDE_CODE_OAUTH_TOKEN: z.string().min(1),
   REPO_DIR: z.string().min(1).default("/workspace/repo"),
   WORKTREES_DIR: z.string().min(1).default("/workspace/worktrees"),
+  APPROVAL_POLICY: json.pipe(z.array(PolicyPattern)).default([]),
+  WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
 });
 
 export type Config = {
@@ -26,6 +38,10 @@ export type Config = {
   agentToken: string;
   repoDir: string;
   worktreesDir: string;
+  /** Tool-call patterns that wait for a person's approval; see `matchesPolicy`. */
+  approvalPolicy: string[];
+  /** How long one wait for an answer or approval may last before the run fails. */
+  waitTimeoutMs: number;
 };
 
 export class ConfigError extends Error {}
@@ -49,5 +65,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     agentToken: e.AGENT_TOKEN,
     repoDir: e.REPO_DIR,
     worktreesDir: e.WORKTREES_DIR,
+    approvalPolicy: e.APPROVAL_POLICY,
+    waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
   };
 }

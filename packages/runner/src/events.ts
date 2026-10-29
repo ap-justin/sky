@@ -34,8 +34,16 @@ export function createPoster(options: {
           signal: AbortSignal.timeout(TIMEOUT_MS),
         });
         // read every body so the keep-alive socket is released
-        await res.arrayBuffer();
+        const text = await res.text();
         if (res.ok) return;
+        // an earlier attempt opened this request, and only its response was lost
+        if (
+          attempt > 1 &&
+          event.type === "run.waiting" &&
+          res.status === 409 &&
+          errorCode(text) === "request_open"
+        )
+          return;
         failure = `HTTP ${res.status}`;
       } catch (error) {
         const cause = error instanceof Error ? (error.cause ?? error) : error;
@@ -46,4 +54,12 @@ export function createPoster(options: {
       `runner: dropped ${event.type} after ${ATTEMPTS} attempts: ${failure}`,
     );
   };
+}
+
+function errorCode(body: string): unknown {
+  try {
+    return (JSON.parse(body) as { error?: { code?: unknown } }).error?.code;
+  } catch {
+    return undefined;
+  }
 }

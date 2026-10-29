@@ -10,11 +10,12 @@ import type {
   SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { RunnerEventPost } from "@harness/shared";
-import { HttpResponse, http } from "msw";
+import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { server } from "../../../test/msw.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
+import { createDecisionWaiter } from "./requests.js";
 import { type QueryFn, runSession } from "./session.js";
 
 const git = (cwd: string, ...args: string[]) =>
@@ -49,6 +50,8 @@ beforeEach(() => {
     agentToken: "agent-secret",
     repoDir: join(root, "repo"),
     worktreesDir: join(root, "worktrees"),
+    approvalPolicy: [],
+    waitTimeoutMs: 60_000,
   };
 });
 afterEach(() => rmSync(root, { recursive: true, force: true }));
@@ -120,11 +123,19 @@ function scripted(
         if (m instanceof Error) throw m;
         if (typeof m === "function") await (m as Step)(params.options);
         else yield m as SDKMessage;
+        // the SDK rejects its stream once its abortController fires
+        if (params.options.abortController?.signal.aborted)
+          throw new Error("Claude Code process aborted by user");
       }
     })();
   };
   return Object.assign(fn, { calls });
 }
+
+/** For runs that hold nothing: any wait fails the test. */
+const noDecision = async (): Promise<never> => {
+  throw new Error("no request should wait");
+};
 
 const recorder = () => {
   const posted: RunnerEventPost[] = [];
@@ -150,6 +161,7 @@ test("a finished run posts started, assistant text progress, then finished with 
     query,
     post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   expect(code).toBe(0);
   expect(posted).toEqual([
@@ -226,6 +238,7 @@ test("hooks reach the API in order: a notification, one progress per tool call f
     query,
     post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   expect(code).toBe(0);
   expect(sent).toEqual([
@@ -281,6 +294,7 @@ test("a result with no text takes its summary from the Stop hook's last message"
     query,
     post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   expect(posted.filter((e) => e.type === "run.finished")).toEqual([
     expect.objectContaining({
@@ -324,6 +338,7 @@ test("a hook answers continue without waiting on its post, and a post that rejec
     query,
     post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   expect(code).toBe(0);
   expect(posted.map((e) => e.type)).toEqual([
@@ -339,7 +354,12 @@ test("runs the session in the agent worktree, resuming the stored session, witho
     const query = scripted([init, success]);
     await runSession(
       { ...config, sessionId: "sess-old" },
-      { query, post: recorder().post, signal: new AbortController().signal },
+      {
+        query,
+        post: recorder().post,
+        signal: new AbortController().signal,
+        awaitDecision: noDecision,
+      },
     );
     const [call] = query.calls;
     expect(call?.prompt).toBe("add a file");
@@ -358,6 +378,7 @@ test("a new session passes no resume", async () => {
     query,
     post: recorder().post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   expect(query.calls[0]?.options.resume).toBeUndefined();
 });
@@ -370,6 +391,7 @@ test("commits what the session left uncommitted on the agent branch", async () =
     query,
     post: recorder().post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   const wt = join(root, "worktrees", "agt_1");
   expect(git(wt, "status", "--porcelain")).toBe("");
@@ -396,6 +418,7 @@ test("an SDK error result posts run.failed with its errors and usage, still comm
     query,
     post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   expect(code).toBe(1);
   expect(posted.at(-1)).toEqual({
@@ -428,6 +451,7 @@ test("an SDK that throws posts run.failed and exits 1", async () => {
       query,
       post,
       signal: new AbortController().signal,
+      awaitDecision: noDecision,
     }),
   ).toBe(1);
   expect(posted.at(-1)).toEqual({
@@ -444,6 +468,7 @@ test("a stream that ends without a result is a failure", async () => {
       query: scripted([init]),
       post,
       signal: new AbortController().signal,
+      awaitDecision: noDecision,
     }),
   ).toBe(1);
   expect(posted.at(-1)?.type).toBe("run.failed");
@@ -454,7 +479,12 @@ test("a worktree that can't be made fails the run before any session starts", as
   const query = scripted([init, success]);
   const code = await runSession(
     { ...config, repoDir: join(root, "missing") },
-    { query, post, signal: new AbortController().signal },
+    {
+      query,
+      post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    },
   );
   expect(code).toBe(1);
   expect(query.calls).toHaveLength(0);
@@ -487,6 +517,7 @@ test("an abort mid-session posts run.failed naming the signal", async () => {
       query: wrapped,
       post,
       signal: controller.signal,
+      awaitDecision: noDecision,
     }),
   ).toBe(1);
   expect(posted.at(-1)).toEqual({
@@ -525,6 +556,260 @@ test("leaves no child process or other handle behind", async () => {
     ),
     post: recorder().post,
     signal: new AbortController().signal,
+    awaitDecision: noDecision,
   });
   expect(added(before, await liveResources())).toEqual([]);
+});
+
+type DecisionReply = (requestId: string) => Promise<Response> | Response;
+
+/** The API's two internal routes: events land in `sent`; each decision poll is answered by the next reply, the last one repeating. */
+function api(...replies: DecisionReply[]) {
+  const sent: RunnerEventPost[] = [];
+  const polls: { auth: string | null; requestId: string }[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      sent.push((await request.json()) as RunnerEventPost);
+      return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+    }),
+    http.get(
+      "https://api.test/internal/runs/run_1/requests/:requestId",
+      ({ request, params }) => {
+        const requestId = String(params.requestId);
+        polls.push({ auth: request.headers.get("authorization"), requestId });
+        const reply = replies[Math.min(polls.length, replies.length) - 1];
+        return reply?.(requestId) ?? new HttpResponse(null, { status: 500 });
+      },
+    ),
+  );
+  const deps = {
+    post: createPoster({
+      apiBaseUrl: "https://api.test",
+      agentToken: "agent-secret",
+      warn: () => {},
+      retryDelayMs: 0,
+    }),
+    awaitDecision: createDecisionWaiter({
+      apiBaseUrl: "https://api.test",
+      agentToken: "agent-secret",
+      runId: "run_1",
+      retryDelayMs: 0,
+    }),
+    signal: new AbortController().signal,
+  };
+  return { sent, polls, deps };
+}
+
+const pending: DecisionReply = () => HttpResponse.json({ status: "pending" });
+const decided =
+  (decision: object): DecisionReply =>
+  (requestId) =>
+    HttpResponse.json({
+      status: "decided",
+      decision: { requestId, ...decision },
+    });
+
+const gitPush = {
+  tool_name: "Bash",
+  tool_input: { command: "git push origin main", description: "Push" },
+  tool_use_id: "t1",
+};
+/** Fires PreToolUse for `gitPush` whatever the hook answers. */
+const firePush: Step = async (options) =>
+  void (await fire(options, "PreToolUse", gitPush));
+
+test("a held tool call posts approval waiting, polls past pending, and an approval lets the tool run", async () => {
+  const { sent, polls, deps } = api(pending, decided({ decision: "approve" }));
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(code).toBe(0);
+  expect(answers).toEqual([{ continue: true }]);
+  const waiting = sent.find((e) => e.type === "run.waiting");
+  expect(waiting).toEqual({
+    runId: "run_1",
+    type: "run.waiting",
+    payload: {
+      request: {
+        kind: "approval",
+        requestId: expect.stringMatching(/^req_[0-9A-Za-z]+$/),
+        toolName: "Bash",
+        toolSummary: "git push origin main",
+      },
+    },
+  });
+  const requestId =
+    waiting?.type === "run.waiting" ? waiting.payload.request.requestId : "";
+  expect(polls).toEqual([
+    { auth: "Bearer agent-secret", requestId },
+    { auth: "Bearer agent-secret", requestId },
+  ]);
+  expect(sent.map((e) => e.type)).toEqual([
+    "run.started",
+    "run.progress",
+    "run.waiting",
+    "run.finished",
+  ]);
+});
+
+test("a denial blocks the tool and hands Claude the reason", async () => {
+  const { deps } = api(decided({ decision: "deny", reason: "open a PR" }));
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([
+    {
+      continue: true,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        permissionDecision: "deny",
+        permissionDecisionReason: "open a PR",
+      },
+    },
+  ]);
+});
+
+test("a call the policy doesn't hold never waits", async () => {
+  const { sent, polls, deps } = api();
+  const query = scripted([
+    init,
+    hook("PreToolUse", { ...gitPush, tool_input: { command: "git status" } }),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  expect(polls).toEqual([]);
+  expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+});
+
+const questions = [
+  {
+    question: "Which database?",
+    header: "Database",
+    multiSelect: false,
+    options: [
+      { label: "Postgres", description: "Managed, relational" },
+      { label: "SQLite", description: "One file" },
+    ],
+  },
+];
+
+test("Claude's question posts question waiting, and the answer goes back as the tool's answers", async () => {
+  const { sent, deps } = api(decided({ decision: "answer", answer: "SQLite" }));
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "t1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  expect(await runSession(config, { ...deps, query })).toBe(0);
+  expect(sent.find((e) => e.type === "run.waiting")?.payload).toEqual({
+    request: {
+      kind: "question",
+      requestId: expect.stringMatching(/^req_/),
+      prompt:
+        "Which database?\n- Postgres: Managed, relational\n- SQLite: One file",
+    },
+  });
+  expect(permission).toEqual({
+    behavior: "allow",
+    updatedInput: { questions, answers: { "Which database?": "SQLite" } },
+  });
+});
+
+test("a declined question tells Claude the user declined", async () => {
+  const { deps } = api(decided({ decision: "deny" }));
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "t1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  await runSession(config, { ...deps, query });
+  expect(permission).toEqual({
+    behavior: "deny",
+    message: "The user declined to answer.",
+  });
+});
+
+test("a wait past the max aborts the session, commits, and fails the run with waiting_timeout", async () => {
+  const { sent, deps } = api(async () => {
+    await delay("infinite");
+    return new HttpResponse(null, { status: 500 });
+  });
+  const timed = scripted([init, firePush, success], (cwd) =>
+    writeFileSync(join(cwd, "partial.txt"), "x\n"),
+  );
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"], waitTimeoutMs: 50 },
+    { ...deps, query: timed },
+  );
+  expect(code).toBe(1);
+  expect(sent.at(-1)).toEqual({
+    runId: "run_1",
+    type: "run.failed",
+    payload: { error: "waiting_timeout" },
+  });
+  expect(git(join(root, "worktrees", "agt_1"), "status", "--porcelain")).toBe(
+    "",
+  );
+});
+
+test("a run the API already ended stops the session and posts nothing terminal", async () => {
+  const { sent, deps } = api(() =>
+    HttpResponse.json(
+      { error: { code: "run_ended", message: "the run has ended" } },
+      { status: 401 },
+    ),
+  );
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query: scripted([init, firePush, success]) },
+  );
+  expect(code).toBe(1);
+  expect(sent.map((e) => e.type)).toEqual([
+    "run.started",
+    "run.progress",
+    "run.waiting",
+  ]);
 });

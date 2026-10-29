@@ -1,6 +1,7 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { createPoster } from "./events.js";
+import { createDecisionWaiter } from "./requests.js";
 import { runSession } from "./session.js";
 
 const warn = (message: string) => process.stderr.write(`${message}\n`);
@@ -30,6 +31,7 @@ async function main(): Promise<void> {
     process.exitCode = await runSession(config, {
       query,
       post: createPoster({ ...config, warn }),
+      awaitDecision: createDecisionWaiter(config),
       signal: controller.signal,
     });
   } finally {

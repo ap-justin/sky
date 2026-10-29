@@ -85,3 +85,29 @@ test("refuses an event the shared schema rejects before sending it", async () =>
     post({ runId: "run_1", type: "run.started", payload: {} } as never),
   ).rejects.toThrow();
 });
+
+test("a retried waiting post answered request_open landed the first time, so it stops without a warning", async () => {
+  let calls = 0;
+  server.use(
+    http.post(url, () => {
+      calls++;
+      // the first post was stored, but its response never arrived
+      if (calls === 1) return HttpResponse.error();
+      return HttpResponse.json(
+        { error: { code: "request_open", message: "open" } },
+        { status: 409 },
+      );
+    }),
+  );
+  const warnings: string[] = [];
+  const post = createPoster({ ...options, warn: (m) => warnings.push(m) });
+  await post({
+    runId: "run_1",
+    type: "run.waiting",
+    payload: {
+      request: { kind: "question", requestId: "req_1", prompt: "which?" },
+    },
+  });
+  expect(calls).toBe(2);
+  expect(warnings).toEqual([]);
+});
