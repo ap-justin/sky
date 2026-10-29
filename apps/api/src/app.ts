@@ -1,5 +1,6 @@
 import type { SpritesClient } from "@fly/sprites";
 import type { Db } from "@harness/db";
+import { createMcpHandler } from "@harness/mcp";
 import type { Context } from "hono";
 import { bearerAuth } from "hono/bearer-auth";
 import { HTTPException } from "hono/http-exception";
@@ -51,6 +52,20 @@ export function createApp({
     log,
     nudgeDeliveries,
   });
+  const apiKeyGuard = bearerAuth({
+    token: config.apiKey,
+    noAuthenticationHeader: { message: unauthorized("missing bearer token") },
+    invalidAuthenticationHeader: {
+      message: unauthorized("malformed Authorization header"),
+    },
+    invalidToken: { message: unauthorized("invalid bearer token") },
+  });
+  // the MCP tools call /v1 in-process through the whole app, so its guard checks them too
+  const mcp = createMcpHandler({
+    baseUrl: "http://harness.internal",
+    fetch: (request) => app.fetch(request),
+    apiKey: config.apiKey,
+  });
   const v1 = factory
     .createApp()
     .route("/environments", environmentRoutes(provisioner, sprites, log))
@@ -77,20 +92,10 @@ export function createApp({
     })
     // the runner's own channel, authenticated per run by its agent token rather than the API key
     .route("/internal", internalRoutes(longPollMs))
-    .use(
-      "/v1/*",
-      bearerAuth({
-        token: config.apiKey,
-        noAuthenticationHeader: {
-          message: unauthorized("missing bearer token"),
-        },
-        invalidAuthenticationHeader: {
-          message: unauthorized("malformed Authorization header"),
-        },
-        invalidToken: { message: unauthorized("invalid bearer token") },
-      }),
-    )
-    .route("/v1", v1);
+    .use("/v1/*", apiKeyGuard)
+    .route("/v1", v1)
+    .use("/mcp", apiKeyGuard)
+    .all("/mcp", (c) => mcp(c.req.raw));
 
   app.onError((err, c) => {
     // a thrown HTTPException (bearerAuth's 401) already carries its enveloped response
