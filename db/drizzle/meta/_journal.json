@@ -43,6 +43,13 @@
       "when": 1793292156172,
       "tag": "0005_silky_changeling",
       "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1793292627733,
+      "tag": "0006_sweet_madame_hydra",
+      "breakpoints": true
     }
   ]
 }

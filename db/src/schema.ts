@@ -46,6 +46,13 @@ export const deliveryStatuses = ["pending", "delivered", "failed"] as const;
 // what a run waits on; the CHECK on `kind` spells the same list
 export const requestKinds = ["question", "approval"] as const;
 
+// a stored env value, or a Sprites connector injected by name; the CHECK on `kind` spells the same list
+export const secretKinds = ["value", "connector"] as const;
+
+// an env-var name, the rule `^[A-Za-z_][A-Za-z0-9_]*$` in glob form
+const envVarName = (column: AnyColumn) =>
+  sql`${c(column)} glob '[A-Za-z_]*' and ${c(column)} not glob '*[^A-Za-z0-9_]*'`;
+
 // stamped by the database, so no insert path can omit or misformat it
 const createdAt = () =>
   text("created_at")
@@ -139,6 +146,8 @@ export const runs = sqliteTable(
     durationMs: integer("duration_ms"),
     // no CHECK: adding one makes drizzle-kit rebuild the table; the API parses with the shared RunRollup first
     rollup: text({ mode: "json" }).$type<RunRollup>(),
+    // names of the env secrets and envVars injected into the run; no CHECK, for the same reason as rollup
+    secretNames: text("secret_names", { mode: "json" }).$type<string[]>(),
     createdAt: createdAt(),
   },
   (t) => [
@@ -300,12 +309,49 @@ export const secrets = sqliteTable(
       .notNull()
       .references(() => environments.id, { onDelete: "cascade" }),
     name: text().notNull(),
-    ciphertext: blob({ mode: "buffer" }).notNull(),
-    nonce: blob({ mode: "buffer" }).notNull(),
-    keyVersion: integer("key_version").notNull(),
+    kind: text({ enum: secretKinds }).notNull(),
+    connector: text(),
+    ciphertext: blob({ mode: "buffer" }),
+    nonce: blob({ mode: "buffer" }),
+    keyVersion: integer("key_version"),
   },
   (t) => [
     primaryKey({ columns: [t.envId, t.name] }),
+    check("secrets_name", envVarName(t.name)),
+    check("secrets_kind", sql`${c(t.kind)} in ('value', 'connector')`),
+    check(
+      "secrets_shape",
+      sql`(${c(t.kind)} = 'value' and ${c(t.connector)} is null
+          and ${c(t.ciphertext)} is not null and ${c(t.nonce)} is not null and ${c(t.keyVersion)} is not null)
+        or (${c(t.kind)} = 'connector' and ${c(t.connector)} is not null and ${c(t.connector)} <> ''
+          and ${c(t.ciphertext)} is null and ${c(t.nonce)} is null and ${c(t.keyVersion)} is null)`,
+    ),
     check("secrets_key_version", sql`${c(t.keyVersion)} > 0`),
+  ],
+);
+
+// a run's own env values, encrypted by the API like secrets and purged once expired
+export const runEnvVars = sqliteTable(
+  "run_env_vars",
+  {
+    runId: text("run_id")
+      .$type<RunId>()
+      .notNull()
+      .references(() => runs.id, { onDelete: "cascade" }),
+    name: text().notNull(),
+    ciphertext: blob({ mode: "buffer" }).notNull(),
+    nonce: blob({ mode: "buffer" }).notNull(),
+    keyVersion: integer("key_version").notNull(),
+    expiresAt: text("expires_at").notNull(),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.runId, t.name] }),
+    // the purge scan: `expires_at <= ?`
+    index("run_env_vars_expires_at").on(t.expiresAt),
+    check("run_env_vars_name", envVarName(t.name)),
+    check("run_env_vars_key_version", sql`${c(t.keyVersion)} > 0`),
+    check("run_env_vars_expires_at", isoUtc(t.expiresAt)),
+    check("run_env_vars_created_at", isoUtc(t.createdAt)),
   ],
 );

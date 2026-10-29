@@ -25,8 +25,10 @@ import {
   migrate,
   openDb,
   requestKinds,
+  runEnvVars,
   runRequests,
   runs,
+  secretKinds,
   webhookDeliveries,
   webhooks,
 } from "./index.js";
@@ -78,6 +80,7 @@ const TABLES = [
   "agents",
   "environments",
   "events",
+  "run_env_vars",
   "run_requests",
   "runs",
   "secrets",
@@ -148,7 +151,7 @@ test("foreign keys are enforced after migrate", () => {
   ).toThrow(/FOREIGN KEY constraint failed/);
 });
 
-test("secrets hold ciphertext, nonce and key version, with no plaintext column", () => {
+test("secrets hold a kind, a connector or ciphertext, nonce and key version, with no plaintext column", () => {
   migrate(db);
   const columns = db.$client
     .prepare("select name from pragma_table_info('secrets') order by cid")
@@ -157,6 +160,8 @@ test("secrets hold ciphertext, nonce and key version, with no plaintext column",
   expect(columns).toEqual([
     "env_id",
     "name",
+    "kind",
+    "connector",
     "ciphertext",
     "nonce",
     "key_version",
@@ -202,7 +207,10 @@ test("migrating a populated 0000 file keeps every row, cascade children included
   migrate(db);
 
   const atInit = TABLES.filter(
-    (t) => t !== "webhook_deliveries" && t !== "run_requests",
+    (t) =>
+      t !== "webhook_deliveries" &&
+      t !== "run_requests" &&
+      t !== "run_env_vars",
   );
   for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
   const createdAt = db.$client
@@ -559,4 +567,171 @@ test("migrating a populated 0004 file adds a null rollup to every run and keeps 
   expect(db.$client.prepare("select rollup from runs").get()).toEqual({
     rollup: null,
   });
+});
+
+const insertSecret = (
+  name: string,
+  kind: string,
+  connector: string | null,
+  sealed: boolean,
+) =>
+  run(
+    "insert into secrets (env_id, name, kind, connector, ciphertext, nonce, key_version) values ('env_1', ?, ?, ?, ?, ?, ?)",
+    name,
+    kind,
+    connector,
+    sealed ? Buffer.from([1]) : null,
+    sealed ? Buffer.from([2]) : null,
+    sealed ? 1 : null,
+  );
+
+test("a value secret carries ciphertext, nonce and key version; a connector secret carries only its connector", () => {
+  migrate(db);
+  seedRun();
+  expect(secretKinds).toEqual(["value", "connector"]);
+  expect(() => insertSecret("A", "value", null, true)).not.toThrow();
+  expect(() => insertSecret("B", "connector", "github", false)).not.toThrow();
+
+  for (const [kind, connector, sealed] of [
+    ["value", null, false],
+    ["value", "github", true],
+    ["connector", null, false],
+    ["connector", "", false],
+    ["connector", "github", true],
+    ["bogus", null, true],
+  ] as const) {
+    expect(() => insertSecret("C", kind, connector, sealed)).toThrow(
+      /CHECK constraint failed/,
+    );
+  }
+  expect(() =>
+    run(
+      "insert into secrets (env_id, name, kind, connector, ciphertext, nonce, key_version) values ('env_1', 'D', 'value', null, x'01', null, 1)",
+    ),
+  ).toThrow(/CHECK constraint failed/);
+});
+
+test("secret names follow the env-var rule", () => {
+  migrate(db);
+  seedRun();
+  for (const name of ["A", "_x", "API_KEY_2", "a1"])
+    expect(() => insertSecret(name, "value", null, true)).not.toThrow();
+  for (const name of ["", "1A", "A-B", "A B", "A.B", "\u00e9"])
+    expect(() => insertSecret(name, "value", null, true)).toThrow(
+      /CHECK constraint failed/,
+    );
+});
+
+test("migrating a populated 0005 file keeps every secret as a value secret", () => {
+  migrateThrough("0005_silky_changeling");
+  seedRun();
+  insertEvent();
+  run(
+    "insert into secrets (env_id, name, ciphertext, nonce, key_version) values ('env_1', 'K', x'0a', x'0b', 2)",
+  );
+
+  migrate(db);
+
+  for (const table of ["environments", "runs", "events"])
+    expect(count(table)).toBe(1);
+  expect(db.$client.prepare("select * from secrets").all()).toEqual([
+    {
+      env_id: "env_1",
+      name: "K",
+      kind: "value",
+      connector: null,
+      ciphertext: Buffer.from([0x0a]),
+      nonce: Buffer.from([0x0b]),
+      key_version: 2,
+    },
+  ]);
+});
+
+const insertEnvVar = (
+  name: string,
+  expiresAt = "2026-10-30T12:00:00.000Z",
+  keyVersion = 1,
+) =>
+  run(
+    "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at) values ('run_1', ?, x'01', x'02', ?, ?)",
+    name,
+    keyVersion,
+    expiresAt,
+  );
+
+test("a run's envVars are unique by name, follow the env-var rule, and need a positive key version and UTC expiry", () => {
+  migrate(db);
+  seedRun();
+  expect(() => insertEnvVar("TOKEN")).not.toThrow();
+  expect(() => insertEnvVar("TOKEN")).toThrow(/UNIQUE constraint failed/);
+  for (const name of ["", "1A", "A-B"])
+    expect(() => insertEnvVar(name)).toThrow(/CHECK constraint failed/);
+  expect(() => insertEnvVar("K0", undefined, 0)).toThrow(
+    /CHECK constraint failed/,
+  );
+  expect(() => insertEnvVar("K1", "2026-10-30 12:00:00")).toThrow(
+    /CHECK constraint failed/,
+  );
+  expect(() =>
+    run(
+      "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at) values ('run_missing', 'X', x'01', x'02', 1, '2026-10-30T12:00:00Z')",
+    ),
+  ).toThrow(/FOREIGN KEY constraint failed/);
+});
+
+test("drizzle round-trips an envVar with a stamped created_at", () => {
+  migrate(db);
+  seedRun();
+  db.insert(runEnvVars)
+    .values({
+      runId: "run_1" as RunId,
+      name: "TOKEN",
+      ciphertext: Buffer.from([1]),
+      nonce: Buffer.from([2]),
+      keyVersion: 1,
+      expiresAt: "2026-10-30T12:00:00.000Z",
+    })
+    .run();
+  const [row] = db.select().from(runEnvVars).all();
+  expect(row).toMatchObject({
+    runId: "run_1",
+    name: "TOKEN",
+    ciphertext: Buffer.from([1]),
+    keyVersion: 1,
+  });
+  expect(row?.createdAt).toMatch(/Z$/);
+});
+
+test("deleting a run drops its envVars", () => {
+  migrate(db);
+  seedRun();
+  insertEnvVar("TOKEN");
+  run("delete from runs where id = 'run_1'");
+  expect(count("run_env_vars")).toBe(0);
+});
+
+test("the expiry purge scan is served by the expires_at index", () => {
+  migrate(db);
+  const plan = db.$client
+    .prepare(
+      "explain query plan delete from run_env_vars where expires_at <= ?",
+    )
+    .all("2026-10-30T12:00:00.000Z")
+    .map((r) => (r as { detail: string }).detail)
+    .join("\n");
+  expect(plan).toMatch(/USING (COVERING )?INDEX run_env_vars_expires_at/);
+});
+
+test("a run's secret_names audit round-trips through drizzle and is null on migrated runs", () => {
+  migrateThrough("0005_silky_changeling");
+  seedRun();
+  migrate(db);
+  const [before] = db.select().from(runs).all();
+  expect(before?.secretNames).toBeNull();
+
+  db.update(runs)
+    .set({ secretNames: ["GITHUB_TOKEN", "API_KEY"] })
+    .run();
+  const [after] = db.select().from(runs).all();
+  expect(after?.secretNames).toEqual(["GITHUB_TOKEN", "API_KEY"]);
 });
