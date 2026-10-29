@@ -158,7 +158,17 @@ test("launch uploads the bundle, then starts the runner as a detached session an
     PROMPT_FILE: `/workspace/runs/${run.id}.prompt`,
     REPO_DIR: "/workspace/repo",
     WORKTREES_DIR: "/workspace/worktrees",
+    APPROVAL_POLICY: "[]",
+    WAIT_TIMEOUT_MINUTES: "120",
   });
+});
+
+test("the runner gets the env's approval policy as a JSON array", async () => {
+  await launched(readyEnv({ approvalPolicy: ["Bash", "mcp__github__*"] }));
+  await sessionOpened();
+  expect(wire.sessions[0]?.env.APPROVAL_POLICY).toBe(
+    '["Bash","mcp__github__*"]',
+  );
 });
 
 test("secrets travel as process env only: never argv, the run row, an event or the logs", async () => {

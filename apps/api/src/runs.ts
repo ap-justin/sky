@@ -1,4 +1,4 @@
-import { agents, type Db, events, runs } from "@harness/db";
+import { agents, type Db, events, runRequests, runs } from "@harness/db";
 import {
   type AgentId,
   type AgentStatus,
@@ -8,7 +8,7 @@ import {
   runTransitions,
   type Usage,
 } from "@harness/shared";
-import { and, count, eq, inArray, sql } from "drizzle-orm";
+import { and, count, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { enqueueDeliveries } from "./deliveries.js";
 import { runEvents } from "./run-events.js";
@@ -153,8 +153,8 @@ export function stopActiveRun(tx: Tx, agentId: AgentId): RunRow | undefined {
 }
 
 /**
- * Fails every active run with no event (or, before its first, no launch) since `timeoutMs` ago, so a
- * runner that died can't hold a concurrency slot. Returns the ids it failed.
+ * Fails every active run but a waiting one with no event (or, before its first, no launch) since
+ * `timeoutMs` ago, so a runner that died can't hold a concurrency slot. Returns the ids it failed.
  */
 export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   const cutoff = new Date(now - timeoutMs).toISOString();
@@ -167,7 +167,10 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
         .from(runs)
         .where(
           and(
-            inArray(runs.status, activeRunStatuses),
+            inArray(
+              runs.status,
+              activeRunStatuses.filter((s) => s !== "waiting"),
+            ),
             sql`${lastActivity} < ${cutoff}`,
           ),
         )
@@ -175,6 +178,41 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
         .map((r) => r.id);
       for (const id of stale) failRun(tx, id, "runner_timeout");
       return stale;
+    },
+    { behavior: "immediate" },
+  );
+}
+
+// past the runner's own wait timeout, so a live runner gives up first
+const WAIT_GRACE_MS = 5 * 60_000;
+
+/**
+ * Fails, with `waiting_timeout`, every waiting run whose open request is older than the runner's
+ * `waitTimeoutMs` plus a grace: its runner died while waiting. Returns the ids it failed.
+ */
+export function failAbandonedWaits(
+  db: Db,
+  waitTimeoutMs: number,
+  now = Date.now(),
+) {
+  const cutoff = new Date(now - waitTimeoutMs - WAIT_GRACE_MS).toISOString();
+  return db.transaction(
+    (tx) => {
+      const abandoned = tx
+        .select({ id: runs.id })
+        .from(runs)
+        .innerJoin(runRequests, eq(runRequests.runId, runs.id))
+        .where(
+          and(
+            eq(runs.status, "waiting"),
+            isNull(runRequests.decidedAt),
+            lt(runRequests.createdAt, cutoff),
+          ),
+        )
+        .all()
+        .map((r) => r.id);
+      for (const id of abandoned) failRun(tx, id, "waiting_timeout");
+      return abandoned;
     },
     { behavior: "immediate" },
   );

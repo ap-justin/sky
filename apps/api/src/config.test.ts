@@ -13,7 +13,7 @@ const required = {
   WEBHOOK_SIGNING_KEY: "w".repeat(32),
 };
 
-test("parses the env, defaulting PORT, the runner bundle path and the run timeout", () => {
+test("parses the env, defaulting PORT, the runner bundle path and the run and wait timeouts", () => {
   expect(loadConfig(required)).toEqual({
     ok: true,
     config: {
@@ -25,20 +25,26 @@ test("parses the env, defaulting PORT, the runner bundle path and the run timeou
       publicBaseUrl: "https://harness.example.com",
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
       runTimeoutMs: 30 * 60_000,
+      waitTimeoutMs: 120 * 60_000,
       webhookSigningKey: "w".repeat(32),
     },
   });
 });
 
-test("RUNNER_BUNDLE_PATH and RUN_TIMEOUT_MINUTES override their defaults", () => {
+test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES and WAIT_TIMEOUT_MINUTES override their defaults", () => {
   const result = loadConfig({
     ...required,
     RUNNER_BUNDLE_PATH: "/opt/api/runner.mjs",
     RUN_TIMEOUT_MINUTES: "5",
+    WAIT_TIMEOUT_MINUTES: "15",
   });
   expect(result).toMatchObject({
     ok: true,
-    config: { runnerBundlePath: "/opt/api/runner.mjs", runTimeoutMs: 300_000 },
+    config: {
+      runnerBundlePath: "/opt/api/runner.mjs",
+      runTimeoutMs: 300_000,
+      waitTimeoutMs: 900_000,
+    },
   });
 });
 

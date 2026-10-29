@@ -24,6 +24,8 @@ export type AppDeps = {
   nudgeDeliveries: () => void;
   /** Quiet time before a run stream sends a `: ping` comment; 15 s unless a test shortens it. */
   heartbeatMs?: number;
+  /** How long the runner's decision long-poll waits before answering pending; 25 s unless a test shortens it. */
+  longPollMs?: number;
 };
 
 export function createApp({
@@ -33,6 +35,7 @@ export function createApp({
   log,
   nudgeDeliveries,
   heartbeatMs = 15_000,
+  longPollMs = 25_000,
 }: AppDeps) {
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
   const unauthorized = (message: string) => (c: Context) =>
@@ -73,7 +76,7 @@ export function createApp({
       return c.json({ status: "ok", db: "ok" } as const, 200);
     })
     // the runner's own channel, authenticated per run by its agent token rather than the API key
-    .route("/internal", internalRoutes())
+    .route("/internal", internalRoutes(longPollMs))
     .use(
       "/v1/*",
       bearerAuth({

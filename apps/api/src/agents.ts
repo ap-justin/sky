@@ -1,17 +1,25 @@
 import type { SpritesClient } from "@fly/sprites";
 import { agents, environments, runs } from "@harness/db";
-import { AgentId, agentBranch, EnvironmentId, RunId } from "@harness/shared";
+import {
+  AgentId,
+  agentBranch,
+  type Decision,
+  EnvironmentId,
+  RequestId,
+  RunId,
+} from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
 import { and, count, eq, inArray } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
 import { apiError } from "./errors.js";
-import { factory } from "./factory.js";
+import { type AppEnv, factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import { type Launcher, removeWorktree, signalRunner } from "./launch.js";
 import { REPO_DIR } from "./provision.js";
 import { redact } from "./redact.js";
+import { decideRequest, requestDecisions } from "./requests.js";
 import { streamRunEvents } from "./run-stream.js";
 import {
   activeRunOf,
@@ -29,6 +37,18 @@ import { body, jsonBody } from "./validation.js";
 const Prompt = z.string().min(1);
 const LaunchInput = z.strictObject({ envId: EnvironmentId, prompt: Prompt });
 const FollowUpInput = z.strictObject({ prompt: Prompt });
+const AnswerInput = z.strictObject({
+  requestId: RequestId,
+  answer: z.string().min(1),
+});
+const ApprovalInput = z.discriminatedUnion("decision", [
+  z.strictObject({ requestId: RequestId, decision: z.literal("approve") }),
+  z.strictObject({
+    requestId: RequestId,
+    decision: z.literal("deny"),
+    reason: z.string().min(1).optional(),
+  }),
+]);
 
 type AgentRow = typeof agents.$inferSelect;
 
@@ -82,6 +102,35 @@ const agentRow = (tx: Tx, id: AgentId) => {
 
 const archived = (c: Context) =>
   apiError(c, 409, "agent_archived", "the agent is archived");
+
+/** Decides one of the agent's requests and wakes the runner long-polling for it. */
+function decide(c: Context<AppEnv>, agentId: AgentId, decision: Decision) {
+  const outcome = c.var.db.transaction(
+    (tx) => decideRequest(tx, agentId, decision),
+    { behavior: "immediate" },
+  );
+  switch (outcome.kind) {
+    case "not_found":
+      return apiError(c, 404, "not_found", "no such request on this agent");
+    case "wrong_kind":
+      return apiError(
+        c,
+        409,
+        "wrong_kind",
+        `the request is a ${outcome.requestKind}`,
+      );
+    case "closed":
+      return apiError(
+        c,
+        409,
+        "request_closed",
+        "the request is already decided or its run is no longer waiting",
+      );
+  }
+  if (outcome.enqueued > 0) c.var.nudgeDeliveries();
+  requestDecisions.publish(decision.requestId);
+  return c.json({ run: presentRun(outcome.run, null) }, 200);
+}
 
 const agentParam = zValidator(
   "param",
@@ -182,6 +231,7 @@ export function agentRoutes(
         runId,
         prompt,
         sessionId: null,
+        approvalPolicy: outcome.env.approvalPolicy,
       });
       c.header("Location", `/v1/agents/${agentId}/runs/${runId}`);
       return c.json(
@@ -255,6 +305,7 @@ export function agentRoutes(
         runId,
         prompt,
         sessionId: outcome.agent.sessionId,
+        approvalPolicy: outcome.env.approvalPolicy,
       });
       c.header("Location", `/v1/agents/${id}/runs/${runId}`);
       return c.json(
@@ -338,6 +389,14 @@ export function agentRoutes(
       }
       return c.json({ agent: presentAgent(agent) }, 200);
     })
+    .post("/:id/answers", agentParam, jsonBody, body(AnswerInput), (c) => {
+      const { id } = c.req.valid("param");
+      const { requestId, answer } = c.req.valid("json");
+      return decide(c, id, { requestId, decision: "answer", answer });
+    })
+    .post("/:id/approvals", agentParam, jsonBody, body(ApprovalInput), (c) =>
+      decide(c, c.req.valid("param").id, c.req.valid("json")),
+    )
     .get("/:id", agentParam, (c) => {
       const { id } = c.req.valid("param");
       const db = c.var.db;

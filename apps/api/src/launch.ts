@@ -93,6 +93,8 @@ export type Launch = {
   prompt: string;
   /** The Claude session to resume; null starts a fresh one. */
   sessionId: string | null;
+  /** The env's tool patterns that wait for an approval. */
+  approvalPolicy: string[];
 };
 
 /** Starts runners in the background; a launch that fails fails its run with a redacted `launch_failed` error. */
@@ -163,6 +165,8 @@ export function createLauncher({
           PROMPT_FILE: promptFile,
           REPO_DIR,
           WORKTREES_DIR,
+          APPROVAL_POLICY: JSON.stringify(launch.approvalPolicy),
+          WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
           ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
         },
       },
