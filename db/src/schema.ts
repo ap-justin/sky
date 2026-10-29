@@ -36,6 +36,9 @@ export const environmentFailureSteps = [
   "checkpoint",
 ] as const;
 
+// a webhook delivery's lifecycle; the CHECK on `status` spells the same list
+export const deliveryStatuses = ["pending", "delivered", "failed"] as const;
+
 // stamped by the database, so no insert path can omit or misformat it
 const createdAt = () =>
   text("created_at")
@@ -185,6 +188,54 @@ export const webhooks = sqliteTable(
       sql`json_type(${c(t.eventTypes)}) = 'array' and json_array_length(${c(t.eventTypes)}) > 0`,
     ),
     check("webhooks_created_at", isoUtc(t.createdAt)),
+  ],
+);
+
+export const webhookDeliveries = sqliteTable(
+  "webhook_deliveries",
+  {
+    id: integer().primaryKey({ autoIncrement: true }),
+    webhookId: text("webhook_id")
+      .$type<WebhookId>()
+      .notNull()
+      .references(() => webhooks.id, { onDelete: "cascade" }),
+    eventId: integer("event_id")
+      .notNull()
+      .references(() => events.id),
+    status: text({ enum: deliveryStatuses }).notNull(),
+    attempts: integer().notNull().default(0),
+    nextAttemptAt: text("next_attempt_at").notNull(),
+    // HTTP status of the latest attempt; null until one gets a response
+    lastStatus: integer("last_status"),
+    lastError: text("last_error"),
+    createdAt: createdAt(),
+  },
+  (t) => [
+    // one delivery per (subscriber, event); also serves the webhook_id foreign key
+    uniqueIndex("webhook_deliveries_webhook_id_event_id").on(
+      t.webhookId,
+      t.eventId,
+    ),
+    // the worker's due scan: `status = 'pending' and next_attempt_at <= ?`
+    index("webhook_deliveries_status_next_attempt_at").on(
+      t.status,
+      t.nextAttemptAt,
+    ),
+    check(
+      "webhook_deliveries_status",
+      sql`${c(t.status)} in ('pending', 'delivered', 'failed')`,
+    ),
+    check("webhook_deliveries_attempts", sql`${c(t.attempts)} >= 0`),
+    check("webhook_deliveries_next_attempt_at", isoUtc(t.nextAttemptAt)),
+    check(
+      "webhook_deliveries_last_status",
+      sql`${c(t.lastStatus)} between 100 and 599`,
+    ),
+    check(
+      "webhook_deliveries_last_error",
+      sql`length(${c(t.lastError)}) <= 1000`,
+    ),
+    check("webhook_deliveries_created_at", isoUtc(t.createdAt)),
   ],
 );
 

@@ -16,7 +16,14 @@ import {
 } from "@harness/shared";
 import { migrate as drizzleMigrate } from "drizzle-orm/better-sqlite3/migrator";
 import { afterEach, beforeEach, expect, test } from "vitest";
-import { type Db, migrate, openDb, webhooks } from "./index.js";
+import {
+  type Db,
+  deliveryStatuses,
+  migrate,
+  openDb,
+  webhookDeliveries,
+  webhooks,
+} from "./index.js";
 
 let dir: string;
 let path: string;
@@ -67,6 +74,7 @@ const TABLES = [
   "events",
   "runs",
   "secrets",
+  "webhook_deliveries",
   "webhooks",
 ];
 
@@ -186,7 +194,8 @@ test("migrating a populated 0000 file keeps every row, cascade children included
 
   migrate(db);
 
-  for (const table of TABLES) expect([table, count(table)]).toEqual([table, 1]);
+  const atInit = TABLES.filter((t) => t !== "webhook_deliveries");
+  for (const table of atInit) expect([table, count(table)]).toEqual([table, 1]);
   const createdAt = db.$client
     .prepare("select created_at from environments")
     .pluck()
@@ -252,4 +261,97 @@ test("drizzle inserts stamp created_at without the caller passing it", () => {
     .run();
   const [row] = db.select().from(webhooks).all();
   expect(row?.createdAt).toMatch(/Z$/);
+});
+
+const seedDelivery = () => {
+  seedRun();
+  insertEvent();
+  run(
+    "insert into webhooks (id, url, event_types) values ('wh_1', 'https://x', '[\"run.started\"]')",
+  );
+};
+
+const insertDelivery = (...extra: [column: string, value: unknown][]) =>
+  run(
+    `insert into webhook_deliveries (webhook_id, event_id, status, next_attempt_at${extra.map(([c]) => `, ${c}`).join("")}) values ('wh_1', 1, 'pending', '2026-10-29T12:00:00.000Z'${extra.map(() => ", ?").join("")})`,
+    ...extra.map(([, v]) => v),
+  );
+
+test("an event is delivered at most once per webhook", () => {
+  migrate(db);
+  seedDelivery();
+  insertDelivery();
+  expect(() => insertDelivery()).toThrow(
+    /UNIQUE constraint failed: webhook_deliveries.webhook_id, webhook_deliveries.event_id/,
+  );
+});
+
+test("deleting a webhook drops its deliveries; an event with deliveries can't be deleted", () => {
+  migrate(db);
+  seedDelivery();
+  insertDelivery();
+  expect(() => run("delete from events")).toThrow(
+    /FOREIGN KEY constraint failed/,
+  );
+  run("delete from webhooks");
+  expect(count("webhook_deliveries")).toBe(0);
+});
+
+test("delivery columns reject values outside their contract", () => {
+  migrate(db);
+  seedDelivery();
+  insertDelivery();
+  const set = (assignment: string, value: unknown) =>
+    run(`update webhook_deliveries set ${assignment} = ?`, value);
+  for (const status of deliveryStatuses)
+    expect(() => set("status", status)).not.toThrow();
+  expect(() => set("status", "retrying")).toThrow(/CHECK constraint failed/);
+  expect(() => set("attempts", -1)).toThrow(/CHECK constraint failed/);
+  expect(() => set("next_attempt_at", "2026-10-29 12:00:00")).toThrow(
+    /CHECK constraint failed/,
+  );
+  expect(() => set("last_status", 503)).not.toThrow();
+  expect(() => set("last_status", 0)).toThrow(/CHECK constraint failed/);
+  expect(() => set("last_error", "x".repeat(1000))).not.toThrow();
+  expect(() => set("last_error", "x".repeat(1001))).toThrow(
+    /CHECK constraint failed/,
+  );
+});
+
+test("a drizzle insert starts a delivery at zero attempts with a stamped created_at", () => {
+  migrate(db);
+  seedDelivery();
+  db.insert(webhookDeliveries)
+    .values({
+      webhookId: "wh_1" as WebhookId,
+      eventId: 1,
+      status: "pending",
+      nextAttemptAt: "2026-10-29T12:00:00.000Z",
+    })
+    .run();
+  const [row] = db.select().from(webhookDeliveries).all();
+  expect(row).toMatchObject({ attempts: 0, lastStatus: null, lastError: null });
+  expect(row?.createdAt).toMatch(/Z$/);
+});
+
+test("the due-pending scan is served by the status, next_attempt_at index", () => {
+  migrate(db);
+  const plan = db.$client
+    .prepare(
+      "explain query plan select id from webhook_deliveries where status = 'pending' and next_attempt_at <= ? order by next_attempt_at",
+    )
+    .all("2026-10-29T12:00:00.000Z") as { detail: string }[];
+  expect(plan.map((p) => p.detail).join("\n")).toMatch(
+    /USING (COVERING )?INDEX webhook_deliveries_status_next_attempt_at \(status=\? AND next_attempt_at<\?\)/,
+  );
+});
+
+test("migrating a populated 0002 file adds an empty deliveries table and keeps every row", () => {
+  migrateThrough("0002_remarkable_bishop");
+  seedDelivery();
+
+  migrate(db);
+
+  for (const table of ["events", "webhooks"]) expect(count(table)).toBe(1);
+  expect(count("webhook_deliveries")).toBe(0);
 });
