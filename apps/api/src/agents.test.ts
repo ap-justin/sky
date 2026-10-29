@@ -857,7 +857,7 @@ const listRuns = async (agentId: string) => {
   };
 };
 
-test("GET runs lists the agent's runs newest first, ties by id, without diffs or waking the sprite", async () => {
+test("GET runs lists the agent's runs newest first, ties by insert order, without diffs or waking the sprite", async () => {
   const { agent, run } = await finishedRun();
   await runningRun();
   const agentId = agent.id as AgentId;
@@ -870,16 +870,16 @@ test("GET runs lists the agent's runs newest first, ties by id, without diffs or
   db.insert(runs)
     .values([
       at("2000-01-01T00:00:00.000Z", "o"),
-      at("2999-01-01T00:00:00.000Z", "A"),
       at("2999-01-01T00:00:00.000Z", "B"),
+      at("2999-01-01T00:00:00.000Z", "A"),
     ])
     .run();
   const calls = wire.calls.length;
   const { status, body } = await listRuns(agent.id);
   expect(status).toBe(200);
   expect(body.data.map((r) => r.id)).toEqual([
-    `run_${"B".repeat(22)}`,
     `run_${"A".repeat(22)}`,
+    `run_${"B".repeat(22)}`,
     run.id,
     `run_${"o".repeat(22)}`,
   ]);

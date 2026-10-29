@@ -1,7 +1,7 @@
 import { webhooks } from "@harness/db";
 import { EventType, Webhook, WebhookId } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
-import { asc, eq } from "drizzle-orm";
+import { asc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
@@ -42,7 +42,8 @@ export function webhookRoutes() {
       const rows = c.var.db
         .select()
         .from(webhooks)
-        .orderBy(asc(webhooks.createdAt), asc(webhooks.id))
+        // ties within a millisecond go by insert order (rowid); ids are random
+        .orderBy(asc(webhooks.createdAt), asc(sql`rowid`))
         .all();
       return c.json({ data: rows.map(present) }, 200);
     })

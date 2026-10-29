@@ -287,6 +287,19 @@ test("GET lists environments oldest first; an unknown or malformed id is 404", a
   }
 });
 
+test("GET breaks a same-millisecond tie by insert order, not id", async () => {
+  const insert = db.$client.prepare(
+    "insert into environments (id, name, repo, setup, status, sprite_name, created_at) values (?, ?, 'o/r', '', 'ready', ?, '2026-01-01T00:00:00.000Z')",
+  );
+  const first = `env_${"z".repeat(22)}`;
+  const second = `env_${"A".repeat(22)}`;
+  insert.run(first, "first", "sprite-first");
+  insert.run(second, "second", "sprite-second");
+  const res = await app.request("/v1/environments", { headers: auth });
+  const { data } = (await res.json()) as { data: { id: string }[] };
+  expect(data.map((e) => e.id)).toEqual([first, second]);
+});
+
 /** Inserts an agent on the env with one run in `status`. */
 function seedRun(envId: string, status: "running" | "finished") {
   const agentId = `agt_${envId.slice(4)}`;

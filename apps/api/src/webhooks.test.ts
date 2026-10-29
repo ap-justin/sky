@@ -63,6 +63,20 @@ test("GET lists subscriptions in creation order and GET /:id reads one", async (
   expect(await one.json()).toEqual(b);
 });
 
+test("GET breaks a same-millisecond tie by insert order, not id", async () => {
+  const at = "2026-01-01T00:00:00.000Z";
+  const insert = db.$client.prepare(
+    "insert into webhooks (id, url, event_types, created_at) values (?, ?, '[\"run.finished\"]', ?)",
+  );
+  const first = `whk_${"z".repeat(22)}`;
+  const second = `whk_${"A".repeat(22)}`;
+  insert.run(first, hook.url, at);
+  insert.run(second, hook.url, at);
+  const list = await app.request("/v1/webhooks", { headers: auth });
+  const { data } = (await list.json()) as { data: { id: string }[] };
+  expect(data.map((w) => w.id)).toEqual([first, second]);
+});
+
 test("DELETE removes the subscription: 204, then 404", async () => {
   const { id } = (await (await subscribe(hook)).json()) as { id: string };
   const del = await app.request(`/v1/webhooks/${id}`, {

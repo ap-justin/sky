@@ -2,7 +2,7 @@ import type { SpritesClient } from "@fly/sprites";
 import { agents, type Db, environments, events, runs } from "@harness/db";
 import { Environment, EnvironmentId } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { z } from "zod";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
@@ -119,7 +119,8 @@ export function environmentRoutes(
       const rows = c.var.db
         .select()
         .from(environments)
-        .orderBy(asc(environments.createdAt), asc(environments.id))
+        // ties within a millisecond go by insert order (rowid); ids are random
+        .orderBy(asc(environments.createdAt), asc(sql`rowid`))
         .all();
       return c.json({ data: rows.map(present) }, 200);
     })

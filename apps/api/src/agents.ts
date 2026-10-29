@@ -9,7 +9,7 @@ import {
   RunId,
 } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
-import { and, count, desc, eq, inArray } from "drizzle-orm";
+import { and, count, desc, eq, inArray, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
 import { mintAgentToken } from "./agent-token.js";
@@ -478,7 +478,8 @@ export function agentRoutes(
         .select()
         .from(runs)
         .where(eq(runs.agentId, id))
-        .orderBy(desc(runs.createdAt), desc(runs.id))
+        // ties within a millisecond go by insert order (rowid); ids are random
+        .orderBy(desc(runs.createdAt), desc(sql`rowid`))
         .all();
       // reading a diff wakes the sprite, so only the single-run GET returns one
       const data = rows.map((run) =>
