@@ -1,20 +1,31 @@
 import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { Db } from "@harness/db";
+import {
+  agents,
+  type Db,
+  environments,
+  events,
+  runs,
+  webhookDeliveries,
+  webhooks,
+} from "@harness/db";
+import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
+import { server } from "../../../test/msw.js";
 import { boot, shutdown } from "./boot.js";
 import { testConfig } from "./testing/sprites.js";
 
 let dir: string;
 let db: Db | undefined;
-let stops: (() => void)[];
+let stops: (() => unknown)[];
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "harness-api-"));
   stops = [];
 });
-afterEach(() => {
-  for (const stop of stops) stop();
+afterEach(async () => {
+  for (const stop of stops) await stop();
   if (db?.$client.open) db.$client.close();
   rmSync(dir, { recursive: true, force: true });
 });
@@ -23,7 +34,7 @@ const config = () => testConfig({ dataDir: dir, runTimeoutMs: 60_000 });
 
 const booted = (log: (line: string) => void = () => {}) => {
   const b = boot(config(), log);
-  stops.push(b.stopSweeping);
+  stops.push(b.stopSweeping, b.stopDelivering);
   return b;
 };
 
@@ -95,4 +106,70 @@ test("boot fails runs a previous process left silent past the timeout; fresh one
   expect(
     db.$client.prepare("select status from agents where id = 'agt_old'").get(),
   ).toEqual({ status: "idle" });
+});
+
+test("a webhook delivery a previous process left pending is sent after boot", async () => {
+  const first = booted();
+  const envId = "env_boot" as EnvironmentId;
+  const agentId = "agt_boot" as AgentId;
+  const runId = "run_boot" as RunId;
+  await first.stopDelivering();
+  first.db
+    .insert(environments)
+    .values({
+      id: envId,
+      name: "e",
+      repo: "acme/kru",
+      setup: "",
+      status: "ready",
+      spriteName: "harness-env_boot",
+    })
+    .run();
+  first.db
+    .insert(agents)
+    .values({ id: agentId, envId, branch: `claude/${agentId}`, status: "idle" })
+    .run();
+  first.db.insert(runs).values({ id: runId, agentId, status: "stopped" }).run();
+  first.db
+    .insert(webhooks)
+    .values({
+      id: "whk_boot",
+      url: "https://hooks.example.com/boot",
+      eventTypes: ["run.stopped"],
+    })
+    .run();
+  const { id: eventId } = first.db
+    .insert(events)
+    .values({
+      runId,
+      ts: new Date().toISOString(),
+      type: "run.stopped",
+      payload: {},
+    })
+    .returning({ id: events.id })
+    .get();
+  first.db
+    .insert(webhookDeliveries)
+    .values({
+      webhookId: "whk_boot",
+      eventId,
+      status: "pending",
+      nextAttemptAt: new Date().toISOString(),
+    })
+    .run();
+  first.db.$client.close();
+
+  const received: string[] = [];
+  server.use(
+    http.post("https://hooks.example.com/boot", ({ request }) => {
+      received.push(request.headers.get("harness-event-id") ?? "");
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const second = booted();
+  db = second.db;
+  await expect.poll(() => received).toEqual([`evt_${eventId}`]);
+  await expect
+    .poll(() => db?.select().from(webhookDeliveries).get()?.status)
+    .toBe("delivered");
 });

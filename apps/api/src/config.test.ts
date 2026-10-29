@@ -10,6 +10,7 @@ const required = {
   DATA_DIR: "/data",
   CLAUDE_CODE_OAUTH_TOKEN: claudeOauthToken,
   PUBLIC_BASE_URL: "https://harness.example.com",
+  WEBHOOK_SIGNING_KEY: "w".repeat(32),
 };
 
 test("parses the env, defaulting PORT, the runner bundle path and the run timeout", () => {
@@ -24,6 +25,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run timeou
       publicBaseUrl: "https://harness.example.com",
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
       runTimeoutMs: 30 * 60_000,
+      webhookSigningKey: "w".repeat(32),
     },
   });
 });
@@ -40,16 +42,17 @@ test("RUNNER_BUNDLE_PATH and RUN_TIMEOUT_MINUTES override their defaults", () =>
   });
 });
 
-test.each(["CLAUDE_CODE_OAUTH_TOKEN", "PUBLIC_BASE_URL"])(
-  "%s is required",
-  (name) => {
-    const result = loadConfig({ ...required, [name]: undefined });
-    expect(result).toEqual({
-      ok: false,
-      message: expect.stringContaining(`${name} is missing`),
-    });
-  },
-);
+test.each([
+  "CLAUDE_CODE_OAUTH_TOKEN",
+  "PUBLIC_BASE_URL",
+  "WEBHOOK_SIGNING_KEY",
+])("%s is required", (name) => {
+  const result = loadConfig({ ...required, [name]: undefined });
+  expect(result).toEqual({
+    ok: false,
+    message: expect.stringContaining(`${name} is missing`),
+  });
+});
 
 test("a missing variable is named in the failure", () => {
   const result = loadConfig({ DATA_DIR: "/data" });
@@ -73,4 +76,15 @@ test("an invalid value is named by its variable, never echoed", () => {
   expect(result.message).toContain("PORT");
   expect(result.message).not.toContain(secret);
   expect(result.message).not.toContain("not-a-port");
+});
+
+test("a WEBHOOK_SIGNING_KEY under 32 characters is rejected", () => {
+  const result = loadConfig({
+    ...required,
+    WEBHOOK_SIGNING_KEY: "w".repeat(31),
+  });
+  expect(result).toEqual({
+    ok: false,
+    message: expect.stringContaining("WEBHOOK_SIGNING_KEY is invalid"),
+  });
 });

@@ -6,6 +6,7 @@ const secrets = {
   spritesToken: "sprites-tok-123",
   claudeOauthToken: "claude-oauth-opaque-1",
   publicBaseUrl: "https://harness.internal.example",
+  webhookSigningKey: "webhook-signing-key-0123456789abcdef",
 };
 const known = KnownSecrets.fromConfig(secrets).values();
 
@@ -22,6 +23,7 @@ const credentials = [
   ["the Sprites token", secrets.spritesToken],
   ["the Claude OAuth token", secrets.claudeOauthToken],
   ["the public base URL", secrets.publicBaseUrl],
+  ["the webhook signing key", secrets.webhookSigningKey],
 ] as const;
 
 test.each(credentials)("scrubs %s and keeps the text around it", (_, token) => {

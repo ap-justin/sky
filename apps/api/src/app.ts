@@ -13,15 +13,24 @@ import { internalRoutes } from "./internal.js";
 import { createLauncher } from "./launch.js";
 import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
+import { webhookRoutes } from "./webhooks.js";
 
 export type AppDeps = {
   db: Db;
   config: Config;
   sprites: SpritesClient;
   log: (line: string) => void;
+  /** Wakes the delivery loop after ingestion enqueues webhook deliveries; must not block. */
+  nudgeDeliveries: () => void;
 };
 
-export function createApp({ db, config, sprites, log }: AppDeps) {
+export function createApp({
+  db,
+  config,
+  sprites,
+  log,
+  nudgeDeliveries,
+}: AppDeps) {
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
   const unauthorized = (message: string) => (c: Context) =>
     apiError(c, 401, "unauthorized", message);
@@ -32,7 +41,8 @@ export function createApp({ db, config, sprites, log }: AppDeps) {
   const v1 = factory
     .createApp()
     .route("/environments", environmentRoutes(provisioner, sprites, log))
-    .route("/agents", agentRoutes(launcher, sprites, log));
+    .route("/agents", agentRoutes(launcher, sprites, log))
+    .route("/webhooks", webhookRoutes());
 
   const app = factory
     .createApp()
@@ -52,7 +62,7 @@ export function createApp({ db, config, sprites, log }: AppDeps) {
       return c.json({ status: "ok", db: "ok" } as const, 200);
     })
     // the runner's own channel, authenticated per run by its agent token rather than the API key
-    .route("/internal", internalRoutes())
+    .route("/internal", internalRoutes(nudgeDeliveries))
     .use(
       "/v1/*",
       bearerAuth({

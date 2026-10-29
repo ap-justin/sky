@@ -3,6 +3,7 @@ import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@harness/db";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
+import { createDispatcher } from "./deliveries.js";
 import { failInterruptedProvisioning } from "./provision.js";
 import { failStaleRuns } from "./runs.js";
 
@@ -11,7 +12,7 @@ const SWEEP_EVERY_MS = 60_000;
 /**
  * Opens and migrates the one DB handle the app reuses for its lifetime, fails provisioning a previous
  * process left unfinished, and fails silent runs now and every minute after. Runs outlive a restart:
- * their runners keep posting, so only silence fails one.
+ * their runners keep posting, so only silence fails one. Webhook deliveries left pending resume at once.
  */
 export function boot(config: Config, log: (line: string) => void) {
   const db = openDb(join(config.dataDir, "harness.db"));
@@ -35,10 +36,23 @@ export function boot(config: Config, log: (line: string) => void) {
   );
   sweeper.unref();
   const sprites = new SpritesClient(config.spritesToken);
+  const dispatcher = createDispatcher({
+    db,
+    signingKey: config.webhookSigningKey,
+    log,
+  });
+  dispatcher.start();
   return {
     db,
-    app: createApp({ db, config, sprites, log }),
+    app: createApp({
+      db,
+      config,
+      sprites,
+      log,
+      nudgeDeliveries: dispatcher.nudge,
+    }),
     stopSweeping: () => clearInterval(sweeper),
+    stopDelivering: dispatcher.stop,
   };
 }
 

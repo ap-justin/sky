@@ -17,6 +17,7 @@ beforeEach(() => {
     config: testConfig({ apiKey }),
     sprites: new SpritesClient("unused"),
     log: (line) => logs.push(line),
+    nudgeDeliveries: () => {},
   });
 });
 afterEach(() => {

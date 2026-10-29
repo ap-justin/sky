@@ -21,7 +21,11 @@ export class KnownSecrets {
   static fromConfig(
     config: Pick<
       Config,
-      "apiKey" | "spritesToken" | "claudeOauthToken" | "publicBaseUrl"
+      | "apiKey"
+      | "spritesToken"
+      | "claudeOauthToken"
+      | "publicBaseUrl"
+      | "webhookSigningKey"
     >,
   ): KnownSecrets {
     const secrets = new KnownSecrets();
@@ -29,6 +33,7 @@ export class KnownSecrets {
     secrets.add("SPRITES_TOKEN", config.spritesToken);
     secrets.add("CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken);
     secrets.add("PUBLIC_BASE_URL", config.publicBaseUrl);
+    secrets.add("WEBHOOK_SIGNING_KEY", config.webhookSigningKey);
     return secrets;
   }
 

@@ -7,6 +7,7 @@ import {
 } from "@harness/shared";
 import { eq, inArray } from "drizzle-orm";
 import { isAgentTokenFor, mintAgentToken } from "./agent-token.js";
+import { enqueueDeliveries } from "./deliveries.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { redactDeep } from "./redact.js";
@@ -26,7 +27,7 @@ const statusAfter: Record<EventType, RunStatus | null> = {
 const bearer = (header: string | undefined) =>
   /^Bearer ([A-Za-z0-9_-]+)$/.exec(header ?? "")?.[1];
 
-export function internalRoutes() {
+export function internalRoutes(nudgeDeliveries: () => void) {
   return factory
     .createApp()
     .use("/events", async (c, next) => {
@@ -72,16 +73,18 @@ export function internalRoutes() {
             ...secrets.values(),
             ...liveTokens,
           ]);
+          const ts = new Date().toISOString();
           const { id } = tx
             .insert(events)
             .values({
               runId: run.id,
-              ts: new Date().toISOString(),
+              ts,
               type: event.type,
               payload: redacted.payload,
             })
             .returning({ id: events.id })
             .get();
+          const enqueued = enqueueDeliveries(tx, id, event.type, ts);
           if (next) {
             const usage =
               redacted.type === "run.finished" || redacted.type === "run.failed"
@@ -107,7 +110,7 @@ export function internalRoutes() {
             })
             .where(eq(agents.id, run.agentId))
             .run();
-          return { kind: "stored", id } as const;
+          return { kind: "stored", id, enqueued } as const;
         },
         { behavior: "immediate" },
       );
@@ -126,6 +129,8 @@ export function internalRoutes() {
             `a ${outcome.from} run cannot become ${outcome.to}`,
           );
       }
+      // after the commit, so the dispatcher sees the rows; never awaited, so delivery can't slow the runner
+      if (outcome.enqueued > 0) nudgeDeliveries();
       return c.json({ id: outcome.id }, 201);
     });
 }

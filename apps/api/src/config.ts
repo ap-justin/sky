@@ -19,6 +19,8 @@ const configSchema = z.object({
   RUNNER_BUNDLE_PATH: z.string().min(1).default(bundledRunner),
   /** A run with no event for this long is failed with `runner_timeout`. */
   RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
+  /** HMAC key every outbound webhook delivery is signed with. */
+  WEBHOOK_SIGNING_KEY: z.string().min(32),
 });
 
 export type Config = {
@@ -30,6 +32,7 @@ export type Config = {
   publicBaseUrl: string;
   runnerBundlePath: string;
   runTimeoutMs: number;
+  webhookSigningKey: string;
 };
 
 type Env = Record<string, string | undefined>;
@@ -52,6 +55,7 @@ export function loadConfig(
         publicBaseUrl: e.PUBLIC_BASE_URL,
         runnerBundlePath: e.RUNNER_BUNDLE_PATH,
         runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
+        webhookSigningKey: e.WEBHOOK_SIGNING_KEY,
       },
     };
   }

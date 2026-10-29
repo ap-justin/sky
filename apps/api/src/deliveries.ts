@@ -1,0 +1,226 @@
+import { createHmac } from "node:crypto";
+import { type Db, events, webhookDeliveries, webhooks } from "@harness/db";
+import type { Event, EventType } from "@harness/shared";
+import { and, asc, eq, lte } from "drizzle-orm";
+import type { Tx } from "./runs.js";
+
+const TICK_MS = 5_000;
+const BATCH = 20;
+const TIMEOUT_MS = 10_000;
+const MAX_ATTEMPTS = 8;
+const FIRST_RETRY_MS = 10_000;
+const MAX_RETRY_MS = 3_600_000;
+// the CHECK on webhook_deliveries.last_error
+const MAX_ERROR_LENGTH = 1000;
+
+/**
+ * The `Harness-Signature` header for one delivery: `t=<unix seconds>,v1=<hex>`, where hex is
+ * HMAC-SHA256 keyed with the UTF-8 bytes of `key` over `<t>.<raw body>`. A receiver recomputes it
+ * over the exact bytes it received and rejects a `t` too far from its own clock.
+ */
+export function signatureHeader(key: string, body: string, t: number): string {
+  const v1 = createHmac("sha256", key).update(`${t}.${body}`).digest("hex");
+  return `t=${t},v1=${v1}`;
+}
+
+/** Backoff before the next try after `attempts` failures: 10s doubling to a 1h cap, ±20% by `random` in [0, 1). */
+export function retryDelayMs(attempts: number, random: number): number {
+  const base = Math.min(FIRST_RETRY_MS * 2 ** (attempts - 1), MAX_RETRY_MS);
+  return base * (0.8 + 0.4 * random);
+}
+
+/** Enqueues one pending delivery per subscription to `type`, in the transaction that stored the event. */
+export function enqueueDeliveries(
+  tx: Tx,
+  eventId: number,
+  type: EventType,
+  at: string,
+): number {
+  const subscribers = tx
+    .select({ id: webhooks.id, eventTypes: webhooks.eventTypes })
+    .from(webhooks)
+    .all()
+    .filter((w) => w.eventTypes.includes(type));
+  if (subscribers.length === 0) return 0;
+  tx.insert(webhookDeliveries)
+    .values(
+      subscribers.map((w) => ({
+        webhookId: w.id,
+        eventId,
+        status: "pending" as const,
+        nextAttemptAt: at,
+      })),
+    )
+    .onConflictDoNothing({
+      target: [webhookDeliveries.webhookId, webhookDeliveries.eventId],
+    })
+    .run();
+  return subscribers.length;
+}
+
+const describeError = (err: unknown): string => {
+  if (err instanceof Error && err.name === "TimeoutError") {
+    return `timed out after ${TIMEOUT_MS / 1000}s`;
+  }
+  // fetch's own message is a bare "fetch failed"; the cause says why
+  const cause = err instanceof Error ? err.cause : undefined;
+  const text = cause instanceof Error ? `${err}: ${cause.message}` : `${err}`;
+  return text.slice(0, MAX_ERROR_LENGTH);
+};
+
+export type Dispatcher = ReturnType<typeof createDispatcher>;
+
+/**
+ * Sends due webhook deliveries from the DB, one drain at a time: a 2xx delivers, anything else (a
+ * redirect included, never followed) retries with backoff until the 8th attempt fails it.
+ */
+export function createDispatcher({
+  db,
+  signingKey,
+  log,
+  now = () => new Date(),
+  random = Math.random,
+}: {
+  db: Db;
+  signingKey: string;
+  log: (line: string) => void;
+  now?: () => Date;
+  random?: () => number;
+}) {
+  const stopping = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  let inflight: Promise<void> | null = null;
+  let again = false;
+
+  type Due = {
+    id: number;
+    attempts: number;
+    url: string;
+    event: typeof events.$inferSelect;
+  };
+
+  async function attempt(row: Due): Promise<void> {
+    const { event } = row;
+    const id = `evt_${event.id}` as const;
+    const body = JSON.stringify({
+      id,
+      runId: event.runId,
+      ts: event.ts,
+      type: event.type,
+      payload: event.payload,
+    } as Event);
+    const t = Math.floor(now().getTime() / 1000);
+    let status: number | null = null;
+    let error: string | null = null;
+    try {
+      const res = await fetch(row.url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Harness-Event-Id": id,
+          "Harness-Event-Type": event.type,
+          "Harness-Signature": signatureHeader(signingKey, body, t),
+        },
+        body,
+        redirect: "manual",
+        signal: AbortSignal.any([
+          AbortSignal.timeout(TIMEOUT_MS),
+          stopping.signal,
+        ]),
+      });
+      status = res.status;
+      await res.body?.cancel();
+    } catch (err) {
+      // cut off by shutdown: the attempt doesn't count, and the row resumes at the next boot
+      if (stopping.signal.aborted) return;
+      error = describeError(err);
+    }
+    const attempts = row.attempts + 1;
+    const delivered = status !== null && status >= 200 && status < 300;
+    const failed = !delivered && attempts >= MAX_ATTEMPTS;
+    db.update(webhookDeliveries)
+      .set({
+        status: delivered ? "delivered" : failed ? "failed" : "pending",
+        attempts,
+        lastStatus: status,
+        lastError: error,
+        ...(delivered || failed
+          ? {}
+          : {
+              nextAttemptAt: new Date(
+                now().getTime() + retryDelayMs(attempts, random()),
+              ).toISOString(),
+            }),
+      })
+      .where(eq(webhookDeliveries.id, row.id))
+      .run();
+  }
+
+  /** Sends one batch of due deliveries; true when the batch was full, so more may be due. */
+  async function sendBatch(): Promise<boolean> {
+    const due = db
+      .select({
+        id: webhookDeliveries.id,
+        attempts: webhookDeliveries.attempts,
+        url: webhooks.url,
+        event: events,
+      })
+      .from(webhookDeliveries)
+      .innerJoin(webhooks, eq(webhookDeliveries.webhookId, webhooks.id))
+      .innerJoin(events, eq(webhookDeliveries.eventId, events.id))
+      .where(
+        and(
+          eq(webhookDeliveries.status, "pending"),
+          lte(webhookDeliveries.nextAttemptAt, now().toISOString()),
+        ),
+      )
+      .orderBy(asc(webhookDeliveries.nextAttemptAt), asc(webhookDeliveries.id))
+      .limit(BATCH)
+      .all();
+    await Promise.all(due.map(attempt));
+    return due.length === BATCH;
+  }
+
+  /** Sends every due delivery; a call during a drain joins it and makes it look again before resolving. */
+  function drain(): Promise<void> {
+    if (stopping.signal.aborted) return Promise.resolve();
+    if (inflight) {
+      again = true;
+      return inflight;
+    }
+    inflight = (async () => {
+      try {
+        do {
+          again = false;
+          if (await sendBatch()) again = true;
+        } while (again && !stopping.signal.aborted);
+      } catch (err) {
+        log(`delivering webhooks failed: ${err}`);
+      } finally {
+        inflight = null;
+      }
+    })();
+    return inflight;
+  }
+
+  const nudge = () => {
+    void drain();
+  };
+
+  return {
+    drain,
+    nudge,
+    /** Drains now, then every 5 s. */
+    start() {
+      timer = setInterval(nudge, TICK_MS);
+      timer.unref();
+      nudge();
+    },
+    /** Stops ticking and aborts in-flight sends; resolves once the drain has written its last row. */
+    stop(): Promise<void> {
+      clearInterval(timer);
+      stopping.abort();
+      return inflight ?? Promise.resolve();
+    },
+  };
+}

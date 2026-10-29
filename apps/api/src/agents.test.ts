@@ -36,6 +36,7 @@ beforeEach(() => {
     config,
     sprites: new SpritesClient(spritesToken),
     log: (line) => logs.push(line),
+    nudgeDeliveries: () => {},
   });
 });
 afterEach(() => {

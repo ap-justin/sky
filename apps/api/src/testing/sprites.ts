@@ -15,6 +15,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   publicBaseUrl: "https://harness.test",
   runnerBundlePath: "/unused/runner.mjs",
   runTimeoutMs: 30 * 60_000,
+  webhookSigningKey: "webhook-signing-key-for-tests-0123456789",
   ...overrides,
 });
 
