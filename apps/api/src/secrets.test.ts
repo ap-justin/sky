@@ -1,0 +1,256 @@
+import { SpritesClient } from "@fly/sprites";
+import {
+  agents,
+  type Db,
+  environments,
+  migrate,
+  openDb,
+  runs,
+} from "@harness/db";
+import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { afterEach, beforeEach, expect, test } from "vitest";
+import { mintAgentToken } from "./agent-token.js";
+import { createApp } from "./app.js";
+import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
+
+const apiKey = "k".repeat(40);
+const config = testConfig();
+
+let db: Db;
+let app: ReturnType<typeof createApp>;
+const newApp = () =>
+  createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: () => {},
+    nudgeDeliveries: () => {},
+  });
+beforeEach(() => {
+  db = openDb(":memory:");
+  migrate(db);
+  stubSprites();
+  app = newApp();
+});
+afterEach(() => {
+  if (db.$client.open) db.$client.close();
+});
+
+const auth = { Authorization: `Bearer ${apiKey}` };
+const json = { ...auth, "Content-Type": "application/json" };
+
+function env(id = "env_secrets"): EnvironmentId {
+  db.insert(environments)
+    .values({
+      id: id as EnvironmentId,
+      name: id,
+      repo: "acme/kru",
+      setup: "",
+      status: "ready",
+      spriteName: `harness-${id}`,
+      checkpointId: "v1",
+    })
+    .run();
+  return id as EnvironmentId;
+}
+
+const put = (envId: string, name: string, body: unknown) =>
+  app.request(`/v1/environments/${envId}/secrets/${name}`, {
+    method: "PUT",
+    headers: json,
+    body: JSON.stringify(body),
+  });
+
+const list = async (envId: string) => {
+  const res = await app.request(`/v1/environments/${envId}/secrets`, {
+    headers: auth,
+  });
+  return { status: res.status, body: await res.json() };
+};
+
+const rawSecrets = () =>
+  db.$client.prepare("select * from secrets order by name").all() as Record<
+    string,
+    unknown
+  >[];
+
+const plaintext = "ghp_plaintext-secret-value-0001";
+
+test("PUT of a value answers its name and kind, never the value, and stores no plaintext", async () => {
+  const envId = env();
+  const res = await put(envId, "GITHUB_TOKEN", { value: plaintext });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ name: "GITHUB_TOKEN", kind: "value" });
+  const rows = rawSecrets();
+  expect(rows).toHaveLength(1);
+  expect(rows[0]).toMatchObject({
+    env_id: envId,
+    name: "GITHUB_TOKEN",
+    kind: "value",
+    connector: null,
+    key_version: 1,
+  });
+  const raw = JSON.stringify(
+    rows.map((r) => ({
+      ...r,
+      ciphertext: (r.ciphertext as Buffer).toString("latin1"),
+    })),
+  );
+  expect(raw).not.toContain(plaintext);
+  expect(raw).not.toContain("plaintext");
+});
+
+test("GET lists names and kinds in name order, never a value; a connector names its connector", async () => {
+  const envId = env();
+  await put(envId, "Z_TOKEN", { value: plaintext });
+  await put(envId, "A_GITHUB", { connector: "github" });
+  expect(await list(envId)).toEqual({
+    status: 200,
+    body: {
+      data: [
+        { name: "A_GITHUB", kind: "connector", connector: "github" },
+        { name: "Z_TOKEN", kind: "value" },
+      ],
+    },
+  });
+});
+
+test("a connector secret stores only its connector name", async () => {
+  const envId = env();
+  const res = await put(envId, "GH", { connector: "github" });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({
+    name: "GH",
+    kind: "connector",
+    connector: "github",
+  });
+  expect(rawSecrets()).toEqual([
+    {
+      env_id: envId,
+      name: "GH",
+      kind: "connector",
+      connector: "github",
+      ciphertext: null,
+      nonce: null,
+      key_version: null,
+    },
+  ]);
+});
+
+test("PUT replaces a secret, value to connector and back, under a fresh nonce", async () => {
+  const envId = env();
+  await put(envId, "TOKEN", { value: plaintext });
+  const nonceOf = (row: Record<string, unknown> | undefined) =>
+    row?.nonce as Buffer;
+  const firstNonce = nonceOf(rawSecrets()[0]);
+  await put(envId, "TOKEN", { connector: "github" });
+  expect(rawSecrets()[0]).toMatchObject({ kind: "connector", nonce: null });
+  await put(envId, "TOKEN", { value: plaintext });
+  const rows = rawSecrets();
+  expect(rows).toHaveLength(1);
+  expect(nonceOf(rows[0]).equals(firstNonce)).toBe(false);
+});
+
+test("DELETE answers 204, then 404 once gone; GET and PUT on an unknown env are 404", async () => {
+  const envId = env();
+  await put(envId, "TOKEN", { value: plaintext });
+  const del = () =>
+    app.request(`/v1/environments/${envId}/secrets/TOKEN`, {
+      method: "DELETE",
+      headers: auth,
+    });
+  expect((await del()).status).toBe(204);
+  expect(rawSecrets()).toEqual([]);
+  expect((await del()).status).toBe(404);
+  expect((await list("env_missing")).status).toBe(404);
+  expect((await put("env_missing", "TOKEN", { value: "x" })).status).toBe(404);
+  expect(rawSecrets()).toEqual([]);
+});
+
+test.each([
+  ["PATH", 400, "reserved_name"],
+  ["AGENT_TOKEN", 400, "reserved_name"],
+  ["ENV_FILE", 400, "reserved_name"],
+  ["1BAD", 400, "invalid_name"],
+  ["BAD-NAME", 400, "invalid_name"],
+])("PUT of %s is %i %s and stores nothing", async (name, status, code) => {
+  const res = await put(env(), name, { value: plaintext });
+  expect(res.status).toBe(status);
+  expect(await res.json()).toMatchObject({ error: { code } });
+  expect(rawSecrets()).toEqual([]);
+});
+
+test("a body with both or neither of value and connector is 400", async () => {
+  const envId = env();
+  for (const body of [{}, { value: "a", connector: "b" }, { value: "" }]) {
+    expect((await put(envId, "TOKEN", body)).status).toBe(400);
+  }
+  expect(rawSecrets()).toEqual([]);
+});
+
+test("the secret routes need the API key", async () => {
+  const envId = env();
+  const res = await app.request(`/v1/environments/${envId}/secrets/TOKEN`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ value: plaintext }),
+  });
+  expect(res.status).toBe(401);
+  expect((await app.request(`/v1/environments/${envId}/secrets`)).status).toBe(
+    401,
+  );
+  expect(rawSecrets()).toEqual([]);
+});
+
+/** A running run on the env, and the event its runner would post carrying `message`. */
+function runOn(envId: EnvironmentId) {
+  const agentId = "agt_redact" as AgentId;
+  const runId = "run_redact" as RunId;
+  db.insert(agents)
+    .values({
+      id: agentId,
+      envId,
+      branch: `claude/${agentId}`,
+      status: "running",
+    })
+    .run();
+  db.insert(runs).values({ id: runId, agentId, status: "running" }).run();
+  return (target: typeof app, message: string) =>
+    target.request("/internal/events", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${mintAgentToken(config.apiKey, runId)}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        runId,
+        type: "run.progress",
+        payload: { message },
+      }),
+    });
+}
+
+const storedEvents = () =>
+  JSON.stringify(db.$client.prepare("select * from events").all());
+
+// opaque: no token pattern would catch it, only the registry
+const opaque = "opaque-secret-value-0042";
+
+test("a value set at runtime is redacted from an event a runner posts", async () => {
+  const envId = env();
+  await put(envId, "DB_PASSWORD", { value: opaque });
+  const post = runOn(envId);
+  expect((await post(app, `connecting with ${opaque}`)).status).toBeLessThan(
+    300,
+  );
+  expect(storedEvents()).not.toContain(opaque);
+  expect(storedEvents()).toContain("connecting with [redacted]");
+});
+
+test("a value stored before the app started is redacted too", async () => {
+  const envId = env();
+  await put(envId, "DB_PASSWORD", { value: opaque });
+  const post = runOn(envId);
+  expect((await post(newApp(), `leaked ${opaque}`)).status).toBeLessThan(300);
+  expect(storedEvents()).toContain("leaked [redacted]");
+});

@@ -7,6 +7,7 @@ const secrets = {
   claudeOauthToken: "claude-oauth-opaque-1",
   publicBaseUrl: "https://harness.internal.example",
   webhookSigningKey: "webhook-signing-key-0123456789abcdef",
+  secretEncryptionKey: Buffer.alloc(32, 9),
 };
 const known = KnownSecrets.fromConfig(secrets).values();
 
@@ -24,6 +25,10 @@ const credentials = [
   ["the Claude OAuth token", secrets.claudeOauthToken],
   ["the public base URL", secrets.publicBaseUrl],
   ["the webhook signing key", secrets.webhookSigningKey],
+  [
+    "the secret encryption key, as base64",
+    secrets.secretEncryptionKey.toString("base64"),
+  ],
 ] as const;
 
 test.each(credentials)("scrubs %s and keeps the text around it", (_, token) => {
@@ -82,4 +87,13 @@ test("values shorter than 8 characters are never registered", () => {
   expect(registry.values()).not.toContain("abc");
   expect(registry.values()).not.toContain("true");
   expect(redact("abc is true", registry.values())).toBe("abc is true");
+});
+
+test("a removed value is no longer scrubbed", () => {
+  const registry = new KnownSecrets();
+  registry.add("run:run_1:TOKEN", "held-for-a-while");
+  registry.remove("run:run_1:TOKEN");
+  expect(redact("held-for-a-while", registry.values())).toBe(
+    "held-for-a-while",
+  );
 });

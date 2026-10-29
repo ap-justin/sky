@@ -14,6 +14,7 @@ import { internalRoutes } from "./internal.js";
 import { createLauncher } from "./launch.js";
 import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
+import { registerStoredValues, secretRoutes } from "./secrets.js";
 import { webhookRoutes } from "./webhooks.js";
 
 export type AppDeps = {
@@ -27,6 +28,8 @@ export type AppDeps = {
   heartbeatMs?: number;
   /** How long the runner's decision long-poll waits before answering pending; 25 s unless a test shortens it. */
   longPollMs?: number;
+  /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
+  secrets?: KnownSecrets;
 };
 
 export function createApp({
@@ -37,12 +40,13 @@ export function createApp({
   nudgeDeliveries,
   heartbeatMs = 15_000,
   longPollMs = 25_000,
+  secrets = KnownSecrets.fromConfig(config),
 }: AppDeps) {
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
   const unauthorized = (message: string) => (c: Context) =>
     apiError(c, 401, "unauthorized", message);
 
-  const secrets = KnownSecrets.fromConfig(config);
+  registerStoredValues(db, config.secretEncryptionKey, secrets);
   const provisioner = createProvisioner({ db, secrets, sprites, log });
   const launcher = createLauncher({
     db,
@@ -69,6 +73,7 @@ export function createApp({
   const v1 = factory
     .createApp()
     .route("/environments", environmentRoutes(provisioner, sprites, log))
+    .route("/environments", secretRoutes())
     .route("/agents", agentRoutes(launcher, sprites, log, heartbeatMs))
     .route("/webhooks", webhookRoutes());
 

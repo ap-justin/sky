@@ -26,6 +26,7 @@ export class KnownSecrets {
       | "claudeOauthToken"
       | "publicBaseUrl"
       | "webhookSigningKey"
+      | "secretEncryptionKey"
     >,
   ): KnownSecrets {
     const secrets = new KnownSecrets();
@@ -34,12 +35,20 @@ export class KnownSecrets {
     secrets.add("CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken);
     secrets.add("PUBLIC_BASE_URL", config.publicBaseUrl);
     secrets.add("WEBHOOK_SIGNING_KEY", config.webhookSigningKey);
+    secrets.add(
+      "SECRET_ENCRYPTION_KEY",
+      config.secretEncryptionKey.toString("base64"),
+    );
     return secrets;
   }
 
   /** Registers `value` under `name`, replacing that name's previous value; a value under 8 characters is ignored. */
   add(name: string, value: string): void {
     if (value.length >= MIN_KNOWN_LENGTH) this.#values.set(name, value);
+  }
+
+  remove(name: string): void {
+    this.#values.delete(name);
   }
 
   values(): string[] {

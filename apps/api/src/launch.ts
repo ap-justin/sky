@@ -2,19 +2,29 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { SpritesClient } from "@fly/sprites";
 import { type Db, runs } from "@harness/db";
-import type { AgentId, RunId } from "@harness/shared";
+import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
 import { eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";
 import { REPO_DIR, RUNNER_DIR, WORKTREES_DIR } from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import { failRun, isActive } from "./runs.js";
+import { openEnvSecrets } from "./secrets.js";
 import { execInSprite, startDetached, writeSpriteFile } from "./sprites.js";
 
 const RUNNER = `${RUNNER_DIR}/runner.mjs`;
-// the prompt rides in a file: env reaches the session as URL query params, too short for a long prompt.
+// the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
+// then deleted, and the prompt in PROMPT_FILE, which a query param is too short for.
 // the run id in argv is what `runnerPattern` matches; the runner itself ignores it
-const RUNNER_COMMAND = `PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
+const RUNNER_COMMAND = `set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
+
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+/** `export NAME='value'` lines for sh to source; later names override earlier ones. */
+const envFile = (vars: Iterable<[string, string]>) =>
+  [...vars]
+    .map(([name, value]) => `export ${name}=${shellQuote(value)}\n`)
+    .join("");
 
 /** `pgrep -f`/`pkill -f` pattern matching only this run's runner, never its Claude child. */
 const runnerPattern = (runId: RunId) =>
@@ -87,6 +97,7 @@ type Deps = {
   nudgeDeliveries: () => void;
 };
 export type Launch = {
+  envId: EnvironmentId;
   spriteName: string;
   agentId: AgentId;
   runId: RunId;
@@ -150,6 +161,24 @@ export function createLauncher({
       log(`${launch.runId} ended before its runner started`);
       return;
     }
+    const key = config.secretEncryptionKey;
+    const envSecrets = openEnvSecrets(db, key, launch.envId);
+    db.update(runs)
+      .set({ secretNames: [...envSecrets.keys()].sort() })
+      .where(eq(runs.id, launch.runId))
+      .run();
+    const envFilePath = `/workspace/runs/${launch.runId}.env`;
+    await writeSpriteFile(
+      sprites,
+      launch.spriteName,
+      envFilePath,
+      envFile([
+        ...envSecrets,
+        ["CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken],
+        ["AGENT_TOKEN", agentToken],
+      ]),
+      { mode: 0o600 },
+    );
     await startDetached(
       sprites,
       launch.spriteName,
@@ -160,8 +189,7 @@ export function createLauncher({
           AGENT_ID: launch.agentId,
           RUN_ID: launch.runId,
           API_BASE_URL: config.publicBaseUrl,
-          AGENT_TOKEN: agentToken,
-          CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
+          ENV_FILE: envFilePath,
           PROMPT_FILE: promptFile,
           REPO_DIR,
           WORKTREES_DIR,
@@ -170,7 +198,15 @@ export function createLauncher({
           ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
         },
       },
-    );
+    ).catch(async (err: unknown) => {
+      // the runner never started, so nothing else deletes the file its secrets sit in
+      await execInSprite(sprites, launch.spriteName, [
+        "rm",
+        "-f",
+        envFilePath,
+      ]).catch(() => {});
+      throw err;
+    });
   }
 
   return {

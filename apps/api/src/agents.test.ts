@@ -4,11 +4,14 @@ import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, environments, migrate, openDb, runs } from "@harness/db";
 import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { failStaleRuns } from "./runs.js";
 import {
+  envFileOf,
   type SpritesWire,
   spritesToken,
   stubSprites,
@@ -131,6 +134,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
     `exec ${sprite} - sha256sum /opt/harness/runner.mjs`,
     `write ${sprite} /opt/harness/runner.mjs`,
     `write ${sprite} /workspace/runs/${run.id}.prompt`,
+    `write ${sprite} /workspace/runs/${run.id}.env`,
     expect.stringMatching(`^session ${sprite} /workspace/repo bash -c `),
   ]);
   expect(
@@ -153,14 +157,22 @@ test("launch uploads the bundle, then starts the runner as a detached session an
     AGENT_ID: agent.id,
     RUN_ID: run.id,
     API_BASE_URL: config.publicBaseUrl,
-    AGENT_TOKEN: expect.any(String),
-    CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
+    ENV_FILE: `/workspace/runs/${run.id}.env`,
     PROMPT_FILE: `/workspace/runs/${run.id}.prompt`,
     REPO_DIR: "/workspace/repo",
     WORKTREES_DIR: "/workspace/worktrees",
     APPROVAL_POLICY: "[]",
     WAIT_TIMEOUT_MINUTES: "120",
   });
+  // the secrets ride in a file only the sprite user can read, which the command sources and deletes
+  expect(envFileOf(wire, session)).toEqual({
+    CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
+    AGENT_TOKEN: expect.any(String),
+  });
+  expect(wire.modes.get(`/workspace/runs/${run.id}.env`)).toBe("0600");
+  expect(session?.argv.join(" ")).toMatch(
+    /set -a && \. "\$ENV_FILE" && set \+a && rm -f "\$ENV_FILE" && /,
+  );
 });
 
 test("the runner gets the env's approval policy as a JSON array", async () => {
@@ -171,20 +183,80 @@ test("the runner gets the env's approval policy as a JSON array", async () => {
   );
 });
 
-test("secrets travel as process env only: never argv, the run row, an event or the logs", async () => {
+const putSecret = (envId: string, name: string, body: unknown) =>
+  app.request(`/v1/environments/${envId}/secrets/${name}`, {
+    method: "PUT",
+    headers: json,
+    body: JSON.stringify(body),
+  });
+
+test("the env's value secrets reach the runner through the env file, quotes intact; a connector injects nothing", async () => {
+  const envId = readyEnv();
+  const tricky = `it's "quoted" $HOME \`x\`\nline two`;
+  expect((await putSecret(envId, "TRICKY", { value: tricky })).status).toBe(
+    200,
+  );
+  expect(
+    (await putSecret(envId, "DB_URL", { value: "postgres://u:p@db/x" })).status,
+  ).toBe(200);
+  expect((await putSecret(envId, "GH", { connector: "github" })).status).toBe(
+    200,
+  );
+  const { agent, run } = await launched(envId);
+  await sessionOpened();
+  const session = wire.sessions[0];
+  expect(envFileOf(wire, session)).toEqual({
+    TRICKY: tricky,
+    DB_URL: "postgres://u:p@db/x",
+    CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
+    AGENT_TOKEN: expect.any(String),
+  });
+  expect(session?.env).not.toHaveProperty("DB_URL");
+  expect(wire.execUrls.map(decodeURIComponent).join("\n")).not.toContain(
+    "postgres://u:p@db/x",
+  );
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.secretNames).toEqual([
+      "DB_URL",
+      "TRICKY",
+    ]),
+  );
+});
+
+test("a runner session that fails to open fails the run and deletes the env file it would have sourced", async () => {
+  server.use(
+    ws
+      .link("wss://api.sprites.dev/v1/sprites/:name/exec")
+      .addEventListener("connection", ({ client }) => {
+        client.close(1011, "upstream unavailable");
+      }),
+  );
+  const envId = readyEnv();
+  const { agent, run } = await launched(envId);
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
+  );
+  expect(wire.calls).toContain(
+    `exec harness-${envId} - rm -f /workspace/runs/${run.id}.env`,
+  );
+});
+
+test("secrets travel in the env file only: never an exec URL, argv, the run row, an event or the logs", async () => {
   const { run } = await launched(readyEnv());
   await sessionOpened();
   const session = wire.sessions[0];
   const secrets = [
     config.claudeOauthToken,
-    session?.env.AGENT_TOKEN ?? "missing",
+    envFileOf(wire, session).AGENT_TOKEN ?? "missing",
   ];
+  const urls = wire.execUrls.map(decodeURIComponent).join("\n");
   const stored = JSON.stringify([
     db.$client.prepare("select * from runs").all(),
     db.$client.prepare("select * from agents").all(),
     db.$client.prepare("select * from events").all(),
   ]);
   for (const secret of secrets) {
+    expect(urls).not.toContain(secret);
     expect(session?.argv.join(" ")).not.toContain(secret);
     expect(stored).not.toContain(secret);
     expect(logs.join("\n")).not.toContain(secret);
@@ -199,6 +271,7 @@ test("a sprite already holding the current bundle gets no upload", async () => {
   await sessionOpened();
   expect(wire.calls.filter((c) => c.startsWith("write"))).toEqual([
     expect.stringMatching(/\.prompt$/),
+    expect.stringMatching(/\.env$/),
   ]);
 });
 
@@ -310,7 +383,7 @@ async function runningRun(envId = readyEnv()) {
   const before = wire.sessions.length;
   const ids = await launched(envId);
   await sessionOpened(before + 1);
-  const token = wire.sessions[before]?.env.AGENT_TOKEN ?? "";
+  const token = envFileOf(wire, wire.sessions[before]).AGENT_TOKEN ?? "";
   return { ...ids, envId, token };
 }
 
@@ -561,6 +634,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     pendingRequest: null,
     rollup: null,
     compareUrl: null,
+    secretNames: [],
   });
   expect(wire.calls.at(-1)).toBe(
     `exec harness-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
@@ -941,7 +1015,7 @@ test("GET of a follow-up run shows its own summary and the cumulative branch dif
   const res = await followUp(agent.id, { prompt: "add a test" });
   const { run } = (await res.json()) as Launched;
   await sessionOpened(2);
-  const token = wire.sessions[1]?.env.AGENT_TOKEN ?? "";
+  const token = envFileOf(wire, wire.sessions[1]).AGENT_TOKEN ?? "";
   await postEvent(token, {
     runId: run.id,
     type: "run.started",
@@ -1204,7 +1278,10 @@ async function followUpRun(agentId: string, sessions: number) {
   expect(res.status).toBe(202);
   const { run } = (await res.json()) as Launched;
   await sessionOpened(sessions);
-  return { runId: run.id, token: wire.sessions.at(-1)?.env.AGENT_TOKEN ?? "" };
+  return {
+    runId: run.id,
+    token: envFileOf(wire, wire.sessions.at(-1)).AGENT_TOKEN ?? "",
+  };
 }
 
 test("GET agent totals usage across its runs; a stopped run adds nothing", async () => {

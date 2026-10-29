@@ -11,6 +11,7 @@ const required = {
   CLAUDE_CODE_OAUTH_TOKEN: claudeOauthToken,
   PUBLIC_BASE_URL: "https://harness.example.com",
   WEBHOOK_SIGNING_KEY: "w".repeat(32),
+  SECRET_ENCRYPTION_KEY: Buffer.alloc(32, 7).toString("base64"),
 };
 
 test("parses the env, defaulting PORT, the runner bundle path and the run and wait timeouts", () => {
@@ -27,6 +28,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       runTimeoutMs: 30 * 60_000,
       waitTimeoutMs: 120 * 60_000,
       webhookSigningKey: "w".repeat(32),
+      secretEncryptionKey: Buffer.alloc(32, 7),
     },
   });
 });
@@ -92,5 +94,26 @@ test("a WEBHOOK_SIGNING_KEY under 32 characters is rejected", () => {
   expect(result).toEqual({
     ok: false,
     message: expect.stringContaining("WEBHOOK_SIGNING_KEY is invalid"),
+  });
+});
+
+test.each([
+  ["missing", undefined, "SECRET_ENCRYPTION_KEY is missing"],
+  [
+    "31 bytes",
+    Buffer.alloc(31).toString("base64"),
+    "SECRET_ENCRYPTION_KEY is invalid",
+  ],
+  [
+    "33 bytes",
+    Buffer.alloc(33).toString("base64"),
+    "SECRET_ENCRYPTION_KEY is invalid",
+  ],
+  ["not base64", "!".repeat(44), "SECRET_ENCRYPTION_KEY is invalid"],
+])("a SECRET_ENCRYPTION_KEY that is %s is rejected", (_, value, message) => {
+  const result = loadConfig({ ...required, SECRET_ENCRYPTION_KEY: value });
+  expect(result).toEqual({
+    ok: false,
+    message: expect.stringContaining(message),
   });
 });

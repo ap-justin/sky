@@ -67,6 +67,8 @@ const presentRunDetail = (
   compareUrl: run.rollup
     ? `https://github.com/${repo}/compare/${run.rollup.base}...${branch}`
     : null,
+  // null until the launch records what it injected
+  secretNames: run.secretNames,
 });
 
 const presentAgent = (row: AgentRow) => ({
@@ -243,6 +245,7 @@ export function agentRoutes(
           return atCap(c, outcome.limit);
       }
       launcher.start({
+        envId,
         spriteName: outcome.env.spriteName,
         agentId,
         runId,
@@ -317,6 +320,7 @@ export function agentRoutes(
           return atCap(c, outcome.limit);
       }
       launcher.start({
+        envId: outcome.env.id,
         spriteName: outcome.env.spriteName,
         agentId: id,
         runId,

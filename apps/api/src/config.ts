@@ -23,6 +23,12 @@ const configSchema = z.object({
   WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
   /** HMAC key every outbound webhook delivery is signed with. */
   WEBHOOK_SIGNING_KEY: z.string().min(32),
+  /** AES-256 key, base64, that env secrets and run envVars are encrypted under. */
+  SECRET_ENCRYPTION_KEY: z
+    .base64()
+    .refine((s) => Buffer.from(s, "base64").length === 32, {
+      error: "must decode to 32 bytes",
+    }),
 });
 
 export type Config = {
@@ -36,6 +42,7 @@ export type Config = {
   runTimeoutMs: number;
   waitTimeoutMs: number;
   webhookSigningKey: string;
+  secretEncryptionKey: Buffer;
 };
 
 type Env = Record<string, string | undefined>;
@@ -60,6 +67,7 @@ export function loadConfig(
         runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
         waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
         webhookSigningKey: e.WEBHOOK_SIGNING_KEY,
+        secretEncryptionKey: Buffer.from(e.SECRET_ENCRYPTION_KEY, "base64"),
       },
     };
   }

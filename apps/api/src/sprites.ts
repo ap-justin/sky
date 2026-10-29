@@ -77,8 +77,9 @@ export async function writeSpriteFile(
   name: string,
   path: string,
   data: string | Buffer,
+  options: { mode?: number } = {},
 ): Promise<void> {
-  await client.sprite(name).filesystem("/").writeFile(path, data);
+  await client.sprite(name).filesystem("/").writeFile(path, data, options);
 }
 
 /**

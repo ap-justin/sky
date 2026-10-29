@@ -17,6 +17,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   runTimeoutMs: 30 * 60_000,
   waitTimeoutMs: 120 * 60_000,
   webhookSigningKey: "webhook-signing-key-for-tests-0123456789",
+  secretEncryptionKey: Buffer.alloc(32, 1),
   ...overrides,
 });
 
@@ -34,7 +35,30 @@ export type Session = {
   env: Record<string, string>;
   tty: boolean;
   detachable: boolean;
+  /** The WebSocket URL as sent, query included. */
+  url: string;
 };
+
+/**
+ * The variables a session's `ENV_FILE` exports, parsed back from the `export NAME='value'` lines the
+ * launcher writes; empty when the session names no file or the file was never written.
+ */
+export function envFileOf(
+  wire: { files: Map<string, Uint8Array> },
+  session: Session | undefined,
+): Record<string, string> {
+  const path = session?.env.ENV_FILE;
+  const bytes = path ? wire.files.get(path) : undefined;
+  if (!bytes) return {};
+  const text = new TextDecoder().decode(bytes);
+  const line = /^export ([A-Za-z_][A-Za-z0-9_]*)='((?:[^']|'\\'')*)'$/gm;
+  return Object.fromEntries(
+    [...text.matchAll(line)].map(([, name, quoted]) => [
+      name,
+      (quoted ?? "").replaceAll("'\\''", "'"),
+    ]),
+  );
+}
 
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
@@ -45,6 +69,10 @@ export function stubSprites() {
     sprites: new Set<string>(),
     /** Files written through the filesystem API, by absolute path. */
     files: new Map<string, Uint8Array>(),
+    /** The octal mode each write asked for, by absolute path. */
+    modes: new Map<string, string>(),
+    /** Every exec URL, HTTP or WebSocket, query included. */
+    execUrls: [] as string[],
     /**
      * One line per call, in order: `create <name>`, `exec <name> <dir> <argv…>`, `write <name> <path>`,
      * `session <name> <dir> <argv…>`, `checkpoint <name>`, `delete <name>`.
@@ -98,6 +126,7 @@ export function stubSprites() {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const name = String(params.name);
       const url = new URL(request.url);
+      wire.execUrls.push(url.href);
       const argv = url.searchParams.getAll("cmd");
       wire.calls.push(
         `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${argv.join(" ")}`,
@@ -130,8 +159,11 @@ export function stubSprites() {
     http.put(`${SPRITES}/:name/fs/write`, async ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const name = String(params.name);
-      const path = new URL(request.url).searchParams.get("path") ?? "";
+      const query = new URL(request.url).searchParams;
+      const path = query.get("path") ?? "";
       wire.calls.push(`write ${name} ${path}`);
+      const mode = query.get("mode");
+      if (mode) wire.modes.set(path, mode);
       if (wire.writeStatus !== 200) {
         return HttpResponse.json(
           { error: "write failed" },
@@ -145,6 +177,7 @@ export function stubSprites() {
     execLink.addEventListener("connection", ({ client, params }) => {
       const name = String(params.name);
       const url = client.url;
+      wire.execUrls.push(url.href);
       const argv = url.searchParams.getAll("cmd");
       const env = Object.fromEntries(
         url.searchParams.getAll("env").map((pair) => {
@@ -161,6 +194,7 @@ export function stubSprites() {
         env,
         tty: url.searchParams.get("tty") === "true",
         detachable: url.searchParams.get("detachable") === "true",
+        url: url.href,
       });
       wire.openSockets += 1;
       client.addEventListener("close", () => {
