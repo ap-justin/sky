@@ -1,0 +1,302 @@
+import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { HttpResponse, http } from "msw";
+import { beforeEach, expect, test } from "vitest";
+import { server } from "../../../test/msw.js";
+import { specHash } from "./spec.js";
+import { apiKey, apiUrl, type Captured, runCli } from "./testing.js";
+
+const yaml = "name: web\nrepo: acme/web\nsetup: pnpm install\n";
+const spec = {
+  name: "web",
+  repo: "acme/web",
+  setup: "pnpm install",
+  concurrency: 3,
+  approvalPolicy: [],
+};
+const env = (over: Record<string, unknown> = {}) => ({
+  id: "env_1",
+  ...spec,
+  status: "ready",
+  spriteName: "harness-env-1",
+  checkpointId: "ckpt_1",
+  failure: null,
+  createdAt: "2026-10-30T00:00:00.000Z",
+  ...over,
+});
+
+let dir: string;
+let file: string;
+let lockFile: string;
+const writes: { method: string; body: unknown }[] = [];
+
+beforeEach(() => {
+  dir = mkdtempSync(join(tmpdir(), "harness-apply-"));
+  file = join(dir, "env.yaml");
+  lockFile = join(dir, "harness-lock.json");
+  writeFileSync(file, yaml);
+  writes.length = 0;
+});
+
+const authed = (request: Request) =>
+  request.headers.get("authorization") === `Bearer ${apiKey}`;
+
+/** GET /:id answers with each status in turn, then repeats the last. */
+function getSequence(...states: Record<string, unknown>[]) {
+  let i = 0;
+  return http.get(`${apiUrl}/v1/environments/:id`, ({ request }) => {
+    if (!authed(request)) return new HttpResponse(null, { status: 401 });
+    const body = states[Math.min(i++, states.length - 1)];
+    return HttpResponse.json(body);
+  });
+}
+const list = (...envs: Record<string, unknown>[]) =>
+  http.get(`${apiUrl}/v1/environments`, () =>
+    HttpResponse.json({ data: envs }),
+  );
+const recordWrite =
+  (status: number, response: Record<string, unknown>) =>
+  async ({ request }: { request: Request }) => {
+    writes.push({ method: request.method, body: await request.json() });
+    return HttpResponse.json(response, { status });
+  };
+
+const noKeyLeak = (r: Captured) => {
+  expect(r.stdout).not.toContain(apiKey);
+  expect(r.stderr).not.toContain(apiKey);
+};
+const lock = () => JSON.parse(readFileSync(lockFile, "utf8"));
+
+test("creates an absent env, waits for ready and writes the lock", async () => {
+  server.use(
+    list(env({ id: "env_other", name: "other" })),
+    http.post(
+      `${apiUrl}/v1/environments`,
+      recordWrite(202, env({ status: "provisioning", checkpointId: null })),
+    ),
+    getSequence(
+      env({ status: "provisioning", checkpointId: null }),
+      env({ status: "ready" }),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([{ method: "POST", body: spec }]);
+  expect(r.sleeps.every((ms) => ms === 3000)).toBe(true);
+  expect(r.sleeps.length).toBeGreaterThan(0);
+  expect(r.stderr).toMatch(/provisioning/);
+  expect(r.stdout).toBe("ready web env_1\n");
+  expect(lock()).toEqual({
+    envId: "env_1",
+    spriteName: "harness-env-1",
+    checkpointId: "ckpt_1",
+    specHash: specHash(spec),
+  });
+  noKeyLeak(r);
+});
+
+test("an unchanged spec makes no write and says up to date", async () => {
+  writeFileSync(
+    lockFile,
+    JSON.stringify({
+      envId: "env_1",
+      spriteName: "x",
+      checkpointId: "y",
+      specHash: "z",
+    }),
+  );
+  // no POST/PATCH handler: any write is an unhandled request and fails the test
+  server.use(getSequence(env()));
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("up to date web env_1\n");
+  expect(lock()).toMatchObject({ envId: "env_1", checkpointId: "ckpt_1" });
+});
+
+test("patches only the changed fields", async () => {
+  writeFileSync(file, `${yaml}concurrency: 5\n`);
+  server.use(
+    list(env()),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ concurrency: 5 })),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([{ method: "PATCH", body: { concurrency: 5 } }]);
+  expect(r.sleeps).toEqual([]);
+  expect(lock().specHash).toBe(specHash({ ...spec, concurrency: 5 }));
+});
+
+test("the lock's id finds a renamed env, which is patched rather than created", async () => {
+  writeFileSync(file, yaml.replace("name: web", "name: site"));
+  writeFileSync(lockFile, JSON.stringify({ envId: "env_1" }));
+  server.use(
+    getSequence(env()),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(200, env({ name: "site" })),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([{ method: "PATCH", body: { name: "site" } }]);
+});
+
+test("a lock whose env is gone falls back to the name", async () => {
+  writeFileSync(lockFile, JSON.stringify({ envId: "env_gone" }));
+  server.use(
+    http.get(`${apiUrl}/v1/environments/env_gone`, () =>
+      HttpResponse.json(
+        { error: { code: "not_found", message: "no such environment" } },
+        { status: 404 },
+      ),
+    ),
+    list(env()),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(lock().envId).toBe("env_1");
+});
+
+test("a failed reprovision exits 1 with the step and the stderr tail, and leaves the lock", async () => {
+  writeFileSync(file, yaml.replace("pnpm install", "make"));
+  writeFileSync(lockFile, JSON.stringify({ envId: "env_1", specHash: "old" }));
+  server.use(
+    getSequence(
+      env(),
+      env({ status: "provisioning", setup: "make" }),
+      env({
+        status: "failed",
+        setup: "make",
+        checkpointId: null,
+        failure: { step: "setup", stderr: "make: *** No targets.  Stop.\n" },
+      }),
+    ),
+    http.patch(
+      `${apiUrl}/v1/environments/env_1`,
+      recordWrite(
+        202,
+        env({ status: "provisioning", setup: "make", checkpointId: null }),
+      ),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(1);
+  expect(writes).toEqual([{ method: "PATCH", body: { setup: "make" } }]);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toMatch(/failed at step setup/);
+  expect(r.stderr).toContain("make: *** No targets.  Stop.");
+  expect(lock().specHash).toBe("old");
+});
+
+test("an API error exits 1 with its message", async () => {
+  writeFileSync(file, yaml.replace("pnpm install", "make"));
+  server.use(
+    list(env()),
+    http.patch(`${apiUrl}/v1/environments/env_1`, () =>
+      HttpResponse.json(
+        {
+          error: {
+            code: "run_active",
+            message: "a run on this environment is active",
+          },
+        },
+        { status: 409 },
+      ),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(
+    "a run on this environment is active (run_active)",
+  );
+  expect(existsSync(lockFile)).toBe(false);
+});
+
+test("an unreachable API exits 1 naming the URL", async () => {
+  server.use(http.get(`${apiUrl}/v1/environments`, () => HttpResponse.error()));
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain(`cannot reach ${apiUrl}`);
+});
+
+test("gives up after 30 minutes of provisioning", async () => {
+  server.use(
+    list(),
+    http.post(
+      `${apiUrl}/v1/environments`,
+      recordWrite(202, env({ status: "provisioning" })),
+    ),
+    getSequence(env({ status: "provisioning" })),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(1);
+  expect(r.sleeps.reduce((a, b) => a + b, 0)).toBe(30 * 60 * 1000);
+  expect(r.stderr).toMatch(/still provisioning after 30m/);
+  expect(existsSync(lockFile)).toBe(false);
+});
+
+test("--json prints the final env object and nothing else on stdout", async () => {
+  server.use(list(env()));
+  const r = await runCli(["apply", "--json", file]);
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.stdout)).toEqual(env());
+});
+
+test("--json failure leaves stdout empty and puts an error object on stderr", async () => {
+  server.use(
+    list(),
+    http.post(`${apiUrl}/v1/environments`, () =>
+      HttpResponse.json(
+        { error: { code: "name_taken", message: "taken" } },
+        { status: 409 },
+      ),
+    ),
+  );
+  const r = await runCli(["apply", "--json", file]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(JSON.parse(r.stderr)).toEqual({
+    error: { code: "name_taken", message: "taken" },
+  });
+});
+
+test("an invalid spec exits 2 naming field and line, with no request", async () => {
+  writeFileSync(file, "name: web\nrepo: nope\nsetup: x\n");
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toContain(
+    `${file}:2: repo: expected a GitHub repo as owner/name`,
+  );
+});
+
+test("a missing file exits 2", async () => {
+  const r = await runCli(["apply", join(dir, "nope.yaml")]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(/nope\.yaml/);
+});
+
+test("missing config exits 2 before reading the API", async () => {
+  const r = await runCli(["apply", file], {
+    env: { HARNESS_URL: undefined, HARNESS_API_KEY: undefined },
+  });
+  expect(r.code).toBe(2);
+  expect(r.stderr).toMatch(/no API URL/);
+});
+
+test("usage errors exit 2 with a pointer to --help", async () => {
+  for (const argv of [
+    ["apply"],
+    ["apply", file, "extra"],
+    ["apply", "--bogus", file],
+    ["nope"],
+  ]) {
+    const r = await runCli(argv);
+    expect(r.code, argv.join(" ")).toBe(2);
+    expect(r.stderr).toMatch(/Run 'harness --help' for usage\.\n$/);
+    expect(r.stdout).toBe("");
+  }
+});

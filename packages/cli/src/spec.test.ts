@@ -1,0 +1,82 @@
+import { expect, test } from "vitest";
+import { parseSpec, specHash } from "./spec.js";
+
+test("parses a spec and fills the schema defaults", () => {
+  const result = parseSpec(
+    "name: web\nrepo: acme/web\nsetup: |\n  pnpm install\n",
+    "env.yaml",
+  );
+  expect(result).toEqual({
+    ok: true,
+    spec: {
+      name: "web",
+      repo: "acme/web",
+      setup: "pnpm install\n",
+      concurrency: 3,
+      approvalPolicy: [],
+    },
+  });
+});
+
+test("names the bad field and its line", () => {
+  const result = parseSpec(
+    "name: web\nrepo: not a repo\nsetup: x\n",
+    "env.yaml",
+  );
+  expect(result.ok).toBe(false);
+  if (result.ok) return;
+  expect(result.errors).toEqual([
+    "env.yaml:2: repo: expected a GitHub repo as owner/name",
+  ]);
+});
+
+test("names the line of an unknown key", () => {
+  const result = parseSpec(
+    "name: web\nrepo: acme/web\nsetup: x\napiKey: sk-123\n",
+    "env.yaml",
+  );
+  expect(result.ok).toBe(false);
+  if (result.ok) return;
+  expect(result.errors).toHaveLength(1);
+  expect(result.errors[0]).toMatch(/^env\.yaml:4: apiKey: /);
+});
+
+test("names the line of a bad array item", () => {
+  const result = parseSpec(
+    "name: web\nrepo: acme/web\nsetup: x\napprovalPolicy:\n  - Bash\n  - ''\n",
+    "env.yaml",
+  );
+  expect(result.ok).toBe(false);
+  if (result.ok) return;
+  expect(result.errors[0]).toMatch(/^env\.yaml:6: approvalPolicy\.1: /);
+});
+
+test("a missing field has no line to point at", () => {
+  const result = parseSpec("name: web\nrepo: acme/web\n", "env.yaml");
+  expect(result.ok).toBe(false);
+  if (result.ok) return;
+  expect(result.errors).toEqual([expect.stringMatching(/^env\.yaml: setup: /)]);
+});
+
+test("a YAML syntax error carries its line and column", () => {
+  const result = parseSpec("name: web\nrepo: [acme\n", "env.yaml");
+  expect(result.ok).toBe(false);
+  if (result.ok) return;
+  expect(result.errors[0]).toMatch(/^env\.yaml:\d+:\d+: /);
+});
+
+test("a document that isn't a mapping is rejected", () => {
+  const result = parseSpec("- a\n- b\n", "env.yaml");
+  expect(result.ok).toBe(false);
+});
+
+test("the hash ignores key order and formatting", () => {
+  const a = parseSpec("name: web\nrepo: acme/web\nsetup: x\n", "e");
+  const b = parseSpec(
+    "setup: x\nconcurrency: 3\nrepo: acme/web\nname: web\n",
+    "e",
+  );
+  if (!a.ok || !b.ok) throw new Error("fixture invalid");
+  expect(specHash(a.spec)).toBe(specHash(b.spec));
+  expect(specHash(a.spec)).toMatch(/^sha256:[0-9a-f]{64}$/);
+});
