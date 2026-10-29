@@ -1,0 +1,21 @@
+or {
+  `process.env.NODE_ENV === $lit`,
+  `process.env.NODE_ENV !== $lit`,
+  `process.env.NODE_ENV == $lit`,
+  `process.env.NODE_ENV != $lit`,
+  `$lit === process.env.NODE_ENV`,
+  `$lit !== process.env.NODE_ENV`,
+  `$lit == process.env.NODE_ENV`,
+  `$lit != process.env.NODE_ENV`,
+  `import.meta.env.MODE === $lit`,
+  `import.meta.env.MODE !== $lit`,
+  `import.meta.env.MODE == $lit`,
+  `import.meta.env.MODE != $lit`,
+  `$lit === import.meta.env.MODE`,
+  `$lit !== import.meta.env.MODE`,
+  `$lit == import.meta.env.MODE`,
+  `$lit != import.meta.env.MODE`
+} as $cmp where {
+  $lit <: r"^[\"'`](?:test|production|preview|development|staging)[\"'`]$",
+  register_diagnostic(span=$cmp, message="Source must not branch on the test environment or deployment stage; inject the behavior through config or a dependency.", severity="error")
+}

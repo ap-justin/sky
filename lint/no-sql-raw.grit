@@ -1,0 +1,3 @@
+`sql.raw($x)` as $call where {
+  register_diagnostic(span=$call, message="sql.raw interpolates its argument unescaped; bind input with sql`...${value}` or a Drizzle operator instead.", severity="error")
+}

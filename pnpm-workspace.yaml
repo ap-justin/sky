@@ -1,0 +1,7 @@
+packages:
+  - apps/api
+  - packages/runner
+  - packages/mcp
+  - packages/cli
+  - packages/shared
+  - db

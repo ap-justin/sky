@@ -1,0 +1,5 @@
+node_modules/
+.claude/agent-memory-local/
+.claude/settings.local.json
+dist/
+*.tsbuildinfo

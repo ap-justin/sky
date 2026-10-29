@@ -1,0 +1,21 @@
+{
+  "name": "harness",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@10.19.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "typecheck": "tsc -b",
+    "lint": "biome check",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.4",
+    "@types/node": "^22.20.5",
+    "msw": "3.0.3",
+    "typescript": "7.0.2",
+    "vitest": "5.0.5"
+  }
+}
