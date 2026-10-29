@@ -12,6 +12,7 @@ import { mintId } from "./ids.js";
 import { type Launcher, removeWorktree, signalRunner } from "./launch.js";
 import { REPO_DIR } from "./provision.js";
 import { redact } from "./redact.js";
+import { streamRunEvents } from "./run-stream.js";
 import {
   activeRunOf,
   activeRunStatuses,
@@ -98,10 +99,32 @@ const runParam = zValidator(
   },
 );
 
+// a stream resumes after an event row id: EventSource's Last-Event-ID, or ?after= where headers can't be set
+const Cursor = z
+  .string()
+  .regex(/^\d{1,15}$/)
+  .transform(Number);
+const badCursor = (result: { success: boolean }, c: Context) => {
+  if (!result.success) {
+    return apiError(c, 400, "invalid_cursor", "the cursor is not an event id");
+  }
+};
+const afterQuery = zValidator(
+  "query",
+  z.object({ after: Cursor.optional() }),
+  badCursor,
+);
+const lastEventId = zValidator(
+  "header",
+  z.object({ "last-event-id": Cursor.optional() }),
+  badCursor,
+);
+
 export function agentRoutes(
   launcher: Launcher,
   sprites: SpritesClient,
   log: (line: string) => void,
+  heartbeatMs: number,
 ) {
   return factory
     .createApp()
@@ -370,5 +393,20 @@ export function agentRoutes(
         },
         200,
       );
+    })
+    .get("/:id/runs/:runId/stream", runParam, afterQuery, lastEventId, (c) => {
+      const { id, runId } = c.req.valid("param");
+      const run = c.var.db
+        .select({ id: runs.id })
+        .from(runs)
+        .where(and(eq(runs.id, runId), eq(runs.agentId, id)))
+        .get();
+      if (!run) return apiError(c, 404, "not_found", "no such run");
+      // a reconnecting EventSource keeps its original URL, so the header is the fresher cursor
+      const after =
+        c.req.valid("header")["last-event-id"] ??
+        c.req.valid("query").after ??
+        0;
+      return streamRunEvents(c, runId, after, heartbeatMs, log);
     });
 }

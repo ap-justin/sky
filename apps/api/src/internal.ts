@@ -11,6 +11,7 @@ import { enqueueDeliveries } from "./deliveries.js";
 import { apiError } from "./errors.js";
 import { factory } from "./factory.js";
 import { redactDeep } from "./redact.js";
+import { runEvents } from "./run-events.js";
 import { activeRunStatuses, agentStatusFor, isActive } from "./runs.js";
 import { body, jsonBody } from "./validation.js";
 
@@ -84,6 +85,7 @@ export function internalRoutes(nudgeDeliveries: () => void) {
             })
             .returning({ id: events.id })
             .get();
+          runEvents.publish(run.id);
           const enqueued = enqueueDeliveries(tx, id, event.type, ts);
           if (next) {
             const usage =

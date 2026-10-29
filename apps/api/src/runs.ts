@@ -9,6 +9,7 @@ import {
 } from "@harness/shared";
 import { and, count, eq, inArray, sql } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
+import { runEvents } from "./run-events.js";
 
 export type Tx = Parameters<Parameters<Db["transaction"]>[0]>[0];
 type RunRow = typeof runs.$inferSelect;
@@ -113,6 +114,7 @@ function endRun(
       payload,
     })
     .run();
+  runEvents.publish(runId);
   tx.update(agents)
     .set({ status: "idle" })
     .where(eq(agents.id, run.agentId))

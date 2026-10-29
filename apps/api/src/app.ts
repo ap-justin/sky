@@ -22,6 +22,8 @@ export type AppDeps = {
   log: (line: string) => void;
   /** Wakes the delivery loop after ingestion enqueues webhook deliveries; must not block. */
   nudgeDeliveries: () => void;
+  /** Quiet time before a run stream sends a `: ping` comment; 15 s unless a test shortens it. */
+  heartbeatMs?: number;
 };
 
 export function createApp({
@@ -30,6 +32,7 @@ export function createApp({
   sprites,
   log,
   nudgeDeliveries,
+  heartbeatMs = 15_000,
 }: AppDeps) {
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
   const unauthorized = (message: string) => (c: Context) =>
@@ -41,7 +44,7 @@ export function createApp({
   const v1 = factory
     .createApp()
     .route("/environments", environmentRoutes(provisioner, sprites, log))
-    .route("/agents", agentRoutes(launcher, sprites, log))
+    .route("/agents", agentRoutes(launcher, sprites, log, heartbeatMs))
     .route("/webhooks", webhookRoutes());
 
   const app = factory

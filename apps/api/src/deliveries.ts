@@ -1,7 +1,8 @@
 import { createHmac } from "node:crypto";
 import { type Db, events, webhookDeliveries, webhooks } from "@harness/db";
-import type { Event, EventType } from "@harness/shared";
+import type { EventType } from "@harness/shared";
 import { and, asc, eq, lte } from "drizzle-orm";
+import { presentEvent } from "./run-events.js";
 import type { Tx } from "./runs.js";
 
 const TICK_MS = 5_000;
@@ -102,13 +103,7 @@ export function createDispatcher({
   async function attempt(row: Due): Promise<void> {
     const { event } = row;
     const id = `evt_${event.id}` as const;
-    const body = JSON.stringify({
-      id,
-      runId: event.runId,
-      ts: event.ts,
-      type: event.type,
-      payload: event.payload,
-    } as Event);
+    const body = JSON.stringify(presentEvent(event));
     const t = Math.floor(now().getTime() / 1000);
     let status: number | null = null;
     let error: string | null = null;
