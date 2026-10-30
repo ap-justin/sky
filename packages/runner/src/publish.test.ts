@@ -12,7 +12,12 @@ import { join } from "node:path";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { server } from "../../../test/msw.js";
-import { GatewayError, publish, publishMain } from "./publish.js";
+import {
+  GatewayError,
+  publish,
+  publishMain,
+  stripClaudeAttribution,
+} from "./publish.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
@@ -104,6 +109,7 @@ function fakeGitHub(
     }[],
     refWrites: [] as { method: string; body: unknown }[],
     pullCreates: [] as unknown[],
+    pullUpdates: [] as { number: string; body: Record<string, unknown> }[],
     authorization: [] as (string | null)[],
   };
   const seen = (request: Request) =>
@@ -181,6 +187,14 @@ function fakeGitHub(
       return HttpResponse.json(
         state.pulls.filter((p) => `acme:${p.head}` === head),
       );
+    }),
+    http.patch(`${REPO}/pulls/:number`, async ({ request, params }) => {
+      seen(request);
+      state.pullUpdates.push({
+        number: String(params.number),
+        body: (await request.json()) as Record<string, unknown>,
+      });
+      return HttpResponse.json({ number: Number(params.number) });
     }),
     http.post(`${REPO}/pulls`, async ({ request }) => {
       seen(request);
@@ -337,6 +351,74 @@ test("an open PR for the branch is returned, not duplicated", async () => {
     created: false,
     pullRequest: { number: 3, url: "https://github.com/acme/widgets/pull/3" },
   });
+});
+
+test("an open PR gets the title and body given, through a PATCH", async () => {
+  const gh = fakeGitHub({
+    pulls: [
+      {
+        number: 3,
+        html_url: "https://github.com/acme/widgets/pull/3",
+        head: "claude/agt_1",
+        base: "main",
+      },
+    ],
+  });
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  await run({ title: "New title", body: "New body" });
+  expect(gh.pullUpdates).toEqual([
+    { number: "3", body: { title: "New title", body: "New body" } },
+  ]);
+
+  gh.pullUpdates.length = 0;
+  gh.ref = undefined;
+  await publish({
+    cwd: work,
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    body: "Only body",
+  });
+  expect(gh.pullUpdates).toEqual([
+    { number: "3", body: { body: "Only body" } },
+  ]);
+});
+
+test("a new PR is created with the title and body given", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  await run({ body: "Why" });
+
+  expect(gh.pullUpdates).toEqual([]);
+  expect(gh.pullCreates).toEqual([
+    { title: "Add widgets", body: "Why", head: "claude/agt_1", base: "main" },
+  ]);
+});
+
+test("Claude Code's footer and Co-Authored-By trailers are stripped from PR bodies and commit messages", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit(
+    "Add a\n\nKeeps this line.\n\nCo-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>",
+  );
+
+  await run({
+    body: "## Summary\n\nWhy.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)\n",
+  });
+
+  expect(gh.commits[0]?.message).toBe("Add a\n\nKeeps this line.\n");
+  expect(gh.pullCreates).toMatchObject([{ body: "## Summary\n\nWhy.\n" }]);
+});
+
+test("stripClaudeAttribution leaves other text and other co-authors alone", () => {
+  const text = "Fix\n\nCo-authored-by: Ada <ada@example.com>\n";
+  expect(stripClaudeAttribution(text)).toBe(text);
+  expect(stripClaudeAttribution("Fix\n\nco-authored-by: Claude <a@b.c>")).toBe(
+    "Fix",
+  );
 });
 
 test("a deleted file is a tree entry with a null sha", async () => {

@@ -78,6 +78,27 @@ function parseIdentity(line: string): Identity {
   return { name, email, date };
 }
 
+const CLAUDE_ATTRIBUTION = [
+  /^\s*🤖\s*Generated with .*Claude Code.*$/i,
+  /^\s*Co-Authored-By:\s*Claude\b.*$/i,
+];
+
+/**
+ * Drops the lines Claude Code appends on its own, the "Generated with Claude Code" footer and
+ * `Co-Authored-By: Claude` trailers, with the blank lines they leave at the end.
+ */
+export function stripClaudeAttribution(text: string): string {
+  const kept = text
+    .split("\n")
+    .filter(
+      (line) => !CLAUDE_ATTRIBUTION.some((pattern) => pattern.test(line)),
+    );
+  const stripped = kept.join("\n");
+  if (stripped === text) return text;
+  const body = stripped.trimEnd();
+  return text.endsWith("\n") && body ? `${body}\n` : body;
+}
+
 /** A commit's message, author and committer, byte for byte as git stores them. */
 async function readCommit(cwd: string, sha: string) {
   const raw = await git(cwd, "cat-file", "commit", sha);
@@ -89,7 +110,7 @@ async function readCommit(cwd: string, sha: string) {
     return parseIdentity(line.slice(key.length + 1));
   };
   return {
-    message: split === -1 ? "" : raw.slice(split + 2),
+    message: stripClaudeAttribution(split === -1 ? "" : raw.slice(split + 2)),
     author: header("author"),
     committer: header("committer"),
   };
@@ -195,7 +216,8 @@ function gateway(options: {
  * Publishes the worktree's branch through the GitHub gateway, which carries no git push: each
  * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
  * the commit with its own message and identities), then the branch ref is created or fast-forwarded
- * and a pull request into the base opened, or the open one returned. Only first-parent history is
+ * and a pull request into the base opened, or the open one given the new title and body. Claude Code's
+ * "Generated with" footer and `Co-Authored-By: Claude` trailers are stripped from both. Only first-parent history is
  * replayed, so a merge commit arrives as a plain commit with the same content, and a merge from the
  * base shows the base's changes in the pull request's diff as the branch's own.
  */
@@ -203,8 +225,9 @@ export async function publish(options: {
   cwd: string;
   gatewayUrl: string;
   connectorId: string;
-  /** Required unless the branch already has an open pull request. */
+  /** Required unless the branch already has an open pull request; given for one, it replaces the title. */
   title?: string;
+  /** Given for an open pull request, it replaces the body. */
   body?: string;
   /** Defaults to the branch `origin/HEAD` names. */
   base?: string;
@@ -381,6 +404,16 @@ export async function publish(options: {
   }
 
   if (existing) {
+    // the title and body are given again on a re-publish so they follow the review fixes
+    const update = {
+      ...(options.title && { title: options.title }),
+      ...(options.body !== undefined && {
+        body: stripClaudeAttribution(options.body),
+      }),
+    };
+    if (Object.keys(update).length > 0) {
+      await call("PATCH", `/pulls/${existing.number}`, update);
+    }
     return {
       branch,
       base,
@@ -394,7 +427,9 @@ export async function publish(options: {
     "/pulls",
     {
       title: options.title as string,
-      ...(options.body !== undefined && { body: options.body }),
+      ...(options.body !== undefined && {
+        body: stripClaudeAttribution(options.body),
+      }),
       head: branch,
       base,
     },
@@ -458,7 +493,7 @@ export async function publishMain(
     io.stderr(
       result.created
         ? `sky publish: opened pull request #${result.pullRequest.number}\n`
-        : `sky publish: pull request #${result.pullRequest.number} was already open; ${result.branch} is now ${result.sha}\n`,
+        : `sky publish: pull request #${result.pullRequest.number} was already open and updated; ${result.branch} is now ${result.sha}\n`,
     );
     io.stdout(`${result.pullRequest.url}\n`);
     return 0;
