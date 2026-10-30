@@ -17,6 +17,7 @@ const provisioningEnv = {
   setup: "pnpm install",
   concurrency: 3,
   approvalPolicy: [],
+  autoApprove: { defaults: true, commands: [] },
   status: "provisioning",
   spriteName: "sky-env-slow",
   checkpointId: null,

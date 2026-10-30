@@ -33,6 +33,7 @@ const reservedNames = new Set([
   "REPO_DIR",
   "WORKTREES_DIR",
   "APPROVAL_POLICY",
+  "AUTO_APPROVE",
   "WAIT_TIMEOUT_MINUTES",
   "SESSION_ID",
   "PATH",

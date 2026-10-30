@@ -1,5 +1,11 @@
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setImmediate } from "node:timers/promises";
@@ -51,6 +57,7 @@ beforeEach(() => {
     repoDir: join(root, "repo"),
     worktreesDir: join(root, "worktrees"),
     approvalPolicy: [],
+    autoApprove: { defaults: true, commands: [] },
     waitTimeoutMs: 60_000,
   };
 });
@@ -622,6 +629,63 @@ test("the session commits as Claude through its env, so nothing writes the clone
   });
 });
 
+const sessionEnvOf = async () => {
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  const env = query.calls[0]?.options.env;
+  if (!env) throw new Error("no session env");
+  return env;
+};
+
+test("a plain git status in the session never runs a core.fsmonitor the repo's config names", async () => {
+  vi.stubEnv("GIT_CONFIG_COUNT", undefined);
+  try {
+    const env = await sessionEnvOf();
+    const repo = mkdtempSync(join(tmpdir(), "runner-fsmonitor-"));
+    try {
+      const pwned = join(repo, "pwned");
+      execFileSync("git", ["init", "-q", repo]);
+      execFileSync("git", [
+        "-C",
+        repo,
+        "config",
+        "core.fsmonitor",
+        `touch ${pwned}; false`,
+      ]);
+      execFileSync("git", ["-C", repo, "status", "--short"], {
+        env: env as NodeJS.ProcessEnv,
+      });
+      expect(existsSync(pwned)).toBe(false);
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("the session's git config pairs go after any the project's env already sets, which stay", async () => {
+  vi.stubEnv("GIT_CONFIG_COUNT", "1");
+  vi.stubEnv("GIT_CONFIG_KEY_0", "user.signingkey");
+  vi.stubEnv("GIT_CONFIG_VALUE_0", "ABC");
+  try {
+    expect(await sessionEnvOf()).toMatchObject({
+      GIT_CONFIG_COUNT: "2",
+      GIT_CONFIG_KEY_0: "user.signingkey",
+      GIT_CONFIG_VALUE_0: "ABC",
+      GIT_CONFIG_KEY_1: "core.fsmonitor",
+      GIT_CONFIG_VALUE_1: "false",
+    });
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 test("the plugin's own store sync is off in the session, since the runner syncs the store under a lock", async () => {
   const query = scripted([init, success]);
   await runSession(config, {
@@ -679,10 +743,8 @@ test("with a GitHub connector in its env, the session is told to publish through
     expect(prompt).toMatchObject({ type: "preset", preset: "claude_code" });
     const append = (prompt as { append?: string }).append ?? "";
     expect(append).toContain(" publish --title <title>");
+    expect(append).toContain(`--body "$(cat <<'EOF'`);
     expect(append).toContain("instead of `git push` or `gh pr create`");
-    expect(append).toContain(
-      'env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"',
-    );
   } finally {
     vi.unstubAllEnvs();
   }
@@ -1063,6 +1125,113 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     "run.waiting",
     "run.finished",
   ]);
+});
+
+test("a read-only Bash command runs without an approval request even under a bare Bash policy", async () => {
+  const { sent, deps } = api();
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", {
+        ...gitPush,
+        tool_input: { command: "git status" },
+      });
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(code).toBe(0);
+  expect(answers).toEqual([{ continue: true }]);
+  expect(sent.map((e) => e.type)).not.toContain("run.waiting");
+});
+
+/**
+ * Fires one Bash PreToolUse per call under a bare `Bash` policy, approving whatever is held, and
+ * returns the commands that waited for approval and the runner's log lines.
+ */
+async function bareBashRun(
+  calls: (worktree: string) => { command: string; cwd?: string }[],
+  autoApprove = config.autoApprove,
+) {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const warned: string[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      for (const [i, { command, cwd }] of calls(options.cwd ?? "").entries())
+        await fire(options, "PreToolUse", {
+          tool_name: "Bash",
+          tool_input: { command },
+          tool_use_id: `t${i + 1}`,
+          ...(cwd !== undefined && { cwd }),
+        });
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"], autoApprove },
+    { ...deps, query, warn: (line) => warned.push(line) },
+  );
+  const held = sent.flatMap((e) =>
+    e.type === "run.waiting" && e.payload.request.kind === "approval"
+      ? [e.payload.request.toolSummary]
+      : [],
+  );
+  return { code, held, warned };
+}
+
+test("a relative path that leaves the worktree still asks under a bare Bash policy", async () => {
+  const { held } = await bareBashRun(() => [
+    { command: "cat ../x" },
+    { command: "cat README" },
+  ]);
+  expect(held).toEqual(["cat ../x"]);
+});
+
+test("relative paths resolve against the shell's cwd from the hook, not the worktree root", async () => {
+  const { held } = await bareBashRun((worktree) => [
+    // an earlier `cd` left the shell in the clone, outside the worktree
+    { command: "cat README", cwd: join(root, "repo") },
+    { command: "cat ../README", cwd: join(worktree, "sub") },
+  ]);
+  expect(held).toEqual(["cat README"]);
+});
+
+test("a symlink in the worktree that leads outside it still asks", async () => {
+  const { held } = await bareBashRun((worktree) => {
+    symlinkSync(join(root, "repo", "README"), join(worktree, "link"));
+    return [{ command: "cat link" }];
+  });
+  expect(held).toEqual(["cat link"]);
+});
+
+test("an auto-approved call is logged by its tool use id; held and unheld calls are not", async () => {
+  const { held, warned } = await bareBashRun(() => [
+    { command: "git status" },
+    { command: "git push origin main" },
+  ]);
+  expect(held).toEqual(["git push origin main"]);
+  expect(warned).toEqual([
+    "runner: auto-approved Bash call t1 without an approval request",
+  ]);
+});
+
+test("an auto-approve check that throws holds the call for approval", async () => {
+  const broken = {
+    defaults: true,
+    commands: 1,
+  } as unknown as Config["autoApprove"];
+  const { code, held, warned } = await bareBashRun(
+    () => [{ command: "git status" }],
+    broken,
+  );
+  expect(code).toBe(0);
+  expect(held).toEqual(["git status"]);
+  expect(warned).toEqual([]);
 });
 
 test("a long approval summary reaches run.waiting whole, for the API to redact before it trims", async () => {

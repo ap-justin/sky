@@ -166,6 +166,7 @@ test.each([
   ["PATH", 400, "reserved_name"],
   ["AGENT_TOKEN", 400, "reserved_name"],
   ["ENV_FILE", 400, "reserved_name"],
+  ["AUTO_APPROVE", 400, "reserved_name"],
   ["1BAD", 400, "invalid_name"],
   ["BAD-NAME", 400, "invalid_name"],
 ])("PUT of %s is %i %s and stores nothing", async (name, status, code) => {

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { realpathSync } from "node:fs";
 import type {
   CanUseTool,
   HookCallback,
@@ -24,7 +25,7 @@ import {
 } from "@sky/shared";
 import type { Config } from "./config.js";
 import { type PostEvent, RunEndedError } from "./events.js";
-import { matchesPolicy } from "./policy.js";
+import { policyOutcome } from "./policy.js";
 import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
 import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
@@ -50,6 +51,33 @@ const SESSION_GIT_IDENTITY = {
   GIT_COMMITTER_NAME: "Claude",
   GIT_COMMITTER_EMAIL: "noreply@anthropic.com",
 };
+
+/**
+ * Config the session's git commands take from the env, which outranks every config file. A
+ * worktree's `.git` is a file inside the worktree, so a write there can repoint it at a gitdir
+ * whose config runs a command on a plain `git status`; this pins that key off.
+ */
+const SESSION_GIT_CONFIG: [key: string, value: string][] = [
+  ["core.fsmonitor", "false"],
+];
+
+/** Appends `pairs` after the `GIT_CONFIG_KEY_n`/`VALUE_n` pairs `env` already holds, so those stay. */
+function withGitConfig(
+  env: NodeJS.ProcessEnv,
+  pairs: [key: string, value: string][],
+): NodeJS.ProcessEnv {
+  const held = Number(env.GIT_CONFIG_COUNT);
+  // git refuses a count that isn't a whole number, so no pair under one was ever in effect
+  const start = Number.isSafeInteger(held) && held > 0 ? held : 0;
+  const added: NodeJS.ProcessEnv = {
+    GIT_CONFIG_COUNT: String(start + pairs.length),
+  };
+  for (const [i, [key, value]] of pairs.entries()) {
+    added[`GIT_CONFIG_KEY_${start + i}`] = key;
+    added[`GIT_CONFIG_VALUE_${start + i}`] = value;
+  }
+  return { ...env, ...added };
+}
 
 /**
  * The runner syncs the Kru store itself, under a lock and through the connector; the plugin's own
@@ -78,7 +106,10 @@ function sessionOptions(
     cwd,
     resume: config.sessionId,
     abortController,
-    env: { ...env, ...SESSION_GIT_IDENTITY, ...KRU_PLUGIN_SYNC_OFF },
+    env: withGitConfig(
+      { ...env, ...SESSION_GIT_IDENTITY, ...KRU_PLUGIN_SYNC_OFF },
+      SESSION_GIT_CONFIG,
+    ),
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
@@ -283,6 +314,7 @@ export async function runSession(
   },
 ): Promise<0 | 1> {
   const { runId } = config;
+  const warn = deps.warn ?? warnStderr;
   // one queue keeps the API's order the order things happened, hooks included
   let queue = Promise.resolve();
   const post = (event: RunnerEvent, options?: Parameters<PostEvent>[1]) => {
@@ -407,10 +439,19 @@ export async function runSession(
     input: PreToolUseHookInput,
     signal: AbortSignal,
   ): Promise<SyncHookJSONOutput> => {
-    if (
-      !matchesPolicy(config.approvalPolicy, input.tool_name, input.tool_input)
-    )
-      return { continue: true };
+    const outcome = policyOutcome(
+      config.approvalPolicy,
+      config.autoApprove,
+      // the hook's cwd is the shell's, which an earlier `cd` may have moved off the worktree
+      { root: cwd, cwd: input.cwd, realpath: realpathSync.native },
+      input.tool_name,
+      input.tool_input,
+    );
+    if (outcome === "auto-approved")
+      warn(
+        `runner: auto-approved ${input.tool_name} call ${input.tool_use_id} without an approval request`,
+      );
+    if (outcome !== "hold") return { continue: true };
     const decision = await decide(
       {
         kind: "approval",
@@ -563,7 +604,7 @@ export async function runSession(
       if (since instanceof Error) throw since;
       return await diffRollup({ cwd, since });
     } catch (error) {
-      (deps.warn ?? warnStderr)(`runner: rollup skipped: ${messageOf(error)}`);
+      warn(`runner: rollup skipped: ${messageOf(error)}`);
       return undefined;
     }
   }

@@ -21,6 +21,7 @@ test("reads a run from env, defaulting the sprite paths", () => {
     repoDir: "/workspace/repo",
     worktreesDir: "/workspace/worktrees",
     approvalPolicy: [],
+    autoApprove: { defaults: true, commands: [] },
     waitTimeoutMs: 120 * 60_000,
   });
 });
@@ -37,7 +38,21 @@ test("reads the approval policy and the max wait", () => {
   });
 });
 
+test("reads the auto-approve overrides", () => {
+  const config = loadConfig({
+    ...env,
+    AUTO_APPROVE: '{"defaults":false,"commands":["make check"]}',
+  });
+  expect(config.autoApprove).toEqual({
+    defaults: false,
+    commands: ["make check"],
+  });
+});
+
 test.each([
+  ["AUTO_APPROVE", "not json"],
+  ["AUTO_APPROVE", '{"commands":["ls; rm x"]}'],
+  ["AUTO_APPROVE", '{"defaults":"no"}'],
   ["APPROVAL_POLICY", "not json"],
   ["APPROVAL_POLICY", '"Bash"'],
   ["APPROVAL_POLICY", '["WebFetch(https:*)"]'],
