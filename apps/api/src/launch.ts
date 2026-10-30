@@ -1,5 +1,3 @@
-import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
 import type { SpritesClient } from "@fly/sprites";
 import { type Db, environments, runs } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
@@ -7,14 +5,21 @@ import { and, eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";
 import {
+  envFile,
+  KRU_STORE_REPO,
   REPO_DIR,
-  RUNNER_DIR,
+  RUNNER,
   WITH_PACKAGE_MANAGERS,
   WORKTREES_DIR,
 } from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
+import type { BundleInstaller } from "./runner-bundle.js";
 import { failRun, isActive } from "./runs.js";
-import { openEnvSecrets, openRunEnvVars } from "./secrets.js";
+import {
+  hasConnectorSecret,
+  openEnvSecrets,
+  openRunEnvVars,
+} from "./secrets.js";
 import {
   execInSprite,
   spriteExists,
@@ -22,19 +27,10 @@ import {
   writeSpriteFile,
 } from "./sprites.js";
 
-const RUNNER = `${RUNNER_DIR}/runner.mjs`;
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
 // the run id in argv is what `runnerPattern` matches; the runner itself ignores it
 const RUNNER_COMMAND = `${WITH_PACKAGE_MANAGERS} && set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
-
-const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
-
-/** `export NAME='value'` lines for sh to source; later names override earlier ones. */
-const envFile = (vars: Iterable<[string, string]>) =>
-  [...vars]
-    .map(([name, value]) => `export ${name}=${shellQuote(value)}\n`)
-    .join("");
 
 /**
  * `pgrep -f`/`pkill -f` pattern matching only this run's runner, never its Claude child. Unanchored,
@@ -131,6 +127,7 @@ type Deps = {
   config: Config;
   secrets: KnownSecrets;
   sprites: SpritesClient;
+  ensureBundle: BundleInstaller;
   log: (line: string) => void;
   nudgeDeliveries: () => void;
   /** How long a launch stays attached to catch a runner that dies at start. */
@@ -157,48 +154,11 @@ export function createLauncher({
   config,
   secrets,
   sprites,
+  ensureBundle,
   log,
   nudgeDeliveries,
   watchMs,
 }: Deps) {
-  let bundle: Promise<{ bytes: Buffer; sha256: string }> | undefined;
-  // read once, again only after a failed read: the bundle ships with this build of the API
-  const loadBundle = () => {
-    bundle ??= readFile(config.runnerBundlePath).then((bytes) => ({
-      bytes,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-    }));
-    bundle.catch(() => {
-      bundle = undefined;
-    });
-    return bundle;
-  };
-
-  async function ensureBundle(spriteName: string, runId: RunId): Promise<void> {
-    const { bytes, sha256 } = await loadBundle();
-    const current = await execInSprite(sprites, spriteName, [
-      "sha256sum",
-      RUNNER,
-    ]);
-    const onSprite = current.exitCode === 0 ? current.stdout.split(" ")[0] : "";
-    if (onSprite === sha256) return;
-    // a rename is atomic, so a concurrent launch's node reads the old bundle or the new, never half
-    // of one; the temp path is per run, so two uploads never write the same file
-    const staged = `${RUNNER}.${runId}`;
-    await writeSpriteFile(sprites, spriteName, staged, bytes);
-    const moved = await execInSprite(sprites, spriteName, [
-      "mv",
-      "-f",
-      staged,
-      RUNNER,
-    ]);
-    if (moved.exitCode !== 0) {
-      throw new Error(
-        `installing the runner bundle failed: ${moved.stderr.trim()}`,
-      );
-    }
-  }
-
   async function run(launch: Launch, agentToken: string): Promise<void> {
     await ensureBundle(launch.spriteName, launch.runId);
     const promptFile = `/workspace/runs/${launch.runId}.prompt`;
@@ -237,6 +197,11 @@ export function createLauncher({
       envFile([
         ...envSecrets,
         ...envVars,
+        // after the secrets, so no secret points Kru at another store than the one the runner syncs;
+        // without the connector the runner has nothing to sync through
+        ...(hasConnectorSecret(db, launch.envId, "GITHUB_CONNECTOR")
+          ? [["KRU_STORE_REPO", KRU_STORE_REPO] as const]
+          : []),
         ["CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken],
         ["AGENT_TOKEN", agentToken],
       ]),
