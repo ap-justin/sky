@@ -25,13 +25,14 @@ export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
 
 /**
  * Runs `argv` in the sprite over the SDK's HTTP exec (no WebSocket, no TTY) and waits for it to
- * exit. A nonzero exit resolves with its outcome; only transport and API errors throw.
+ * exit. A nonzero exit resolves with its outcome; only transport and API errors throw, including a
+ * `timeout` (ms) running out. Without a `timeout`, nothing bounds the wait.
  */
 export async function execInSprite(
   client: SpritesClient,
   name: string,
   [file, ...args]: [string, ...string[]],
-  options: { cwd?: string } = {},
+  options: { cwd?: string; timeout?: number } = {},
 ): Promise<ExecOutcome> {
   try {
     const result = await client.sprite(name).execFileHTTP(file, args, options);

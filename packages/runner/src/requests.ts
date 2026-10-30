@@ -28,15 +28,19 @@ const transient = (status: number) =>
 
 /**
  * Long-polls the API for a decision. `pending` is asked again at once (the API holds
- * each poll open); a dropped connection or a transient status after `retryDelayMs`.
+ * each poll open); a dropped connection, a transient status, or a poll still unanswered at
+ * `pollTimeoutMs` is asked again after `retryDelayMs`. The timeout sits past the API's hold: a
+ * sprite pause can leave a poll's connection dead with nothing on this side to say so.
  */
 export function createDecisionWaiter(options: {
   apiBaseUrl: string;
   agentToken: string;
   runId: string;
   retryDelayMs?: number;
+  pollTimeoutMs?: number;
 }): AwaitDecision {
   const retryDelayMs = options.retryDelayMs ?? 1000;
+  const pollTimeoutMs = options.pollTimeoutMs ?? 60_000;
   return async (requestId, signal) => {
     const url = new URL(
       `/internal/runs/${options.runId}/requests/${requestId}`,
@@ -49,7 +53,7 @@ export function createDecisionWaiter(options: {
       try {
         const res = await fetch(url, {
           headers: { authorization: `Bearer ${options.agentToken}` },
-          signal,
+          signal: AbortSignal.any([signal, AbortSignal.timeout(pollTimeoutMs)]),
         });
         status = res.status;
         body = await res.json().catch(() => undefined);

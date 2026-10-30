@@ -52,3 +52,38 @@ test("rejects with the signal's reason once it aborts", async () => {
   controller.abort(new Error("deadline"));
   await expect(waiting).rejects.toThrow("deadline");
 });
+
+test("gives up on a poll the API never answers and asks again", async () => {
+  // a sprite pause can leave the poll's connection open on this side and gone on the API's
+  let calls = 0;
+  server.use(
+    http.get(url, async () => {
+      calls++;
+      if (calls === 1) await new Promise(() => {});
+      return HttpResponse.json({
+        status: "decided",
+        decision: { requestId: "req_1", decision: "approve" },
+      });
+    }),
+  );
+  const waitBounded = createDecisionWaiter({
+    apiBaseUrl: "https://api.test",
+    agentToken: "agent-secret",
+    runId: "run_1",
+    retryDelayMs: 0,
+    pollTimeoutMs: 50,
+  });
+  expect(await waitBounded("req_1", new AbortController().signal)).toEqual({
+    kind: "decided",
+    decision: { requestId: "req_1", decision: "approve" },
+  });
+  expect(calls).toBe(2);
+});
+
+test("a stop during a poll the API never answers rejects with its reason at once", async () => {
+  server.use(http.get(url, () => new Promise<never>(() => {})));
+  const controller = new AbortController();
+  const waiting = waitFor("req_1", controller.signal);
+  setTimeout(() => controller.abort(new Error("deadline")), 10);
+  await expect(waiting).rejects.toThrow("deadline");
+});
