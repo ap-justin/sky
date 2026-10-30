@@ -122,19 +122,33 @@ function fakeGitHub(options: { racing?: () => boolean } = {}) {
     }),
     http.post(`${REPO}/git/trees`, async ({ request }) => {
       const { tree, base_tree } = (await request.json()) as {
-        tree: { mode: string; sha: string; path: string }[];
+        tree: { mode: string; sha: string | null; path: string }[];
         base_tree?: string;
       };
-      expect(base_tree).toBeUndefined();
+      // the whole store's tree in one request is refused by GitHub, so only changes go up
+      expect(base_tree).toBeDefined();
       const index = join(root, "gh-index");
       const env = { GIT_INDEX_FILE: index };
       execFileSync("rm", ["-f", index]);
-      // -z takes each path literally, as GitHub does; without it git unquotes a C-quoted one
-      execFileSync("git", ["update-index", "-z", "--add", "--index-info"], {
-        cwd: remote,
-        env: { ...process.env, ...env },
-        input: tree.map((e) => `${e.mode} ${e.sha}\t${e.path}\0`).join(""),
-      });
+      gitIn(remote, env, "read-tree", String(base_tree));
+      for (const e of tree) {
+        if (e.sha === null) {
+          execFileSync("git", ["update-index", "--index-info"], {
+            cwd: remote,
+            env: { ...process.env, ...env },
+            input: `0 ${"0".repeat(40)}\t${e.path}\n`,
+          });
+        } else {
+          gitIn(
+            remote,
+            env,
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            `${e.mode},${e.sha},${e.path}`,
+          );
+        }
+      }
       return HttpResponse.json(
         { sha: gitIn(remote, env, "write-tree") },
         { status: 201 },

@@ -371,30 +371,47 @@ async function push(
   ) {
     return false;
   }
-  // -z: without it git C-quotes a path with non-ASCII or special characters
-  const listTree = async (rev: string) =>
-    nulSeparated(await gitBytes(home)(["ls-tree", "-r", "-z", rev])).map(
-      (entry) => {
-        const [meta, path] = splitOnce(entry, "\t");
-        const [mode = "", , sha = ""] = meta.split(" ");
-        return { mode, sha, path };
-      },
-    );
-  const onRemote = new Set(
-    (await listTree(SYNCED_REF)).map((entry) => entry.sha),
+  // only what changed since the remote's tree goes up, on top of it: a request carrying the whole
+  // store's tree (thousands of entries) is refused with a 502. -z: without it git C-quotes a path
+  // with non-ASCII or special characters
+  const raw = nulSeparated(
+    await gitBytes(home)([
+      "diff-tree",
+      "-r",
+      "-z",
+      "--raw",
+      "--no-renames",
+      SYNCED_REF,
+      head,
+    ]),
   );
-  const entries: Omit<TreeItem, "type">[] = await listTree(head);
-  for (const entry of entries) {
-    if (entry.mode !== "160000" && !onRemote.has(entry.sha)) {
-      await uploadBlob(call, home, entry.sha);
-      onRemote.add(entry.sha);
+  const changes: {
+    path: string;
+    mode: string;
+    type: string;
+    sha: string | null;
+  }[] = [];
+  // each change is `:<old mode> <new mode> <old sha> <new sha> <status>` then its path
+  for (let i = 0; i + 1 < raw.length; i += 2) {
+    const [, , newMode = "", , newSha = "", status = ""] = (raw[i] ?? "").split(
+      /[ :]/,
+    );
+    const deleted = status === "D";
+    changes.push({
+      path: raw[i + 1] ?? "",
+      mode: deleted ? "100644" : newMode,
+      type: newMode === "160000" ? "commit" : "blob",
+      sha: deleted ? null : newSha,
+    });
+  }
+  for (const change of changes) {
+    if (change.sha !== null && change.type === "blob") {
+      await uploadBlob(call, home, change.sha);
     }
   }
   const tree = await call<{ sha: string }>("POST", "/git/trees", {
-    tree: entries.map((e) => ({
-      ...e,
-      type: e.mode === "160000" ? "commit" : "blob",
-    })),
+    base_tree: await g(["rev-parse", `${SYNCED_REF}^{tree}`]),
+    tree: changes,
   });
   const identity = { name: "sky-agent", email: "agent@sky.local" };
   const commit = await call<{ sha: string }>("POST", "/git/commits", {
