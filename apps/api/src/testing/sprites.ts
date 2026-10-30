@@ -64,6 +64,14 @@ export function envFileOf(
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 
+// the live API's answer to a name outside its alphabet, which the SDK raises as a 400 APIError
+const VALID_NAME = /^[a-z0-9-]+$/;
+const invalidName = () =>
+  HttpResponse.json(
+    { errors: ["invalid sprite name format"] },
+    { status: 400 },
+  );
+
 /** In-memory Sprites API speaking the wire format @fly/sprites reads. */
 export function stubSprites() {
   const wire = {
@@ -130,6 +138,7 @@ export function stubSprites() {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const { name } = (await request.json()) as { name: string };
       wire.calls.push(`create ${name}`);
+      if (!VALID_NAME.test(name)) return invalidName();
       if (wire.createStatus !== 201) {
         return HttpResponse.json(
           { error: "sprite quota exceeded" },
@@ -290,6 +299,7 @@ export function stubSprites() {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const name = String(params.name);
       wire.calls.push(`get ${name}`);
+      if (!VALID_NAME.test(name)) return invalidName();
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }

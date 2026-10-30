@@ -7,6 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { type Db, environments, migrate, openDb } from "@sky/db";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
+import { spriteNameFor } from "./sprites.js";
 import {
   type SpritesWire,
   spritesToken,
@@ -91,11 +92,11 @@ test("an MCP client launches an agent then reads its run status through /v1", as
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `sky-${envId}`,
+      spriteName: spriteNameFor(envId),
       checkpointId: "v1",
     })
     .run();
-  wire.sprites.add(`sky-${envId}`);
+  wire.sprites.add(spriteNameFor(envId));
   const client = await connect();
 
   const launched = await client.callTool({

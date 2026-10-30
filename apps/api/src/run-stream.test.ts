@@ -6,6 +6,7 @@ import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
 import { runEvents } from "./run-events.js";
 import { failStaleRuns } from "./runs.js";
+import { spriteNameFor } from "./sprites.js";
 import {
   type SpritesWire,
   spritesToken,
@@ -50,11 +51,11 @@ function runningRun() {
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `sky-${envId}`,
+      spriteName: spriteNameFor(envId),
       checkpointId: "v1",
     })
     .run();
-  wire.sprites.add(`sky-${envId}`);
+  wire.sprites.add(spriteNameFor(envId));
   db.insert(agents)
     .values({
       id: agentId,

@@ -1,7 +1,12 @@
+import { createHash } from "node:crypto";
 import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
 
-/** The one sprite an environment owns. */
-export const spriteNameFor = (envId: string) => `sky-${envId}`;
+/**
+ * The one sprite an environment owns. Hashed because the API rejects names outside lowercase
+ * letters, digits and hyphens, and env ids carry uppercase and an underscore.
+ */
+export const spriteNameFor = (envId: string) =>
+  `sky-${createHash("sha256").update(envId).digest("hex").slice(0, 24)}`;
 
 /** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
 export async function ensureSprite(
