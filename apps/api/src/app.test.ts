@@ -1,3 +1,6 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@sky/db";
 import { afterEach, beforeEach, expect, test } from "vitest";
@@ -22,6 +25,31 @@ beforeEach(() => {
 });
 afterEach(() => {
   if (db.$client.open) db.$client.close();
+});
+
+test("GET /cli/sky.mjs serves the CLI bundle without a bearer", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "sky-cli-"));
+  const bundle = "#!/usr/bin/env node\nconsole.log('sky');\n";
+  writeFileSync(join(dir, "sky.mjs"), bundle);
+  const served = createApp({
+    db,
+    config: testConfig({ apiKey, cliBundlePath: join(dir, "sky.mjs") }),
+    sprites: new SpritesClient("unused"),
+    log: () => {},
+    nudgeDeliveries: () => {},
+  });
+  const res = await served.request("/cli/sky.mjs");
+  expect(res.status).toBe(200);
+  expect(res.headers.get("content-type")).toMatch(/^text\/javascript/);
+  expect(await res.text()).toBe(bundle);
+});
+
+test("GET /cli/sky.mjs is a 404 when the server has no bundle", async () => {
+  const res = await app.request("/cli/sky.mjs");
+  expect(res.status).toBe(404);
+  expect(await res.json()).toEqual({
+    error: { code: "not_found", message: expect.any(String) },
+  });
 });
 
 const unauthorized = {
