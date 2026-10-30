@@ -5,13 +5,14 @@ import {
   environments,
 } from "@harness/db";
 import type { EnvironmentId } from "@harness/shared";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { type KnownSecrets, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
 import {
   checkpointSprite,
   ensureSprite,
   execInSprite,
+  execLogged,
   spriteNameFor,
 } from "./sprites.js";
 
@@ -26,6 +27,9 @@ const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" 
 // ≤ the length CHECK on environments.failure_stderr in db/src/schema.ts
 const TAIL_CHARS = 4000;
 
+const INTERRUPTED =
+  "interrupted: the API restarted during this step; a retry provisions from the start";
+
 class StepFailed extends Error {}
 
 type Deps = {
@@ -38,34 +42,66 @@ type Target = { id: EnvironmentId; repo: string; setup: string };
 
 /**
  * Runs provisioning as in-process background jobs. A failure lands in `failure_step` and
- * `failure_stderr`: the failed command's stderr tail, or the Sprites error for create/checkpoint.
+ * `failure_stderr`: the failed command's output tail (stdout and stderr together), or the Sprites
+ * error for create/checkpoint.
  */
 export function createProvisioner({ db, secrets, sprites, log }: Deps) {
   async function run(env: Target): Promise<void> {
     const name = spriteNameFor(env.id);
-    const exec = async (argv: [string, ...string[]], cwd?: string) => {
-      const out = await execInSprite(sprites, name, argv, { cwd });
+    const exec = async (argv: [string, ...string[]]) => {
+      const out = await execInSprite(sprites, name, argv);
       if (out.exitCode !== 0) {
         throw new StepFailed(out.stderr || `exited with code ${out.exitCode}`);
       }
     };
+    // clone, install and setup print plenty, so their output stays in a log in the sprite
+    const execNoisy = async (
+      argv: [string, ...string[]],
+      log: string,
+      cwd?: string,
+    ) => {
+      const out = await execLogged(sprites, name, argv, {
+        cwd,
+        log,
+        tailBytes: TAIL_CHARS,
+      });
+      if (out.exitCode !== 0) {
+        throw new StepFailed(out.tail || `exited with code ${out.exitCode}`);
+      }
+    };
     let step: (typeof environmentFailureSteps)[number] = "create";
+    // the step in progress is stored as it starts, so a restart can name where it stopped
+    const begin = (next: typeof step) => {
+      step = next;
+      db.update(environments)
+        .set({ failureStep: next })
+        .where(eq(environments.id, env.id))
+        .run();
+    };
     try {
+      begin("create");
       await ensureSprite(sprites, name);
-      step = "clone";
+      begin("clone");
       await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR]);
-      await exec(["git", "clone", cloneUrl(env.repo), REPO_DIR]);
-      step = "setup";
-      await exec(["sh", "-c", installRunnerSdk]);
-      await exec(["bash", "-c", env.setup], REPO_DIR);
-      step = "checkpoint";
+      await execNoisy(
+        ["git", "clone", cloneUrl(env.repo), REPO_DIR],
+        "/tmp/harness-clone.log",
+      );
+      begin("setup");
+      await execNoisy(["sh", "-c", installRunnerSdk], "/tmp/harness-sdk.log");
+      await execNoisy(
+        ["bash", "-c", env.setup],
+        "/tmp/harness-setup.log",
+        REPO_DIR,
+      );
+      begin("checkpoint");
       const checkpointId = await checkpointSprite(
         sprites,
         name,
         "harness setup",
       );
       db.update(environments)
-        .set({ status: "ready", checkpointId })
+        .set({ status: "ready", checkpointId, failureStep: null })
         .where(eq(environments.id, env.id))
         .run();
     } catch (err) {
@@ -93,10 +129,17 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
 
 export type Provisioner = ReturnType<typeof createProvisioner>;
 
-/** Provisioning jobs die with the process; call at boot so none stays `provisioning` forever. */
+/**
+ * Provisioning jobs die with the process; call at boot so none stays `provisioning` forever. Each is
+ * failed at the step it was in, `create` when it never started one.
+ */
 export function failInterruptedProvisioning(db: Db): void {
   db.update(environments)
-    .set({ status: "failed" })
+    .set({
+      status: "failed",
+      failureStep: sql`coalesce(${environments.failureStep}, 'create')`,
+      failureStderr: INTERRUPTED,
+    })
     .where(eq(environments.status, "provisioning"))
     .run();
 }

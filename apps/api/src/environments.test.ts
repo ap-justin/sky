@@ -1,7 +1,9 @@
 import { readFileSync } from "node:fs";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@harness/db";
+import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import { failInterruptedProvisioning } from "./provision.js";
 import {
@@ -97,9 +99,9 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
   expect(wire.calls).toEqual([
     `create ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
-    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo`,
-    `exec ${sprite} - sh -c ${installRunnerSdk}`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/harness-clone.log`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/harness-sdk.log`,
+    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/harness-setup.log`,
     `checkpoint ${sprite}`,
   ]);
 });
@@ -139,7 +141,7 @@ test.each([
             }
           : { exitCode: 0 };
     },
-    stderr: "ERR_PNPM_NO_LOCKFILE\n",
+    stderr: "installing\nERR_PNPM_NO_LOCKFILE\n",
   },
   {
     step: "checkpoint",
@@ -183,6 +185,39 @@ test("a setup that fails with no stderr names its exit code", async () => {
   expect(await settled(id)).toMatchObject({
     failure: { step: "setup", stderr: "exited with code 2" },
   });
+});
+
+test("a setup whose large output arrives re-chunked still ends ready", async () => {
+  wire.execChunkBytes = 1024;
+  wire.exec = (argv) =>
+    argv[0] === "bash"
+      ? {
+          exitCode: 0,
+          stdout: "Progress: resolved 1, reused 1\n".repeat(20_000),
+        }
+      : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+});
+
+test("a failed setup's tail is the last 4000 bytes of its stdout and stderr, however its output arrives", async () => {
+  wire.execChunkBytes = 1024;
+  wire.exec = (argv) =>
+    argv[0] === "bash"
+      ? {
+          exitCode: 1,
+          stdout: `${"Progress: resolved 1\n".repeat(20_000)}ERR_PNPM_NO_LOCKFILE\n`,
+        }
+      : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  const { failure } = (await settled(id)) as {
+    failure: { step: string; stderr: string };
+  };
+  expect(failure.step).toBe("setup");
+  expect(failure.stderr).toHaveLength(4000);
+  expect(failure.stderr.endsWith("resolved 1\nERR_PNPM_NO_LOCKFILE\n")).toBe(
+    true,
+  );
 });
 
 test("a second POST with the same name gets 409 and never creates a second sprite", async () => {
@@ -356,9 +391,9 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
   const sprite = `harness-${id}`;
   expect(wire.calls).toEqual([
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
-    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo`,
-    `exec ${sprite} - sh -c ${installRunnerSdk}`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install --frozen-lockfile`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/harness-clone.log`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/harness-sdk.log`,
+    `exec ${sprite} /workspace/repo bash -c pnpm install --frozen-lockfile &> /tmp/harness-setup.log`,
     `checkpoint ${sprite}`,
   ]);
 });
@@ -371,7 +406,7 @@ test("PATCH that changes repo re-clones from the new remote", async () => {
     repo: "acme/kru-next",
   });
   expect(wire.calls).toContain(
-    `exec harness-${id} - git clone https://github.com/acme/kru-next.git /workspace/repo`,
+    `exec harness-${id} - git clone https://github.com/acme/kru-next.git /workspace/repo &> /tmp/harness-clone.log`,
   );
 });
 
@@ -606,9 +641,9 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
   const sprite = `harness-${id}`;
   expect(wire.calls).toEqual([
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
-    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo`,
-    `exec ${sprite} - sh -c ${installRunnerSdk}`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/harness-clone.log`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/harness-sdk.log`,
+    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/harness-setup.log`,
     `checkpoint ${sprite}`,
   ]);
 });
@@ -624,7 +659,46 @@ test("retry of a create failure recreates the sprite before cloning", async () =
   expect(wire.calls[0]).toBe(`create harness-${id}`);
 });
 
-/** A ready env whose provisioning a restart then interrupted, as boot records it: failed, no step. */
+test("an env a restart interrupts mid-setup is failed at that step, its detail saying so", async () => {
+  let reached = false;
+  let release = () => {};
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  server.use(
+    http.post(
+      "https://api.sprites.dev/v1/sprites/:name/exec",
+      async ({ request }) => {
+        if (!new URL(request.url).searchParams.getAll("cmd").includes("bash"))
+          return;
+        reached = true;
+        await held;
+        return HttpResponse.error();
+      },
+    ),
+  );
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  try {
+    await vi.waitFor(() => expect(reached).toBe(true));
+    expect((await get(id)).body).toMatchObject({
+      status: "provisioning",
+      failure: null,
+    });
+    // the boot of the next process
+    failInterruptedProvisioning(db);
+    expect((await get(id)).body).toMatchObject({
+      status: "failed",
+      failure: {
+        step: "setup",
+        stderr: expect.stringContaining("interrupted"),
+      },
+    });
+  } finally {
+    release();
+  }
+});
+
+/** A ready env whose provisioning a restart then interrupted before it began a step, as boot records it. */
 const interruptedAtBoot = async () => {
   const id = await ready();
   db.$client
@@ -633,7 +707,7 @@ const interruptedAtBoot = async () => {
   failInterruptedProvisioning(db);
   expect((await get(id)).body).toMatchObject({
     status: "failed",
-    failure: null,
+    failure: { step: "create", stderr: expect.stringContaining("interrupted") },
   });
   return id;
 };

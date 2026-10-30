@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { HttpResponse, http, ws } from "msw";
 import { server } from "../../../../test/msw.js";
 import type { Config } from "../config.js";
+import { LOGGED_EXEC } from "../sprites.js";
 
 export const spritesToken = "sprites-test-token";
 const SPRITES = "https://api.sprites.dev/v1/sprites";
@@ -74,7 +75,8 @@ export function stubSprites() {
     /** Every exec URL, HTTP or WebSocket, query included. */
     execUrls: [] as string[],
     /**
-     * One line per call, in order: `create <name>`, `exec <name> <dir> <argv…>`, `write <name> <path>`,
+     * One line per call, in order: `create <name>`, `exec <name> <dir> <argv…>` (`… &> <log>` for an
+     * `execLogged` wrapper, its inner argv shown), `write <name> <path>`,
      * `session <name> <dir> <argv…>`, `checkpoint <name>`, `delete <name>`.
      */
     calls: [] as string[],
@@ -106,6 +108,11 @@ export function stubSprites() {
      * SDK reads a TTY session's exit from its close code, 1000 as 0 and any other as 1.
      */
     sessionExit: undefined as { output: string; code: 0 | 1 } | undefined,
+    /**
+     * When set, HTTP exec frames are cut into pieces of this many bytes, each on its own tick, as an
+     * intermediary may re-chunk them; the SDK takes each read to start a frame, so this breaks it.
+     */
+    execChunkBytes: undefined as number | undefined,
     createStatus: 201,
     writeStatus: 200,
     checkpointLines: undefined as object[] | undefined,
@@ -140,20 +147,43 @@ export function stubSprites() {
       const url = new URL(request.url);
       wire.execUrls.push(url.href);
       const argv = url.searchParams.getAll("cmd");
+      // execLogged's wrapper: `sh -c <script> sh <log> <bytes> <argv…>`, run here as the shell would
+      const logged =
+        argv[0] === "sh" && argv[1] === "-c" && argv[2] === LOGGED_EXEC
+          ? { log: argv[4] ?? "", bytes: Number(argv[5]), argv: argv.slice(6) }
+          : undefined;
       wire.calls.push(
-        `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${argv.join(" ")}`,
+        `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${
+          logged ? `${logged.argv.join(" ")} &> ${logged.log}` : argv.join(" ")
+        }`,
       );
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
-      const outcome = wire.exec(argv);
       const enc = new TextEncoder();
+      let outcome = wire.exec(logged?.argv ?? argv);
+      if (logged) {
+        if (outcome.exitCode !== 0) {
+          const combined = enc.encode(
+            (outcome.stdout ?? "") + (outcome.stderr ?? ""),
+          );
+          wire.files.set(`${logged.log}.tail`, combined.slice(-logged.bytes));
+        }
+        outcome = { exitCode: outcome.exitCode };
+      }
       // one frame per chunk: a stream-id byte, then the payload; exit is [3, code]
       const frames = [
         ...(outcome.stdout ? [[1, ...enc.encode(outcome.stdout)]] : []),
         ...(outcome.stderr ? [[2, ...enc.encode(outcome.stderr)]] : []),
         [3, outcome.exitCode],
-      ];
+      ].flatMap((frame) => {
+        const size = wire.execChunkBytes ?? frame.length;
+        const pieces: number[][] = [];
+        for (let at = 0; at < frame.length; at += size) {
+          pieces.push(frame.slice(at, at + size));
+        }
+        return pieces;
+      });
       // the SDK splits frames on read boundaries, so each goes out on its own tick, as the
       // live server flushes them; enqueued together they coalesce into one read
       const body = new ReadableStream<Uint8Array>({
@@ -184,6 +214,20 @@ export function stubSprites() {
       }
       wire.files.set(path, new Uint8Array(await request.arrayBuffer()));
       return HttpResponse.json({ path, size: wire.files.get(path)?.length });
+    }),
+    http.get(`${SPRITES}/:name/fs/read`, ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const path = new URL(request.url).searchParams.get("path") ?? "";
+      const bytes = wire.files.get(path);
+      if (!wire.sprites.has(String(params.name)) || !bytes) {
+        return HttpResponse.json(
+          { error: "no such file", code: "ENOENT", path },
+          { status: 404 },
+        );
+      }
+      return new HttpResponse(bytes, {
+        headers: { "content-type": "application/octet-stream" },
+      });
     }),
     // the WebSocket upgrade's headers are out of MSW's reach, so this one can't check the bearer
     execLink.addEventListener("connection", ({ client, params }) => {

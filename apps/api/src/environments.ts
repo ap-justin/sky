@@ -51,8 +51,9 @@ const present = (row: EnvRow) => ({
     concurrency: row.concurrency,
     approvalPolicy: row.approvalPolicy,
   } satisfies Environment),
+  // while provisioning, failure_step holds the step in progress
   failure:
-    row.failureStep === null
+    row.status !== "failed" || row.failureStep === null
       ? null
       : { step: row.failureStep, stderr: row.failureStderr ?? "" },
   createdAt: row.createdAt,

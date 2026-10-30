@@ -43,6 +43,45 @@ const toOutcome = (r: ExecError["result"]): ExecOutcome => ({
   stderr: r.stderr.toString(),
 });
 
+// $1 the log, $2 the tail's byte count, the rest the argv; only a failure writes `<log>.tail`
+export const LOGGED_EXEC =
+  'log=$1; bytes=$2; shift 2; "$@" >"$log" 2>&1 || { rc=$?; tail -c "$bytes" "$log" >"$log.tail"; exit $rc; }';
+
+/**
+ * Runs `argv` like `execInSprite`, but with its stdout and stderr together in `log` in the sprite,
+ * so nothing but the exit frame crosses the HTTP exec: its frames carry no length, and output an
+ * intermediary re-chunks is misread or rejected. On a nonzero exit, `tail` is the log's last
+ * `tailBytes` bytes, read back over the filesystem API; empty when that read fails.
+ */
+export async function execLogged(
+  client: SpritesClient,
+  name: string,
+  argv: [string, ...string[]],
+  options: { cwd?: string; log: string; tailBytes: number },
+): Promise<{ exitCode: number; tail: string }> {
+  const { exitCode } = await execInSprite(
+    client,
+    name,
+    [
+      "sh",
+      "-c",
+      LOGGED_EXEC,
+      "sh",
+      options.log,
+      `${options.tailBytes}`,
+      ...argv,
+    ],
+    { cwd: options.cwd },
+  );
+  if (exitCode === 0) return { exitCode, tail: "" };
+  const tail = await client
+    .sprite(name)
+    .filesystem("/")
+    .readFile(`${options.log}.tail`, "utf8")
+    .catch(() => "");
+  return { exitCode, tail };
+}
+
 // the API names the new checkpoint only in the `complete` message's text
 const CREATED = /^Checkpoint (\S+) created/;
 
