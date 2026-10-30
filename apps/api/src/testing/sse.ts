@@ -2,6 +2,7 @@ export type Frame = {
   id?: string;
   event?: string;
   data?: string;
+  retry?: string;
   comment?: string;
 };
 
@@ -20,8 +21,8 @@ export function sseReader(res: Response) {
           const frame: Frame = {};
           for (const line of block.split("\n")) {
             if (line.startsWith(":")) frame.comment = line.slice(1).trim();
-            const m = /^(id|event|data): ?(.*)$/.exec(line);
-            if (m) frame[m[1] as "id" | "event" | "data"] = m[2];
+            const m = /^(id|event|data|retry): ?(.*)$/.exec(line);
+            if (m) frame[m[1] as "id" | "event" | "data" | "retry"] = m[2];
           }
           return frame;
         }

@@ -7,6 +7,7 @@ import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/
 import { type Db, environments, migrate, openDb } from "@sky/db";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
+import { anyRun, runEvents } from "./run-events.js";
 import { spriteNameFor } from "./sprites.js";
 import {
   type SpritesWire,
@@ -19,6 +20,7 @@ let dir: string;
 let db: Db;
 let app: ReturnType<typeof createApp>;
 let wire: SpritesWire;
+let closing: AbortController;
 const clients: Client[] = [];
 
 beforeEach(() => {
@@ -27,12 +29,14 @@ beforeEach(() => {
   db = openDb(":memory:");
   migrate(db);
   wire = stubSprites();
+  closing = new AbortController();
   app = createApp({
     db,
     config: testConfig({ runnerBundlePath: join(dir, "runner.mjs") }),
     sprites: new SpritesClient(spritesToken),
     log: () => {},
     nudgeDeliveries: () => {},
+    closing: closing.signal,
   });
 });
 afterEach(async () => {
@@ -114,4 +118,24 @@ test("an MCP client launches an agent then reads its run status through /v1", as
   });
   expect(status.isError).toBeFalsy();
   expect(textOf(status)).toMatchObject({ id: run.id, agentId: agent.id });
+});
+
+test("closing answers an in-flight wait_for_events with no events and a cursor", async () => {
+  const client = await connect();
+  // other listeners (a leaked one from another test) don't decide whether this call has parked
+  const baseline = runEvents.listenerCount(anyRun);
+  const pending = client.callTool({
+    name: "wait_for_events",
+    arguments: { wait: 30 },
+  });
+  await vi.waitFor(() =>
+    expect(runEvents.listenerCount(anyRun)).toBe(baseline + 1),
+  );
+  const started = Date.now();
+  closing.abort();
+  const result = await pending;
+  // the wait is 30 s, so only the shutdown can have ended it this fast
+  expect(Date.now() - started).toBeLessThan(2_000);
+  expect(result.isError).toBeFalsy();
+  expect(textOf(result)).toEqual({ events: [], cursor: "evt_0" });
 });
