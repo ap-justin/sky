@@ -16,6 +16,7 @@ import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { failStaleRuns } from "./runs.js";
+import { spriteNameFor } from "./sprites.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -69,12 +70,12 @@ function readyEnv(
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `sky-${id}`,
+      spriteName: spriteNameFor(id),
       checkpointId: "v1",
       ...overrides,
     })
     .run();
-  wire.sprites.add(`sky-${id}`);
+  wire.sprites.add(spriteNameFor(id));
   return id;
 }
 
@@ -136,7 +137,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   const envId = readyEnv();
   const { agent, run } = await launched(envId);
   await sessionOpened();
-  const sprite = `sky-${envId}`;
+  const sprite = spriteNameFor(envId);
   expect(wire.calls).toEqual([
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
     // written beside it, then renamed over it: a node starting on the bundle never reads it half-written
@@ -244,7 +245,7 @@ test("a runner session that fails to open fails the run and deletes the env file
     expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
   );
   expect(wire.calls).toContain(
-    `exec sky-${envId} - rm -f /workspace/runs/${run.id}.env`,
+    `exec ${spriteNameFor(envId)} - rm -f /workspace/runs/${run.id}.env`,
   );
 });
 
@@ -849,7 +850,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     secretNames: [],
   });
   expect(wire.calls.at(-1)).toBe(
-    `exec sky-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
+    `exec ${spriteNameFor(envId)} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
   );
 });
 
@@ -1030,7 +1031,7 @@ test("GET of an ended run whose branch never existed has a null diff", async () 
 
 test("GET while the sprite is unreachable gets 502", async () => {
   const { agent, run, envId } = await finishedRun();
-  wire.sprites.delete(`sky-${envId}`);
+  wire.sprites.delete(spriteNameFor(envId));
   const { status, body } = await getRun(agent.id, run.id);
   expect(status).toBe(502);
   expect(body).toMatchObject({ error: { code: "sprite_unreachable" } });
@@ -1305,7 +1306,7 @@ test("stop SIGTERMs the run's runner, marks the run stopped and frees its cap sl
     'exec node /opt/sky/runner.mjs "$RUN_ID"',
   );
   expect(wire.calls.at(-1)).toBe(
-    `exec sky-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+    `exec ${spriteNameFor(envId)} - pkill -TERM -f ${runnerPattern(run.id)}`,
   );
   expect(
     db.$client.prepare("select type from events order by id").all(),
@@ -1350,7 +1351,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   ).toEqual({ status: "idle" });
   // the wait is bounded on the sprite, to the same 30 s archive allows
   const wait = wire.calls.at(-1) ?? "";
-  expect(wait.startsWith(`exec sky-${envId} - bash -c `)).toBe(true);
+  expect(wait.startsWith(`exec ${spriteNameFor(envId)} - bash -c `)).toBe(true);
   expect(wait).toContain("seq 30");
 
   alive = false;
@@ -1362,7 +1363,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
 
 test("a follow-up whose wait for the previous runner can't reach the sprite gets 502 and starts nothing", async () => {
   const { agent, envId } = await finishedRun();
-  wire.sprites.delete(`sky-${envId}`);
+  wire.sprites.delete(spriteNameFor(envId));
   const res = await followUp(agent.id, { prompt: "again" });
   expect(res.status).toBe(502);
   expect(await res.json()).toMatchObject({
@@ -1389,7 +1390,7 @@ test("stopping an agent with no active run is a 200 no-op that never wakes the s
 
 test("a stop whose signal can't reach the sprite still stops the run, and logs it", async () => {
   const { agent, run, envId } = await runningRun();
-  wire.sprites.delete(`sky-${envId}`);
+  wire.sprites.delete(spriteNameFor(envId));
   const res = await action(agent.id, "stop");
   expect(res.status).toBe(200);
   expect(await res.json()).toMatchObject({ run: { status: "stopped" } });
@@ -1430,7 +1431,7 @@ test("stop or archive without a bearer gets 401 and touches nothing", async () =
 
 const worktreeRemoval = (envId: string, agentId: string) =>
   new RegExp(
-    `^exec sky-${envId} /workspace/repo bash -c .*git worktree remove --force "\\$1".* _ /workspace/worktrees/${agentId}`,
+    `^exec ${spriteNameFor(envId)} /workspace/repo bash -c .*git worktree remove --force "\\$1".* _ /workspace/worktrees/${agentId}`,
   );
 
 test("archive stops the active run, waits for its runner, then removes the worktree and keeps the branch", async () => {
@@ -1446,7 +1447,7 @@ test("archive stops the active run, waits for its runner, then removes the workt
   });
   const [signal, removal] = wire.calls.slice(-2);
   expect(signal).toBe(
-    `exec sky-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+    `exec ${spriteNameFor(envId)} - pkill -TERM -f ${runnerPattern(run.id)}`,
   );
   expect(removal).toMatch(worktreeRemoval(envId, agent.id));
   // the runner commits after SIGTERM, so removal waits until no process matches it
@@ -1510,7 +1511,7 @@ test.each([
   [
     "the sprite is unreachable",
     (w: SpritesWire, envId: string) => {
-      w.sprites.delete(`sky-${envId}`);
+      w.sprites.delete(spriteNameFor(envId));
     },
   ],
 ])("an archive where %s gets 502 and stays archived", async (_, breakIt) => {

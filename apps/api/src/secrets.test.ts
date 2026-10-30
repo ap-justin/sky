@@ -5,6 +5,7 @@ import { afterEach, beforeEach, expect, test } from "vitest";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
 import { runEnvVarAad, seal } from "./crypto.js";
+import { spriteNameFor } from "./sprites.js";
 import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
 
 const apiKey = "k".repeat(40);
@@ -41,7 +42,7 @@ function env(id = "env_secrets"): EnvironmentId {
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `sky-${id}`,
+      spriteName: spriteNameFor(id),
       checkpointId: "v1",
     })
     .run();

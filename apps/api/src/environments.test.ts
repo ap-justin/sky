@@ -6,6 +6,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import { failInterruptedProvisioning } from "./provision.js";
+import { spriteNameFor } from "./sprites.js";
 import {
   type SpritesWire,
   spritesToken,
@@ -79,7 +80,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     id: expect.stringMatching(/^env_[0-9A-Za-z]+$/),
     ...kru,
     status: "provisioning",
-    spriteName: `sky-${created.id}`,
+    spriteName: spriteNameFor(created.id),
     checkpointId: null,
     concurrency: 3,
     approvalPolicy: [],
@@ -95,7 +96,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     checkpointId: "v1",
     failure: null,
   });
-  const sprite = `sky-${created.id}`;
+  const sprite = spriteNameFor(created.id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `create ${sprite}`,
@@ -389,7 +390,7 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     status: "ready",
     checkpointId: "v2",
   });
-  const sprite = `sky-${id}`;
+  const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
@@ -408,7 +409,7 @@ test("PATCH that changes repo re-clones from the new remote", async () => {
     repo: "acme/kru-next",
   });
   expect(wire.calls).toContain(
-    `exec sky-${id} - git clone https://github.com/acme/kru-next.git /workspace/repo &> /tmp/sky-clone.log`,
+    `exec ${spriteNameFor(id)} - git clone https://github.com/acme/kru-next.git /workspace/repo &> /tmp/sky-clone.log`,
   );
 });
 
@@ -500,7 +501,7 @@ test("DELETE destroys the sprite, then the row and its agents' history", async (
   seedRun(id, "finished");
   const res = await del(id);
   expect(res.status).toBe(204);
-  expect(wire.calls).toEqual([`delete sky-${id}`]);
+  expect(wire.calls).toEqual([`delete ${spriteNameFor(id)}`]);
   expect(wire.sprites.size).toBe(0);
   expect((await get(id)).status).toBe(404);
   expect(db.$client.prepare("select count(*) as n from agents").get()).toEqual({
@@ -640,7 +641,7 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
     failure: null,
   });
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  const sprite = `sky-${id}`;
+  const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
@@ -659,7 +660,10 @@ test("retry of a create failure recreates the sprite before cloning", async () =
   wire.calls.length = 0;
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls.slice(0, 2)).toEqual([`get sky-${id}`, `create sky-${id}`]);
+  expect(wire.calls.slice(0, 2)).toEqual([
+    `get ${spriteNameFor(id)}`,
+    `create ${spriteNameFor(id)}`,
+  ]);
 });
 
 test("an env a restart interrupts mid-setup is failed at that step, its detail saying so", async () => {
@@ -717,10 +721,13 @@ const interruptedAtBoot = async () => {
 
 test("retry after a boot interruption creates the sprite it never got", async () => {
   const id = await interruptedAtBoot();
-  wire.sprites.delete(`sky-${id}`);
+  wire.sprites.delete(spriteNameFor(id));
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls.slice(0, 2)).toEqual([`get sky-${id}`, `create sky-${id}`]);
+  expect(wire.calls.slice(0, 2)).toEqual([
+    `get ${spriteNameFor(id)}`,
+    `create ${spriteNameFor(id)}`,
+  ]);
 });
 
 test("retry after a boot interruption keeps the sprite that exists", async () => {
