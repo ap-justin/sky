@@ -20,7 +20,7 @@ export interface Io {
   };
   sleep(ms: number): Promise<void>;
   now(): number;
-  /** Until the returned disarm runs, Ctrl-C prints `sky: <note>` on stderr before the process dies by SIGINT. */
+  /** From return until the returned disarm runs, Ctrl-C prints `sky: <note>` on stderr before the process dies by SIGINT; arm before printing anything that invites a Ctrl-C. */
   onInterrupt(note: string): () => void;
 }
 
