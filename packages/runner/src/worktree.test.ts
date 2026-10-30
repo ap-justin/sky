@@ -61,6 +61,23 @@ test("a later run reuses the worktree and what's in it", async () => {
   expect(existsSync(join(path, "wip.txt"))).toBe(true);
 });
 
+test("two agents on one clone get separate worktrees and branches, and a write in one is absent from the other", async () => {
+  const a = await ensureWorktree({ repoDir, worktreesDir, agentId: "agt_1" });
+  const b = await ensureWorktree({ repoDir, worktreesDir, agentId: "agt_2" });
+  expect(a).not.toBe(b);
+  expect(git(a, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_1");
+  expect(git(b, "rev-parse", "--abbrev-ref", "HEAD")).toBe("claude/agt_2");
+
+  writeFileSync(join(a, "only-a.txt"), "a\n");
+  await commitAll({ cwd: a, agentId: "agt_1", runId: "run_1" });
+
+  expect(existsSync(join(b, "only-a.txt"))).toBe(false);
+  expect(git(b, "rev-parse", "HEAD")).toBe(git(origin, "rev-parse", "trunk"));
+  expect(git(repoDir, "branch", "--list", "claude/agt_2")).toContain(
+    "claude/agt_2",
+  );
+});
+
 test("a branch whose worktree directory is gone is checked out again, keeping its commits", async () => {
   const path = await ensureWorktree({
     repoDir,

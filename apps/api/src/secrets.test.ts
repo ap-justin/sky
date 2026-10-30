@@ -11,6 +11,7 @@ import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
+import { runEnvVarAad, seal } from "./crypto.js";
 import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
 
 const apiKey = "k".repeat(40);
@@ -253,4 +254,81 @@ test("a value stored before the app started is redacted too", async () => {
   const post = runOn(envId);
   expect((await post(newApp(), `leaked ${opaque}`)).status).toBeLessThan(300);
   expect(storedEvents()).toContain("leaked [redacted]");
+});
+
+const copySealed = (
+  fromEnv: string,
+  fromName: string,
+  toEnv: string,
+  toName: string,
+) =>
+  db.$client
+    .prepare(
+      `insert into secrets (env_id, name, kind, ciphertext, nonce, key_version)
+       select ?, ?, kind, ciphertext, nonce, key_version from secrets where env_id = ? and name = ?`,
+    )
+    .run(toEnv, toName, fromEnv, fromName);
+
+test.each([
+  ["another env", "env_two", "TOKEN"],
+  ["another name", "env_one", "OTHER"],
+])(
+  "a secret's ciphertext copied onto %s refuses to open when the app boots",
+  async (_label, toEnv, toName) => {
+    const one = env("env_one");
+    env("env_two");
+    await put(one, "TOKEN", { value: opaque });
+    expect(() => newApp()).not.toThrow();
+
+    copySealed(one, "TOKEN", toEnv, toName);
+
+    expect(() => newApp()).toThrow();
+  },
+);
+
+test("a run envVar's ciphertext copied onto another run or name refuses to open when the app boots", () => {
+  const { agentId } = (() => {
+    const envId = env();
+    const agentId = "agt_vars" as AgentId;
+    db.insert(agents)
+      .values({
+        id: agentId,
+        envId,
+        branch: "claude/agt_vars",
+        status: "running",
+      })
+      .run();
+    return { agentId };
+  })();
+  for (const id of ["run_one", "run_two"]) {
+    db.insert(runs)
+      .values({ id: id as RunId, agentId, status: "running" })
+      .run();
+  }
+  const insert = db.$client.prepare(
+    "insert into run_env_vars (run_id, name, ciphertext, nonce, key_version, expires_at) values (?, ?, ?, ?, ?, '2099-01-01T00:00:00.000Z')",
+  );
+  const sealed = seal(
+    config.secretEncryptionKey,
+    opaque,
+    runEnvVarAad("run_one", "VAR"),
+  );
+  insert.run(
+    "run_one",
+    "VAR",
+    sealed.ciphertext,
+    sealed.nonce,
+    sealed.keyVersion,
+  );
+  expect(() => newApp()).not.toThrow();
+
+  insert.run(
+    "run_two",
+    "VAR",
+    sealed.ciphertext,
+    sealed.nonce,
+    sealed.keyVersion,
+  );
+
+  expect(() => newApp()).toThrow();
 });

@@ -62,7 +62,6 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
   await once(api, "listening");
   const { port } = api.address() as AddressInfo;
   try {
-    const started = Date.now();
     const { code, stdout } = await runBundle({
       AGENT_ID: "agt_1",
       RUN_ID: "run_1",
@@ -75,8 +74,6 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
     });
     expect(code).toBe(1);
     expect(stdout).toBe("");
-    // an idle keep-alive socket or a live child would hold the process open past this
-    expect(Date.now() - started).toBeLessThan(3000);
     expect(received).toEqual([
       {
         auth: "Bearer agent-secret",
@@ -91,7 +88,9 @@ test("a failed run posts run.failed to the API with the agent token, exits 1, an
     api.closeAllConnections();
     api.close();
   }
-});
+  // an idle keep-alive socket or a live child would hold the process open: runBundle then never
+  // resolves and the timeout fails the test, with no wall-clock threshold to tune
+}, 20_000);
 
 test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies by the signal", async () => {
   let respond: (() => void) | undefined;

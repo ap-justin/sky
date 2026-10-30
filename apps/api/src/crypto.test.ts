@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { expect, test } from "vitest";
-import { open, seal } from "./crypto.js";
+import { envSecretAad, open, runEnvVarAad, seal } from "./crypto.js";
 
 const key = randomBytes(32);
 
@@ -25,4 +25,16 @@ test("a value moved to another row, or opened under another key, is refused", ()
   const sealed = seal(key, "value", "env:env_1:A");
   expect(() => open(key, sealed, "env:env_2:A")).toThrow();
   expect(() => open(randomBytes(32), sealed, "env:env_1:A")).toThrow();
+});
+
+test("the AAD names the row: env secrets by env and name, run envVars by run and name", () => {
+  expect(envSecretAad("env_1", "TOKEN")).toBe("env:env_1:TOKEN");
+  expect(runEnvVarAad("run_1", "TOKEN")).toBe("run:run_1:TOKEN");
+  const aads = [
+    envSecretAad("env_1", "A"),
+    envSecretAad("env_2", "A"),
+    envSecretAad("env_1", "B"),
+    runEnvVarAad("env_1", "A"),
+  ];
+  expect(new Set(aads).size).toBe(aads.length);
 });

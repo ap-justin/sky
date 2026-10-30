@@ -9,7 +9,7 @@ import {
 } from "@harness/db";
 import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
 import { HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
@@ -46,6 +46,7 @@ beforeEach(() => {
   });
 });
 afterEach(async () => {
+  vi.useRealTimers();
   await dispatcher.stop();
   if (db.$client.open) db.$client.close();
 });
@@ -300,26 +301,41 @@ const poll = (requestId: string, bearer = token, signal?: AbortSignal) =>
     signal,
   });
 
-test("the long-poll answers pending once its wait runs out", async () => {
+// only the poll's own timers are faked, so the wait is exact and a decision's wake-up is the only way out early
+const settled = (p: unknown) => {
+  let done = false;
+  void Promise.resolve(p).then(() => {
+    done = true;
+  });
+  return () => done;
+};
+
+test("the long-poll answers pending once its wait runs out, and not before", async () => {
   const { requestId } = await waitingOn(question());
-  const started = Date.now();
-  const res = await poll(requestId);
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const pending = poll(requestId);
+  const isSettled = settled(pending);
+  await vi.advanceTimersByTimeAsync(199);
+  expect(isSettled()).toBe(false);
+  await vi.advanceTimersByTimeAsync(1);
+  const res = await pending;
   expect(res.status).toBe(200);
   expect(await res.json()).toEqual({ status: "pending" });
-  expect(Date.now() - started).toBeGreaterThanOrEqual(190);
 });
 
-test("the long-poll returns the decision as soon as it lands", async () => {
+test("the long-poll returns the decision as soon as it lands, without its wait running out", async () => {
   const { requestId } = await waitingOn(question());
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
   const pending = poll(requestId);
-  // a wait well inside the 200ms poll: the poll is parked when the answer lands
-  await new Promise((r) => setTimeout(r, 20));
-  const started = Date.now();
+  const isSettled = settled(pending);
+  // inside the 200 ms wait: the poll is parked when the answer lands
+  await vi.advanceTimersByTimeAsync(20);
+  expect(isSettled()).toBe(false);
   expect((await decide("answers", { requestId, answer: "main" })).status).toBe(
     200,
   );
+  // the clock never reaches 200 ms, so only the decision can have woken it
   const res = await pending;
-  expect(Date.now() - started).toBeLessThan(150);
   expect(await res.json()).toEqual({
     status: "decided",
     decision: { requestId, decision: "answer", answer: "main" },
@@ -348,6 +364,15 @@ test("the long-poll takes only the run's own agent token", async () => {
   expect(other.status).toBe(401);
   const apiKey = await poll(requestId, config.apiKey);
   expect(apiKey.status).toBe(401);
+});
+
+test("an agent token minted under another API key is refused for the run", async () => {
+  const { requestId } = await waitingOn(question());
+  const rotated = await poll(
+    requestId,
+    mintAgentToken("other-key".repeat(5), runId),
+  );
+  expect(rotated.status).toBe(401);
 });
 
 test("the long-poll for a request not on the run gets 404", async () => {

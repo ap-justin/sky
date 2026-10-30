@@ -261,6 +261,41 @@ test("a subscriber answering 500, 500, 200 gets three signed attempts of one eve
   }
 });
 
+test("each attempt is signed with its own clock second, so a retry after 300 s still verifies", async () => {
+  await subscribe(["run.finished"]);
+  const sentAt: number[] = [];
+  const received: Received[] = [];
+  const statuses = [500, 500, 500, 500, 500, 200];
+  server.use(
+    http.post(subscriberUrl, async ({ request }) => {
+      sentAt.push(Math.floor(clock.getTime() / 1000));
+      received.push({ headers: request.headers, body: await request.text() });
+      return new HttpResponse(null, { status: statuses.shift() ?? 599 });
+    }),
+  );
+  const { runId, token } = runningRun();
+  await postEvent(token, {
+    runId,
+    type: "run.finished",
+    payload: { summary: "done", usage },
+  });
+
+  // 10, 20, 40, 80, 160 s backoffs: the sixth attempt lands 310 s after the first
+  await dispatcher.drain();
+  for (const wait of [10_000, 20_000, 40_000, 80_000, 160_000]) {
+    advance(wait);
+    await dispatcher.drain();
+  }
+
+  expect(received).toHaveLength(6);
+  expect(sentAt.at(-1)).toBeGreaterThan((sentAt[0] ?? 0) + 300);
+  for (const [i, { headers, body }] of received.entries()) {
+    const signature = headers.get("harness-signature") ?? "";
+    expect(signature.split(",")[0]).toBe(`t=${sentAt[i]}`);
+    expect(await verify(signature, body, sentAt[i] ?? 0)).toBe(true);
+  }
+});
+
 test("each matching subscription gets its own delivery of the event", async () => {
   await subscribe(["run.finished"]);
   await subscribe(["run.progress", "run.finished"], "https://b.example.com/h");
