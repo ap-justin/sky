@@ -1,6 +1,7 @@
 {
   "name": "@harness/mcp",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"

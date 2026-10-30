@@ -1,6 +1,7 @@
 {
   "name": "@harness/runner",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "scripts": {
     "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --external:@anthropic-ai/claude-agent-sdk --outfile=dist/bundle/runner.mjs"

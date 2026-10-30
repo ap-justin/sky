@@ -1,6 +1,7 @@
 {
   "name": "@harness/api",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "exports": {
     ".": "./src/index.ts"
