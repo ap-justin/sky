@@ -1,4 +1,11 @@
-import { agents, type Db, events, runRequests, runs } from "@sky/db";
+import {
+  agents,
+  type Db,
+  events,
+  runRequests,
+  runs,
+  webhookDeliveries,
+} from "@sky/db";
 import {
   type AgentId,
   type AgentStatus,
@@ -213,6 +220,35 @@ export function failAbandonedWaits(
         .map((r) => r.id);
       for (const id of abandoned) failRun(tx, id, "waiting_timeout");
       return abandoned;
+    },
+    { behavior: "immediate" },
+  );
+}
+
+const CLAUDE_EVENT_TTL_MS = 7 * 86_400_000;
+
+/**
+ * Deletes `claude.*` events older than 7 days and their webhook deliveries; `run.*` events are kept.
+ * Returns how many events it deleted.
+ */
+export function pruneClaudeEvents(db: Db, now = Date.now()) {
+  const cutoff = new Date(now - CLAUDE_EVENT_TTL_MS).toISOString();
+  // the literal pattern, not LIKE or a bound parameter: only then does the planner use events_claude_ts
+  const expired = and(
+    sql`${events.type} glob 'claude.*'`,
+    lt(events.ts, cutoff),
+  );
+  return db.transaction(
+    (tx) => {
+      tx.delete(webhookDeliveries)
+        .where(
+          inArray(
+            webhookDeliveries.eventId,
+            tx.select({ id: events.id }).from(events).where(expired),
+          ),
+        )
+        .run();
+      return tx.delete(events).where(expired).run().changes;
     },
     { behavior: "immediate" },
   );

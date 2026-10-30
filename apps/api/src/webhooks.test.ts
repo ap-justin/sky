@@ -51,7 +51,7 @@ test("POST creates a subscription: 201, its Location and the webhook", async () 
 test("GET lists subscriptions in creation order and GET /:id reads one", async () => {
   const a = (await (await subscribe(hook)).json()) as { id: string };
   const b = (await (
-    await subscribe({ ...hook, eventTypes: ["run.progress"] })
+    await subscribe({ ...hook, eventTypes: ["claude.PostToolUse"] })
   ).json()) as { id: string };
 
   const list = await app.request("/v1/webhooks", { headers: auth });
@@ -106,8 +106,8 @@ test.each([
 
 test.each([
   ["a loopback host", "https://127.0.0.1/hook"],
-  ["localhost", "http://localhost:3000/hook"],
-  ["cloud metadata", "http://169.254.169.254/latest"],
+  ["localhost", "https://localhost:3000/hook"],
+  ["cloud metadata", "https://169.254.169.254/latest"],
   ["an IPv6 unique-local host", "https://[fd00::1]/hook"],
 ])(
   "a URL naming %s is 400 url_not_allowed and stores nothing",
@@ -127,6 +127,7 @@ test.each([
 
 test.each([
   ["a non-http URL", { ...hook, url: "file:///etc/passwd" }],
+  ["a plain-http URL", { ...hook, url: "http://hooks.example.com/sky" }],
   ["an unknown event type", { ...hook, eventTypes: ["run.exploded"] }],
   ["no event types", { ...hook, eventTypes: [] }],
   ["an unknown field", { ...hook, secret: "x" }],

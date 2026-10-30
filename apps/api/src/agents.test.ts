@@ -3,7 +3,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, environments, migrate, openDb, runs } from "@sky/db";
-import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
+import {
+  type AgentId,
+  type EnvironmentId,
+  EVENT_TEXT_MAX,
+  type RunId,
+  truncationMarker,
+} from "@sky/shared";
 import { ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -462,12 +468,12 @@ test("events from the run's own token advance it: started stores the session, fi
     db.$client.prepare("select session_id, status from agents").get(),
   ).toEqual({ session_id: "sess-1", status: "running" });
 
-  const progress = await postEvent(token, {
+  const message = await postEvent(token, {
     runId: run.id,
-    type: "run.progress",
-    payload: { message: "reading the test", tool: "Read" },
+    type: "claude.Message",
+    payload: { text: "reading the test" },
   });
-  expect(progress.status).toBe(201);
+  expect(message.status).toBe(201);
   expect(
     (
       await postEvent(token, {
@@ -482,7 +488,7 @@ test("events from the run's own token advance it: started stores the session, fi
     db.$client.prepare("select type from events order by id").all(),
   ).toEqual([
     { type: "run.started" },
-    { type: "run.progress" },
+    { type: "claude.Message" },
     { type: "run.finished" },
   ]);
   expect(db.$client.prepare("select status from agents").get()).toEqual({
@@ -495,6 +501,104 @@ test("events from the run's own token advance it: started stores the session, fi
     usage,
     error: null,
   });
+});
+
+const tool = { toolName: "Bash", toolUseId: "tu_1", input: '{"command":"ls"}' };
+const task = { taskId: "t1", taskSubject: "write the test" };
+
+test.each([
+  ["claude.PreToolUse", tool],
+  ["claude.PostToolUse", { ...tool, output: "a.ts", durationMs: 12 }],
+  ["claude.PostToolUseFailure", { ...tool, error: "exit 1" }],
+  ["claude.SubagentStart", { subagentId: "sa_1", agentType: "Explore" }],
+  ["claude.SubagentStop", { subagentId: "sa_1", agentType: "Explore" }],
+  ["claude.TaskCreated", task],
+  ["claude.TaskCompleted", task],
+  ["claude.Notification", { message: "idle", notificationType: "idle_prompt" }],
+  ["claude.PreCompact", { trigger: "auto", customInstructions: null }],
+  ["claude.FileChanged", { filePath: "src/a.ts", event: "change" }],
+  ["claude.Message", { text: "done reading" }],
+])(
+  "%s is stored as posted and leaves the run running",
+  async (type, payload) => {
+    const { agent, run, token } = await runningRun();
+    await postEvent(token, {
+      runId: run.id,
+      type: "run.started",
+      payload: { sessionId: "s" },
+    });
+    const res = await postEvent(token, { runId: run.id, type, payload });
+    expect(res.status).toBe(201);
+    const row = db.$client
+      .prepare("select payload from events where type = ?")
+      .get(type) as { payload: string };
+    expect(JSON.parse(row.payload)).toEqual(payload);
+    expect((await getRun(agent.id, run.id)).body.status).toBe("running");
+  },
+);
+
+const startedRun = async () => {
+  const ids = await runningRun();
+  await postEvent(ids.token, {
+    runId: ids.run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  return ids;
+};
+
+const storedOutput = () =>
+  (
+    JSON.parse(
+      (
+        db.$client
+          .prepare(
+            "select payload from events where type = 'claude.PostToolUse'",
+          )
+          .get() as { payload: string }
+      ).payload,
+    ) as { output: string }
+  ).output;
+
+test("a 10 KB tool output is stored trimmed to EVENT_TEXT_MAX with the truncation marker", async () => {
+  const { run, token } = await startedRun();
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "claude.PostToolUse",
+    payload: { ...tool, output: "a".repeat(10_240) },
+  });
+  expect(res.status).toBe(201);
+  expect(storedOutput()).toBe(
+    "a".repeat(EVENT_TEXT_MAX) + truncationMarker(10_240 - EVENT_TEXT_MAX),
+  );
+});
+
+test("a registered secret straddling the trim point is redacted whole, never stored in part", async () => {
+  const { run, token } = await startedRun();
+  const secret = config.webhookSigningKey;
+  const at = EVENT_TEXT_MAX - 16;
+  const output = `${"a".repeat(at)}${secret}`.padEnd(10_240, "b");
+  await postEvent(token, {
+    runId: run.id,
+    type: "claude.PostToolUse",
+    payload: { ...tool, output },
+  });
+  const stored = storedOutput();
+  expect(stored).not.toContain(secret.slice(0, 8));
+  expect(stored.slice(at, at + "[redacted]".length)).toBe("[redacted]");
+});
+
+test("a run.progress post is rejected 400 and stores nothing", async () => {
+  const { run, token } = await startedRun();
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.progress",
+    payload: { message: "working" },
+  });
+  expect(res.status).toBe(400);
+  expect(db.$client.prepare("select type from events").all()).toEqual([
+    { type: "run.started" },
+  ]);
 });
 
 test("a failed event records its error and frees the agent", async () => {
@@ -540,8 +644,8 @@ test("an ended run's token gets 401", async () => {
   });
   const res = await postEvent(token, {
     runId: run.id,
-    type: "run.progress",
-    payload: { message: "late" },
+    type: "claude.Message",
+    payload: { text: "late" },
   });
   expect(res.status).toBe(401);
   expect(await res.json()).toMatchObject({ error: { code: "run_ended" } });
@@ -598,9 +702,9 @@ test("secrets a runner echoes are redacted before the event is stored", async ()
   });
   await postEvent(token, {
     runId: run.id,
-    type: "run.progress",
+    type: "claude.Message",
     payload: {
-      message: `env: AGENT_TOKEN=${token} CLAUDE_CODE_OAUTH_TOKEN=${config.claudeOauthToken}`,
+      text: `env: AGENT_TOKEN=${token} CLAUDE_CODE_OAUTH_TOKEN=${config.claudeOauthToken}`,
     },
   });
   const stored = JSON.stringify(
@@ -804,7 +908,7 @@ test("after runs with planted secrets, no stored event, run or agent row holds a
         },
       },
     ],
-    [b, { type: "run.progress", payload: { message: whileBothLive } }],
+    [b, { type: "claude.Message", payload: { text: whileBothLive } }],
     [b, { type: "run.finished", payload: { summary: whileBothLive, usage } }],
     [
       a,
@@ -970,8 +1074,8 @@ test("a run silent past the timeout is failed with runner_timeout, freeing its c
     (
       await postEvent(token, {
         runId: run.id,
-        type: "run.progress",
-        payload: { message: "late" },
+        type: "claude.Message",
+        payload: { text: "late" },
       })
     ).status,
   ).toBe(401);
@@ -1541,8 +1645,8 @@ test("an envVar a runner echoes is redacted from the stored event while it is he
   const token = envFileOf(wire, wire.sessions[0]).AGENT_TOKEN ?? "";
   await postEvent(token, {
     runId: run.id,
-    type: "run.progress",
-    payload: { message: `echo ${envVarValue}` },
+    type: "claude.Message",
+    payload: { text: `echo ${envVarValue}` },
   });
   const stored = JSON.stringify(
     db.$client.prepare("select * from events").all(),

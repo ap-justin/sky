@@ -79,8 +79,8 @@ async function post(runId: RunId, type: string, payload: object) {
   return ((await res.json()) as { id: number }).id;
 }
 
-const progress = (runId: RunId, message: string) =>
-  post(runId, "run.progress", { message });
+const say = (runId: RunId, message: string) =>
+  post(runId, "claude.Message", { text: message });
 
 type Frame = { id?: string; event?: string; data?: string; comment?: string };
 
@@ -141,7 +141,7 @@ test("a reconnect with Last-Event-ID continues at the next event with no gap or 
   const { agentId, runId } = runningRun();
   const ids = [];
   for (const m of ["one", "two", "three", "four", "five"]) {
-    ids.push(await progress(runId, m));
+    ids.push(await say(runId, m));
   }
   const first = await stream(agentId, runId);
   expect(first.status).toBe(200);
@@ -159,7 +159,7 @@ test("a reconnect with Last-Event-ID continues at the next event with no gap or 
   const fourth = await b.event();
   expect(fourth).toEqual({
     id: String(ids[3]),
-    event: "run.progress",
+    event: "claude.Message",
     data: expect.any(String),
   });
   expect(JSON.parse(fourth?.data ?? "")).toEqual({
@@ -167,18 +167,18 @@ test("a reconnect with Last-Event-ID continues at the next event with no gap or 
     agentId,
     runId,
     ts: expect.any(String),
-    type: "run.progress",
-    payload: { message: "four" },
+    type: "claude.Message",
+    payload: { text: "four" },
   });
   expect((await b.event())?.id).toBe(String(ids[4]));
-  const live = await progress(runId, "six");
+  const live = await say(runId, "six");
   expect((await b.event())?.id).toBe(String(live));
   await b.cancel();
 });
 
 test("a client disconnect releases its listener", async () => {
   const { agentId, runId } = runningRun();
-  await progress(runId, "one");
+  await say(runId, "one");
   const s = sseReader(await stream(agentId, runId));
   await s.event();
   expect(runEvents.listenerCount(runId)).toBe(1);
@@ -204,7 +204,7 @@ test("the stream closes after the run's terminal event and lets go of its listen
   const { agentId, runId } = runningRun();
   const s = sseReader(await stream(agentId, runId));
   await until(() => runEvents.listenerCount(runId) === 1);
-  await progress(runId, "working");
+  await say(runId, "working");
   await post(runId, "run.finished", {
     summary: "done",
     usage: {
@@ -216,7 +216,7 @@ test("the stream closes after the run's terminal event and lets go of its listen
     },
   });
   expect((await rest(s)).map((f) => f.event)).toEqual([
-    "run.progress",
+    "claude.Message",
     "run.finished",
   ]);
   expect(runEvents.listenerCount(runId)).toBe(0);
@@ -224,12 +224,12 @@ test("the stream closes after the run's terminal event and lets go of its listen
 
 test("an ended run's stream replays from the cursor and closes", async () => {
   const { agentId, runId } = runningRun();
-  const first = await progress(runId, "one");
-  await progress(runId, "two");
+  const first = await say(runId, "one");
+  await say(runId, "two");
   const failed = await post(runId, "run.failed", { error: "boom" });
   const s = sseReader(await stream(agentId, runId, {}, `?after=${first}`));
   expect((await rest(s)).map((f) => f.event)).toEqual([
-    "run.progress",
+    "claude.Message",
     "run.failed",
   ]);
   const past = sseReader(
@@ -240,9 +240,9 @@ test("an ended run's stream replays from the cursor and closes", async () => {
 
 test("Last-Event-ID wins over a stale ?after= from the original URL", async () => {
   const { agentId, runId } = runningRun();
-  const one = await progress(runId, "one");
-  const two = await progress(runId, "two");
-  const three = await progress(runId, "three");
+  const one = await say(runId, "one");
+  const two = await say(runId, "two");
+  const three = await say(runId, "three");
   const s = sseReader(
     await stream(
       agentId,

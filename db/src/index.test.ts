@@ -142,6 +142,17 @@ test("status and type columns accept exactly the shared enums", () => {
   );
 });
 
+test("events take claude.* hook types and run.resumed, and reject the retired run.progress", () => {
+  migrate(db);
+  seedRun();
+  expect(insertEvent("claude.PostToolUse")).toBeGreaterThan(0);
+  expect(insertEvent("run.resumed")).toBeGreaterThan(0);
+  expect(() => insertEvent("run.progress")).toThrow(/CHECK constraint failed/);
+  expect(() => insertEvent("claude.CwdChanged")).toThrow(
+    /CHECK constraint failed/,
+  );
+});
+
 test("foreign keys are enforced after migrate", () => {
   migrate(db);
   expect(() =>
@@ -734,4 +745,51 @@ test("a run's secret_names audit round-trips through drizzle and is null on migr
     .run();
   const [after] = db.select().from(runs).all();
   expect(after?.secretNames).toEqual(["GITHUB_TOKEN", "API_KEY"]);
+});
+
+const planOf = (stmt: string, ...params: unknown[]) =>
+  (
+    db.$client.prepare(`explain query plan ${stmt}`).all(...params) as {
+      detail: string;
+    }[]
+  )
+    .map((p) => p.detail)
+    .join("\n");
+
+const PRUNE_CUTOFF = "2026-10-23T12:00:00.000Z";
+
+test("the claude.* prune finds old rows through the partial ts index", () => {
+  migrate(db);
+  expect(
+    planOf(
+      "select id from events where type glob 'claude.*' and ts < ?",
+      PRUNE_CUTOFF,
+    ),
+  ).toMatch(/USING (COVERING )?INDEX events_claude_ts \(ts<\?\)/);
+});
+
+test("deleting deliveries by event finds them through the event_id index", () => {
+  migrate(db);
+  expect(
+    planOf(
+      "delete from webhook_deliveries where event_id in (select id from events where type glob 'claude.*' and ts < ?)",
+      PRUNE_CUTOFF,
+    ),
+  ).toMatch(
+    /USING (COVERING )?INDEX webhook_deliveries_event_id \(event_id=\?\)/,
+  );
+});
+
+test("migrating a populated 0006 file keeps every event and delivery, and never reuses a deleted event id", () => {
+  migrateThrough("0006_sweet_madame_hydra");
+  seedDelivery();
+  insertDelivery();
+  const tail = insertEvent();
+  run("delete from events where id = ?", tail);
+
+  migrate(db);
+
+  expect(count("events")).toBe(1);
+  expect(count("webhook_deliveries")).toBe(1);
+  expect(insertEvent()).toBeGreaterThan(tail);
 });

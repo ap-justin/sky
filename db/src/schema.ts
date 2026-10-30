@@ -181,9 +181,15 @@ export const events = sqliteTable(
   (t) => [
     // a run's stream resumes with `run_id = ? and id > ?`
     index("events_run_id_id").on(t.runId, t.id),
+    // the 7-day prune: the query must spell `type glob 'claude.*'` verbatim for the planner to pick a partial index
+    index("events_claude_ts")
+      .on(t.ts)
+      .where(sql`${c(t.type)} glob 'claude.*'`),
     check(
       "events_type",
-      sql`${c(t.type)} in ('run.started', 'run.progress', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped')`,
+      sql`${c(t.type)} in ('run.started', 'run.waiting', 'run.finished', 'run.failed', 'run.stopped', 'run.resumed',
+        'claude.PreToolUse', 'claude.PostToolUse', 'claude.PostToolUseFailure', 'claude.SubagentStart', 'claude.SubagentStop',
+        'claude.TaskCreated', 'claude.TaskCompleted', 'claude.Notification', 'claude.PreCompact', 'claude.FileChanged', 'claude.Message')`,
     ),
     check("events_ts", isoUtc(t.ts)),
     check("events_payload", sql`json_type(${c(t.payload)}) = 'object'`),
@@ -234,6 +240,8 @@ export const webhookDeliveries = sqliteTable(
       t.webhookId,
       t.eventId,
     ),
+    // the prune's delete by event, and the FK lookup on every events delete
+    index("webhook_deliveries_event_id").on(t.eventId),
     // the worker's due scan: `status = 'pending' and next_attempt_at <= ?`
     index("webhook_deliveries_status_next_attempt_at").on(
       t.status,

@@ -2,12 +2,14 @@ import { zValidator } from "@hono/zod-validator";
 import { agents, type Db, runRequests, runs } from "@sky/db";
 import {
   canTransition,
+  EVENT_TEXT_MAX,
   type EventType,
   RequestId,
   RunId,
   RunnerEventPost,
   RunRollup,
   type RunStatus,
+  truncationMarker,
 } from "@sky/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -25,15 +27,39 @@ import {
 } from "./runs.js";
 import { body, jsonBody } from "./validation.js";
 
-// the status each event moves its run to; progress leaves it where it is
+// the status each event moves its run to; claude.* events leave it, and decideRequest moves it on run.resumed
 const statusAfter: Record<EventType, RunStatus | null> = {
   "run.started": "running",
-  "run.progress": null,
   "run.waiting": "waiting",
+  "run.resumed": null,
   "run.finished": "finished",
   "run.failed": "failed",
   "run.stopped": "stopped",
+  "claude.PreToolUse": null,
+  "claude.PostToolUse": null,
+  "claude.PostToolUseFailure": null,
+  "claude.SubagentStart": null,
+  "claude.SubagentStop": null,
+  "claude.TaskCreated": null,
+  "claude.TaskCompleted": null,
+  "claude.Notification": null,
+  "claude.PreCompact": null,
+  "claude.FileChanged": null,
+  "claude.Message": null,
 };
+
+/** Cuts each string field of a flat payload to `EVENT_TEXT_MAX`, marking how much it dropped. */
+function trimText<T extends object>(payload: T): T {
+  return Object.fromEntries(
+    Object.entries(payload).map(([k, v]) => [
+      k,
+      typeof v === "string" && v.length > EVENT_TEXT_MAX
+        ? v.slice(0, EVENT_TEXT_MAX) +
+          truncationMarker(v.length - EVENT_TEXT_MAX)
+        : v,
+    ]),
+  ) as T;
+}
 
 const bearer = (header: string | undefined) =>
   /^Bearer ([A-Za-z0-9_-]+)$/.exec(header ?? "")?.[1];
@@ -128,11 +154,14 @@ export function internalRoutes(
           if (redacted.type === "run.waiting") {
             openRequest(tx, run.id, redacted.payload.request);
           }
+          // trimmed only after redaction, so a cut can't split a secret out of its match
           const { id, enqueued } = recordEvent(
             tx,
             run.id,
             event.type,
-            redacted.payload,
+            event.type.startsWith("claude.")
+              ? trimText(redacted.payload)
+              : redacted.payload,
           );
           if (next) {
             const ended =

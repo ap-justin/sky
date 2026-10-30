@@ -9,9 +9,9 @@ import { mintId } from "./ids.js";
 import { body, jsonBody } from "./validation.js";
 import { isAllowedWebhookUrl } from "./webhook-url.js";
 
-// any http(s) URL here, so an internal host is refused as url_not_allowed before the shared schema's domain-only rule
+// any https URL here, so an internal host is refused as url_not_allowed before the shared schema's domain-only rule
 const WebhookInput = z.strictObject({
-  url: z.url({ protocol: /^https?$/ }),
+  url: z.url({ protocol: /^https$/ }),
   // the shared schema's nonempty() infers a plain array; the column wants the non-empty tuple
   eventTypes: z.tuple([EventType], EventType),
 });
@@ -62,7 +62,7 @@ export function webhookRoutes() {
           c,
           400,
           "invalid_body",
-          "url must be an http(s) URL whose host is a domain name",
+          "url must be an https URL whose host is a domain name",
         );
       }
       const row = c.var.db

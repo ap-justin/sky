@@ -11,9 +11,13 @@ test("accepts a webhook subscribed to known event types", () => {
   expect(Webhook.parse(hook)).toEqual(hook);
 });
 
-test("rejects a non-http url, an unknown event type and an empty subscription", () => {
+test("rejects a non-https url, an unknown event type and an empty subscription", () => {
   expect(
     Webhook.safeParse({ ...hook, url: "file:///etc/passwd" }).success,
+  ).toBe(false);
+  expect(
+    Webhook.safeParse({ ...hook, url: "http://grok.example/hooks/sky" })
+      .success,
   ).toBe(false);
   expect(
     Webhook.safeParse({ ...hook, eventTypes: ["run.exploded"] }).success,

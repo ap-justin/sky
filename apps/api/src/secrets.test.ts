@@ -218,8 +218,8 @@ function runOn(envId: EnvironmentId) {
       },
       body: JSON.stringify({
         runId,
-        type: "run.progress",
-        payload: { message },
+        type: "claude.Message",
+        payload: { text: message },
       }),
     });
 }

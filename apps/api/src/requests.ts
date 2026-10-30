@@ -42,7 +42,11 @@ export function openRequest(tx: Tx, runId: RunId, request: PendingRequest) {
     .run();
 }
 
-const verbs = { answer: "answered", approve: "approved", deny: "denied" };
+const resumedAs = {
+  answer: "answered",
+  approve: "approved",
+  deny: "denied",
+} as const;
 
 /**
  * Records `decision` on its request, if it is open on the agent's waiting run, and moves the run and
@@ -85,8 +89,9 @@ export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
     .set({ status: "running" })
     .where(eq(agents.id, agentId))
     .run();
-  const { enqueued } = recordEvent(tx, run.id, "run.progress", {
-    message: `request ${decision.requestId} ${verbs[decision.decision]}`,
+  const { enqueued } = recordEvent(tx, run.id, "run.resumed", {
+    requestId: decision.requestId,
+    decision: resumedAs[decision.decision],
   });
   return { kind: "decided", run, enqueued } as const;
 }

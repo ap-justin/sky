@@ -35,8 +35,8 @@ export type Decision = z.infer<typeof Decision>;
 
 export const EventType = z.enum([
   "run.started",
-  "run.progress",
   "run.waiting",
+  "run.resumed",
   "run.finished",
   "run.failed",
   "run.stopped",
@@ -85,11 +85,6 @@ export type RunRollup = z.infer<typeof RunRollup>;
 const runPayloads = {
   /** `sessionId` is the Claude session the API stores to resume the agent's next run. */
   "run.started": z.object({ sessionId: z.string().min(1) }),
-  /** Assistant text or a tool call, as the run goes. */
-  "run.progress": z.object({
-    message: z.string(),
-    tool: z.string().min(1).optional(),
-  }),
   "run.waiting": z.object({ request: PendingRequest }),
   "run.finished": z.object({
     summary: z.string(),
@@ -171,18 +166,25 @@ const claudePayloads = (textMax: number) => {
   };
 };
 
+/** Recorded by the API when a request is decided; the decision's answer or reason stays out. */
+const resumedPayload = z.object({
+  requestId: RequestId,
+  decision: z.enum(["answered", "approved", "denied"]),
+});
+
 const postPayloads = {
   ...runPayloads,
   ...claudePayloads(RUNNER_TEXT_MAX),
-} satisfies Record<EventType, z.ZodType>;
+} satisfies Record<Exclude<EventType, "run.resumed">, z.ZodType>;
 
 /** the extra 64 admits `truncationMarker` after a trimmed field */
 const storedPayloads = {
   ...runPayloads,
+  "run.resumed": resumedPayload,
   ...claudePayloads(EVENT_TEXT_MAX + 64),
 } satisfies Record<EventType, z.ZodType>;
 
-const posted = <T extends EventType>(type: T) =>
+const posted = <T extends keyof typeof postPayloads>(type: T) =>
   z.strictObject({
     runId: RunId,
     type: z.literal(type),
@@ -192,7 +194,6 @@ const posted = <T extends EventType>(type: T) =>
 /** Body of the runner's `POST /internal/events`; the API assigns `id` and `ts`. */
 export const RunnerEventPost = z.discriminatedUnion("type", [
   posted("run.started"),
-  posted("run.progress"),
   posted("run.waiting"),
   posted("run.finished"),
   posted("run.failed"),
@@ -223,8 +224,8 @@ const stored = <T extends EventType>(type: T) =>
 
 export const Event = z.discriminatedUnion("type", [
   stored("run.started"),
-  stored("run.progress"),
   stored("run.waiting"),
+  stored("run.resumed"),
   stored("run.finished"),
   stored("run.failed"),
   stored("run.stopped"),

@@ -201,13 +201,13 @@ test("a subscriber answering 500, 500, 200 gets three signed attempts of one eve
     `ghp_${"a1B2".repeat(9)}`,
   ];
 
-  // progress isn't subscribed, so only the finish is enqueued
+  // claude.Message isn't subscribed, so only the finish is enqueued
   expect(
     (
       await postEvent(token, {
         runId,
-        type: "run.progress",
-        payload: { message: "working" },
+        type: "claude.Message",
+        payload: { text: "working" },
       })
     ).status,
   ).toBe(201);
@@ -298,8 +298,11 @@ test("each attempt is signed with its own clock second, so a retry after 300 s s
 
 test("each matching subscription gets its own delivery of the event", async () => {
   await subscribe(["run.finished"]);
-  await subscribe(["run.progress", "run.finished"], "https://b.example.com/h");
-  await subscribe(["run.progress"], "https://c.example.com/h");
+  await subscribe(
+    ["claude.Message", "run.finished"],
+    "https://b.example.com/h",
+  );
+  await subscribe(["claude.Message"], "https://c.example.com/h");
   const a = subscriber([200]);
   const b = subscriber([200], "https://b.example.com/h");
   const { runId, token } = runningRun();
@@ -311,6 +314,34 @@ test("each matching subscription gets its own delivery of the event", async () =
   await dispatcher.drain();
   expect([a.length, b.length]).toEqual([1, 1]);
   expect(deliveries().map((d) => d.status)).toEqual(["delivered", "delivered"]);
+});
+
+test("a claude.PostToolUse event reaches a webhook subscribed to it, redacted and trimmed", async () => {
+  await subscribe(["claude.PostToolUse"]);
+  const received = subscriber([200]);
+  const { agentId, runId, token } = runningRun();
+  const payload = {
+    toolName: "Bash",
+    toolUseId: "tu_1",
+    input: '{"command":"env"}',
+    output: `SIGNING=${config.webhookSigningKey}\n${"a".repeat(5_000)}`,
+  };
+  expect(
+    (await postEvent(token, { runId, type: "claude.PostToolUse", payload }))
+      .status,
+  ).toBe(201);
+  await dispatcher.drain();
+  expect(received).toHaveLength(1);
+  const body = JSON.parse(received[0]?.body ?? "") as {
+    agentId: string;
+    type: string;
+    payload: { output: string };
+  };
+  expect(body).toMatchObject({ agentId, runId, type: "claude.PostToolUse" });
+  expect(body.payload.output).toMatch(
+    /^SIGNING=\[redacted\]\na+\n…\[truncated \d+ chars\]$/,
+  );
+  expect(received[0]?.body).not.toContain(config.webhookSigningKey);
 });
 
 test("a slow subscriber never holds up the runner's post", async () => {

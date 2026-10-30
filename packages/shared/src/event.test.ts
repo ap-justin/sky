@@ -25,16 +25,23 @@ const meta = {
   ts: "2026-10-29T12:00:00.000Z",
 };
 
-test("event types cover the run lifecycle and progress", () => {
+test("event types cover the run lifecycle and no longer include run.progress", () => {
   expect(EventType.options).toEqual(
     expect.arrayContaining([
       "run.started",
-      "run.progress",
       "run.waiting",
       "run.finished",
       "run.failed",
     ]),
   );
+  expect(EventType.options).not.toContain("run.progress");
+  expect(
+    RunnerEventPost.safeParse({
+      runId: "run_1",
+      type: "run.progress",
+      payload: { message: "editing" },
+    }).success,
+  ).toBe(false);
 });
 
 test("run.started carries the Claude session id", () => {
@@ -68,14 +75,7 @@ test("rejects run.finished without usage", () => {
   ).toBe(false);
 });
 
-test("accepts a tool progress event and a waiting event", () => {
-  expect(
-    Event.parse({
-      ...meta,
-      type: "run.progress",
-      payload: { message: "editing", tool: "Edit" },
-    }).type,
-  ).toBe("run.progress");
+test("accepts a waiting event", () => {
   const request = {
     kind: "question",
     requestId: "req_1",
@@ -375,4 +375,22 @@ test("a stored text field admits EVENT_TEXT_MAX plus the truncation marker, and 
   expect(Event.safeParse(event("x".repeat(EVENT_TEXT_MAX + 65))).success).toBe(
     false,
   );
+});
+
+test("run.resumed is a stored event the runner can't post", () => {
+  const payload = { requestId: "req_1", decision: "approved" };
+  expect(
+    Event.parse({ ...meta, type: "run.resumed", payload }).payload,
+  ).toEqual(payload);
+  expect(
+    Event.safeParse({
+      ...meta,
+      type: "run.resumed",
+      payload: { ...payload, decision: "maybe" },
+    }).success,
+  ).toBe(false);
+  expect(
+    RunnerEventPost.safeParse({ runId: "run_1", type: "run.resumed", payload })
+      .success,
+  ).toBe(false);
 });
