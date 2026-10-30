@@ -34,8 +34,6 @@ export type QueryFn = (params: {
   options: Options;
 }) => AsyncIterable<SDKMessage>;
 
-/** An approval request is read by a person, so its summary stays short. */
-const MAX_SUMMARY_CHARS = 2000;
 /**
  * Seconds before the SDK cancels a PreToolUse hook, and with it the approval gate (its default is
  * 600). `waitTimeoutMs` bounds each wait, but this clock also runs while a call queues behind
@@ -357,7 +355,7 @@ export async function runSession(
       {
         kind: "approval",
         toolName: input.tool_name,
-        toolSummary: clip(
+        toolSummary: bound(
           toolHint(input.tool_input) ??
             (JSON.stringify(input.tool_input) || input.tool_name),
         ),
@@ -433,8 +431,13 @@ export async function runSession(
           payload: { sessionId: message.session_id },
         });
       } else if (message.type === "assistant") {
+        const parent = message.parent_tool_use_id;
+        // queued, not awaited: a slow API must not hold the loop while hooks queue ahead of the text
         for (const text of textOf(message.message.content))
-          await post({ type: "claude.Message", payload: { text } });
+          void post({
+            type: "claude.Message",
+            payload: { text, ...(parent && { parentToolUseId: parent }) },
+          }).catch(() => {});
       } else if (message.type === "result") {
         result = message;
       }
@@ -553,9 +556,6 @@ function usageOf(result: SDKResultMessage): Usage {
     durationMs: Math.round(result.duration_ms),
   };
 }
-
-const clip = (s: string) =>
-  s.length > MAX_SUMMARY_CHARS ? `${s.slice(0, MAX_SUMMARY_CHARS - 1)}…` : s;
 
 /** A plain cut at what the API accepts: it redacts the whole text, so nothing here may clip it shorter. */
 const bound = (s: string) => s.slice(0, RUNNER_TEXT_MAX);

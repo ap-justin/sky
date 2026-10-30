@@ -63,6 +63,11 @@ const assistant = (...content: unknown[]) => ({
   parent_tool_use_id: null,
   message: { content },
 });
+/** Assistant text from inside the subagent the Agent call `parentToolUseId` started. */
+const subagentSays = (parentToolUseId: string, text: string) => ({
+  ...assistant({ type: "text", text }),
+  parent_tool_use_id: parentToolUseId,
+});
 const success = {
   type: "result",
   subtype: "success",
@@ -383,7 +388,7 @@ test("tool text is sent whole up to RUNNER_TEXT_MAX and cut there, never clipped
   const big = "x".repeat(100_000);
   const query = scripted([
     init,
-    assistant({ type: "text", text: "y".repeat(3000) }),
+    assistant({ type: "text", text: "y".repeat(20_000) }),
     hook("PostToolUse", {
       tool_name: "Bash",
       tool_input: { command: big },
@@ -400,13 +405,109 @@ test("tool text is sent whole up to RUNNER_TEXT_MAX and cut there, never clipped
   });
   const message = sent.find((e) => e.type === "claude.Message");
   expect(message?.type === "claude.Message" && message.payload.text).toBe(
-    "y".repeat(3000),
+    "y".repeat(20_000),
   );
   const tool = sent.find((e) => e.type === "claude.PostToolUse");
   expect(tool?.type === "claude.PostToolUse" && tool.payload).toMatchObject({
     output: big.slice(0, RUNNER_TEXT_MAX),
     input: JSON.stringify({ command: big }).slice(0, RUNNER_TEXT_MAX),
   });
+});
+
+test("a subagent's text carries the Agent call's parentToolUseId; main-thread text has none", async () => {
+  const { sent, post } = apiPoster();
+  const query = scripted([
+    init,
+    assistant({ type: "text", text: "Delegating." }),
+    subagentSays("toolu_agent", "Found a.ts."),
+    success,
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(sent.filter((e) => e.type === "claude.Message")).toEqual([
+    {
+      runId: "run_1",
+      type: "claude.Message",
+      payload: { text: "Delegating." },
+    },
+    {
+      runId: "run_1",
+      type: "claude.Message",
+      payload: { text: "Found a.ts.", parentToolUseId: "toolu_agent" },
+    },
+  ]);
+});
+
+/** A query whose producer runs ahead of the consumer, as the SDK reads the CLI's stdout while the runner is still posting. */
+function eager(
+  produce: (options: Options, push: (m: unknown) => void) => Promise<void>,
+): QueryFn {
+  return ({ options }) => {
+    const buffered: unknown[] = [];
+    let done = false;
+    let wake = () => {};
+    void produce(options, (m) => {
+      buffered.push(m);
+      wake();
+    }).finally(() => {
+      done = true;
+      wake();
+    });
+    return (async function* () {
+      while (true) {
+        const next = buffered.shift();
+        if (next !== undefined) yield next as SDKMessage;
+        else if (done) return;
+        else await new Promise<void>((r) => (wake = r));
+      }
+    })();
+  };
+}
+
+test("with a slow API, text and hook events post in stream order and the ending event comes after all of them", async () => {
+  const posted: RunnerEventPost[] = [];
+  const post = async (e: RunnerEventPost) => {
+    await new Promise((r) => setTimeout(r, 20));
+    posted.push(e);
+  };
+  const query = eager(async (options, push) => {
+    push(init);
+    // run.started has landed before Claude says anything
+    await new Promise((r) => setTimeout(r, 60));
+    push(assistant({ type: "text", text: "First." }));
+    await setImmediate();
+    push(assistant({ type: "text", text: "Second." }));
+    await setImmediate();
+    await fire(options, "PreToolUse", {
+      tool_name: "Read",
+      tool_input: { file_path: "a.ts" },
+      tool_use_id: "t1",
+    });
+    await setImmediate();
+    push(success);
+  });
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(code).toBe(0);
+  expect(
+    posted.map((e) =>
+      e.type === "claude.Message" ? `${e.type}:${e.payload.text}` : e.type,
+    ),
+  ).toEqual([
+    "run.started",
+    "claude.Message:First.",
+    "claude.Message:Second.",
+    "claude.PreToolUse",
+    "run.finished",
+  ]);
 });
 
 test("a result with no text takes its summary from the Stop hook's last message", async () => {
@@ -850,6 +951,30 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
     "run.waiting",
     "run.finished",
   ]);
+});
+
+test("a long approval summary reaches run.waiting whole, for the API to redact before it trims", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const command = `git push ${"x".repeat(5000)}`;
+  const query = scripted([
+    init,
+    async (options: Options) =>
+      void (await fire(options, "PreToolUse", {
+        ...gitPush,
+        tool_input: { command },
+      })),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  const waiting = sent.find((e) => e.type === "run.waiting");
+  expect(
+    waiting?.type === "run.waiting" &&
+      waiting.payload.request.kind === "approval" &&
+      waiting.payload.request.toolSummary,
+  ).toBe(command);
 });
 
 test("a denial blocks the tool and hands Claude the reason", async () => {
