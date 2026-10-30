@@ -30,7 +30,7 @@ const HandlerOptions = z.object({
 
 type Outcome =
   | { ok: true; value: unknown }
-  | { ok: false; result: CallToolResult };
+  | { ok: false; result: CallToolResult; error?: ApiError };
 
 type Call = (
   method: "GET" | "POST",
@@ -43,8 +43,13 @@ const text = (value: unknown, isError = false): CallToolResult => ({
   ...(isError && { isError }),
 });
 
-const ErrorEnvelope = z.object({
-  error: z.looseObject({ code: z.string(), message: z.string() }),
+const ApiError = z.looseObject({ code: z.string(), message: z.string() });
+type ApiError = z.infer<typeof ApiError>;
+const ErrorEnvelope = z.object({ error: ApiError });
+
+const AlreadyDecided = z.looseObject({
+  code: z.literal("already_decided"),
+  decision: z.enum(["approved", "denied", "answered"]),
 });
 
 const failure = (status: number, code: string, message: string) =>
@@ -84,11 +89,20 @@ function apiClient({
     const parsed = parseJson(raw);
     if (res.ok) return { ok: true, value: parsed.ok ? parsed.value : raw };
     const envelope = ErrorEnvelope.safeParse(parsed.ok ? parsed.value : null);
+    if (!envelope.success)
+      return {
+        ok: false,
+        result: failure(
+          res.status,
+          `http_${res.status}`,
+          raw || res.statusText,
+        ),
+      };
+    const { error } = envelope.data;
     return {
       ok: false,
-      result: envelope.success
-        ? text({ status: res.status, error: envelope.data.error }, true)
-        : failure(res.status, `http_${res.status}`, raw || res.statusText),
+      result: text({ status: res.status, error }, true),
+      error,
     };
   };
 }
@@ -158,6 +172,16 @@ function buildServer(call: Call) {
   const api = async (...args: Parameters<Call>) => {
     const outcome = await call(...args);
     return outcome.ok ? text(outcome.value) : outcome.result;
+  };
+
+  /** Posts a decision; an `already_decided` 409 means a different, earlier decision stands, so the error says so. */
+  const decide = async (path: string, body: { requestId: RequestId }) => {
+    const outcome = await call("POST", path, body);
+    if (outcome.ok) return text(outcome.value);
+    const already = AlreadyDecided.safeParse(outcome.error);
+    if (!already.success) return outcome.result;
+    const message = `${body.requestId} was already ${already.data.decision}; that decision stands and this one was not applied`;
+    return text({ status: 409, error: { ...already.data, message } }, true);
   };
 
   /** The id of the agent's newest run, which the list returns first. */
@@ -239,31 +263,26 @@ function buildServer(call: Call) {
     "answer",
     {
       description:
-        "Answer the question a waiting run asked; requestId is the pending request status returns.",
+        "Answer the question a waiting run asked; requestId is the pending request status returns. Repeating the same answer is safe; a different answer to a request already answered is an error and is not applied.",
       inputSchema: { agentId: AgentId, requestId: RequestId, answer: nonEmpty },
     },
-    ({ agentId, ...body }) =>
-      api("POST", `/v1/agents/${agentId}/answers`, body),
+    ({ agentId, ...body }) => decide(`/v1/agents/${agentId}/answers`, body),
   );
   server.registerTool(
     "approve",
     {
       description:
-        "Approve or deny the tool call a waiting run asked to make; requestId is the pending request status returns. A reason goes only with deny.",
+        "Approve or deny the tool call a waiting run asked to make, optionally with a reason; requestId is the pending request status returns. Repeating the same decision is safe; a different decision on a request already decided is an error and is not applied.",
       inputSchema: {
         agentId: AgentId,
         requestId: RequestId,
         decision: z.enum(["approve", "deny"]),
         reason: nonEmpty
           .optional()
-          .describe("Why the call is denied; sent only with deny."),
+          .describe("Why the call is approved or denied."),
       },
     },
-    ({ agentId, reason, ...body }) =>
-      api("POST", `/v1/agents/${agentId}/approvals`, {
-        ...body,
-        ...(body.decision === "deny" && reason !== undefined && { reason }),
-      }),
+    ({ agentId, ...body }) => decide(`/v1/agents/${agentId}/approvals`, body),
   );
   server.registerTool(
     "stop",
@@ -273,6 +292,16 @@ function buildServer(call: Call) {
       annotations: { destructiveHint: true },
     },
     ({ agentId }) => api("POST", `/v1/agents/${agentId}/stop`),
+  );
+  server.registerTool(
+    "archive",
+    {
+      description:
+        "Archive the agent: stops any active run, deletes its git worktree (uncommitted work is lost) and takes no more runs. To halt a run but keep the worktree, call stop.",
+      inputSchema: { agentId: AgentId },
+      annotations: { destructiveHint: true },
+    },
+    ({ agentId }) => api("POST", `/v1/agents/${agentId}/archive`),
   );
   server.registerTool(
     "status",

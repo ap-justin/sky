@@ -1,4 +1,5 @@
 import { parseArgs } from "node:util";
+import { agentCommands } from "./agent.js";
 import { ApiError, createApi } from "./api.js";
 import { apply } from "./apply.js";
 import { type Config, configPath, type Env, resolveConfig } from "./config.js";
@@ -32,11 +33,39 @@ const help = (io: Io) => `Usage:
       Store a secret on an environment (<env> is its id or name). The value
       is read from stdin, or prompted for without echo on a terminal. With
       --connector, agents get the Sprites connection id as $NAME instead.
+  sky agent start <env> --prompt=<text|@file> [options]
+  sky agent follow-up <agent> --prompt=<text|@file> [options]
+      Start an agent on an environment (<env> is its id or name), or start
+      an agent's next run once its last one has ended; @file reads the
+      prompt from that file. Prints "<agentId> <runId>".
+  sky agent archive <agent> [options]
+      Stop any active run and delete the agent's worktree; uncommitted work
+      in it is lost.
+  sky inbox <agent> [options]
+      Print what the agent's newest run is waiting on: "question <requestId>"
+      then the question, or "approval <requestId> <tool>" then what the tool
+      would do; nothing when nothing is pending. "<runId> <status>" goes to
+      stderr.
+  sky wait <agent> [--timeout=<seconds>] [options]
+      Wait until the newest run needs input or ends, then print what inbox
+      prints. An unreachable API or a 5xx is retried with backoff (at most
+      30s apart); a 4xx ends the wait. With no --timeout it waits as long as
+      the run and any outage take; --timeout bounds both.
+  sky status <agent> [options]
+      Print "<runId> <status>", then its summary, error and compare link.
+  sky approve <agent> <requestId> [--reason=<text>] [options]
+  sky deny <agent> <requestId> --reason=<text> [options]
+  sky answer <agent> <requestId> -- <text>
+      Decide a pending request. Options go before --, and everything after
+      it is the answer, even text starting with '-'. Repeating the same
+      decision exits 0; a request already decided differently exits 1 and
+      the earlier decision stands.
 
 Options:
   --url=<url>            API URL
   --api-key-env=<VAR>    read the API key from environment variable VAR
-  --json                 print the API's object on stdout
+  --json                 print the API's object on stdout (inbox, wait and
+                         status: the newest run)
   -h, --help             show this help
 
 Configuration, first found wins:
@@ -46,6 +75,9 @@ Configuration, first found wins:
 
 Exit status: 0 done; 1 failed (API error, provisioning failed); 2 usage or
   config error, a rejected API key included
+  inbox, wait and status exit with the newest run's state:
+  0 finished; 3 waiting (needs input); 4 starting or running (wait: timed
+  out); 5 failed; 6 stopped
 `;
 
 const commonOptions = {
@@ -74,6 +106,9 @@ export async function run(io: Io): Promise<number> {
       case "secret":
         return await runSecret(rest, io);
       default:
+        if (Object.hasOwn(agentCommands, command)) {
+          return await runAgent(command, rest, io);
+        }
         throw new UsageError(`unknown command '${command}'`, true);
     }
   } catch (err) {
@@ -88,11 +123,19 @@ export async function run(io: Io): Promise<number> {
 
 function parse<
   O extends Record<string, { type: "string" | "boolean"; short?: string }>,
->(args: string[], options: O) {
+>(args: string[], options: O, unknownOptionHint?: string) {
   try {
     return parseArgs({ args, options, allowPositionals: true, strict: true });
   } catch (err) {
-    if ((err as { code?: string }).code?.startsWith("ERR_PARSE_ARGS_")) {
+    const code = (err as { code?: string }).code;
+    if (code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" && unknownOptionHint) {
+      throw new UsageError(
+        // drop parseArgs' own hint: it quotes only the first character of "- staging"
+        `${(err as Error).message.replace(/ To specify a positional .*$/s, "")} ${unknownOptionHint}`,
+        true,
+      );
+    }
+    if (code?.startsWith("ERR_PARSE_ARGS_")) {
       throw new UsageError((err as Error).message, true);
     }
     throw err;
@@ -158,6 +201,41 @@ async function runSecret(args: string[], io: Io): Promise<number> {
   const { api, config } = connect(values, io);
   try {
     return await secretSet(envRef, name, values.connector, api, io, out);
+  } catch (err) {
+    if (err instanceof ApiError) return failApi(err, config, out);
+    throw err;
+  }
+}
+
+async function runAgent(
+  command: string,
+  args: string[],
+  io: Io,
+): Promise<number> {
+  const spec = agentCommands[command] as (typeof agentCommands)[string];
+  const { values, positionals } = parse(
+    args,
+    { ...commonOptions, ...spec.options },
+    command === "answer"
+      ? "An answer starting with '-' goes after --: sky answer <agent> <requestId> -- <text>"
+      : undefined,
+  );
+  if (values.help) {
+    io.stdout(help(io));
+    return 0;
+  }
+  // every agent option is a string; parseArgs types a spread option set as string | boolean
+  const text = (v: string | boolean | undefined) =>
+    typeof v === "string" ? v : undefined;
+  const action = spec.prepare(positionals, {
+    prompt: text(values.prompt),
+    timeout: text(values.timeout),
+    reason: text(values.reason),
+  });
+  const out = createOutput(values.json ?? false, io.stdout, io.stderr);
+  const { api, config } = connect(values, io);
+  try {
+    return await action(api, io, out);
   } catch (err) {
     if (err instanceof ApiError) return failApi(err, config, out);
     throw err;
