@@ -1,3 +1,4 @@
+import { readFile } from "node:fs/promises";
 import type { SpritesClient } from "@fly/sprites";
 import type { Db } from "@sky/db";
 import { createMcpHandler } from "@sky/mcp";
@@ -96,6 +97,18 @@ export function createApp({
       c.set("nudgeDeliveries", nudgeDeliveries);
       c.set("closing", closing);
       await next();
+    })
+    // public so a fresh machine can install the CLI before it has a key; the bundle holds no credentials
+    .get("/cli/sky.mjs", async (c) => {
+      try {
+        const bytes = await readFile(config.cliBundlePath);
+        return c.body(bytes, 200, {
+          "content-type": "text/javascript; charset=utf-8",
+        });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        return apiError(c, 404, "not_found", "this server has no CLI bundle");
+      }
     })
     .get("/healthz", (c) => {
       try {

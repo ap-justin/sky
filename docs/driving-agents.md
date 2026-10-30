@@ -2,6 +2,21 @@
 
 A bot (a cron job, a chat bot, a CI step) can run an agent end to end with the `sky` CLI: start it, wait until it needs something, answer or approve, follow up, read the result, archive it. Every command reads the same config as `sky apply` (`SKY_URL`, `SKY_API_KEY` or the config file) and takes `--json` to print the API's object instead of a line.
 
+## Install and configure
+
+Your Sky API serves the CLI as one file. It needs Node 24 or later.
+
+```
+mkdir -p ~/.local/bin
+curl -fsSL https://<your-app>.fly.dev/cli/sky.mjs -o ~/.local/bin/sky && chmod +x ~/.local/bin/sky
+```
+
+Make sure `~/.local/bin` is on your `PATH`, then check the install with `sky --version`. Rerun the `curl` to update. Set `SKY_URL` (`https://<your-app>.fly.dev`) and `SKY_API_KEY` (the key you set at deploy time), or put `{"url": "…", "apiKey": "…"}` in `~/.config/sky/config.json` (`$XDG_CONFIG_HOME/sky/config.json` when that is set). Flags beat environment variables, which beat the file. To check the URL and key, list your environments; a `401` means the key is wrong:
+
+```
+curl -fsS -H "Authorization: Bearer $SKY_API_KEY" "$SKY_URL/v1/environments"
+```
+
 ## 1. Start
 
 ```

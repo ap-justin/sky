@@ -7,7 +7,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --external:better-sqlite3 --outfile=dist/bundle/main.js && cp ../../packages/runner/dist/bundle/runner.mjs dist/bundle/runner.mjs && rm -rf dist/drizzle && cp -R ../../db/drizzle dist/drizzle"
+    "build": "esbuild src/main.ts --bundle --platform=node --format=esm --target=node24 --external:better-sqlite3 --outfile=dist/bundle/main.js && cp ../../packages/runner/dist/bundle/runner.mjs ../../packages/cli/dist/bundle/sky.mjs dist/bundle/ && rm -rf dist/drizzle && cp -R ../../db/drizzle dist/drizzle"
   },
   "dependencies": {
     "@fly/sprites": "^0.2.4",
@@ -22,6 +22,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
+    "@sky/cli": "workspace:*",
     "@sky/runner": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "esbuild": "0.28.2"
