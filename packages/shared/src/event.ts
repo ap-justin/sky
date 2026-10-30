@@ -2,21 +2,27 @@ import { z } from "zod";
 import { AgentId, EventId, RequestId, RunId } from "./ids.js";
 import { Usage } from "./run.js";
 
+const pendingRequest = (toolSummary: z.ZodString) =>
+  z.discriminatedUnion("kind", [
+    z.object({
+      kind: z.literal("question"),
+      requestId: RequestId,
+      prompt: z.string().min(1),
+    }),
+    z.object({
+      kind: z.literal("approval"),
+      requestId: RequestId,
+      toolName: z.string().min(1),
+      toolSummary,
+    }),
+  ]);
+
 /** What a run is blocked on: a question from Claude, or a tool call the environment's approval policy holds. */
-export const PendingRequest = z.discriminatedUnion("kind", [
-  z.object({
-    kind: z.literal("question"),
-    requestId: RequestId,
-    prompt: z.string().min(1),
-  }),
-  z.object({
-    kind: z.literal("approval"),
-    requestId: RequestId,
-    toolName: z.string().min(1),
-    toolSummary: z.string().min(1),
-  }),
-]);
+export const PendingRequest = pendingRequest(z.string().min(1));
 export type PendingRequest = z.infer<typeof PendingRequest>;
+
+/** Where an event read resumes: `evt_<n>` as events carry it, or the bare row id SSE frames carry. */
+export const EventCursor = z.string().regex(/^(?:evt_)?\d{1,15}$/);
 
 export const Decision = z.discriminatedUnion("decision", [
   z.object({ requestId: RequestId, decision: z.literal("approve") }),
@@ -162,7 +168,11 @@ const claudePayloads = (textMax: number) => {
       filePath: text,
       event: z.enum(["change", "add", "unlink"]),
     }),
-    "claude.Message": z.object({ text }),
+    "claude.Message": z.object({
+      text,
+      /** set when a subagent wrote it: the Agent tool call that spawned the subagent */
+      parentToolUseId: z.string().min(1).optional(),
+    }),
   };
 };
 
@@ -174,6 +184,9 @@ const resumedPayload = z.object({
 
 const postPayloads = {
   ...runPayloads,
+  "run.waiting": z.object({
+    request: pendingRequest(z.string().min(1).max(RUNNER_TEXT_MAX)),
+  }),
   ...claudePayloads(RUNNER_TEXT_MAX),
 } satisfies Record<Exclude<EventType, "run.resumed">, z.ZodType>;
 

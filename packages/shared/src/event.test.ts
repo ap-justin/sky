@@ -3,6 +3,7 @@ import {
   Decision,
   EVENT_TEXT_MAX,
   Event,
+  EventCursor,
   EventType,
   PendingRequest,
   Rollup,
@@ -392,5 +393,49 @@ test("run.resumed is a stored event the runner can't post", () => {
   expect(
     RunnerEventPost.safeParse({ runId: "run_1", type: "run.resumed", payload })
       .success,
+  ).toBe(false);
+});
+
+test("an event cursor is an event id or its bare row number, nothing else", () => {
+  expect(EventCursor.safeParse("evt_12").success).toBe(true);
+  expect(EventCursor.safeParse("12").success).toBe(true);
+  expect(EventCursor.safeParse("evt_1&x=2").success).toBe(false);
+  expect(EventCursor.safeParse("evt_").success).toBe(false);
+});
+
+test("claude.Message carries the subagent's parentToolUseId, and parses without it", () => {
+  const message = (payload: object) => ({ type: "claude.Message", payload });
+  const sub = message({ text: "Found it.", parentToolUseId: "toolu_1" });
+  expect(RunnerEventPost.parse({ runId: "run_1", ...sub })).toEqual({
+    runId: "run_1",
+    ...sub,
+  });
+  expect(Event.parse({ ...meta, ...sub })).toEqual({ ...meta, ...sub });
+  expect(
+    RunnerEventPost.safeParse({
+      runId: "run_1",
+      ...message({ text: "x", parentToolUseId: "" }),
+    }).success,
+  ).toBe(false);
+});
+
+test("a posted approval's toolSummary is bounded at RUNNER_TEXT_MAX", () => {
+  const waiting = (toolSummary: string) => ({
+    runId: "run_1",
+    type: "run.waiting",
+    payload: {
+      request: {
+        kind: "approval",
+        requestId: "req_1",
+        toolName: "Bash",
+        toolSummary,
+      },
+    },
+  });
+  expect(RunnerEventPost.safeParse(waiting("x".repeat(5000))).success).toBe(
+    true,
+  );
+  expect(
+    RunnerEventPost.safeParse(waiting("x".repeat(RUNNER_TEXT_MAX + 1))).success,
   ).toBe(false);
 });
