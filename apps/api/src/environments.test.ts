@@ -1,4 +1,14 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@sky/db";
 import { HttpResponse, http } from "msw";
@@ -71,6 +81,44 @@ const runnerSdk = JSON.parse(
   ),
 ).dependencies["@anthropic-ai/claude-agent-sdk"];
 const installRunnerSdk = `[ -w /opt/sky ] || sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/sky; npm install --prefix /opt/sky --no-audit --no-fund @anthropic-ai/claude-agent-sdk@${runnerSdk}`;
+// the setup runs as `bash -c <setup>` behind an `sh -c` wrapper; what the wrapper does, the shell-run tests pin
+const isSetup = (argv: string[]) => argv[0] === "sh" && argv[4] === "bash";
+const setupCall = (sprite: string, setup: string) =>
+  expect.stringMatching(
+    new RegExp(
+      `^exec ${sprite} /workspace/repo sh -c .+ sh bash -c ${setup.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} &> /tmp/sky-setup\\.log$`,
+    ),
+  );
+
+/**
+ * Runs the setup in a real local shell, as a sprite would: HOME is `home`, and node's bin holds
+ * `corepack` (a script standing in for it) but no pnpm. Git, rm and the runner SDK's install stay stubbed.
+ */
+function runSetupLocally(home: string, corepack: string) {
+  const nodeBin = join(home, "node-bin");
+  mkdirSync(nodeBin);
+  writeFileSync(join(nodeBin, "corepack"), corepack, { mode: 0o755 });
+  wire.exec = (argv) => {
+    if (!isSetup(argv)) return { exitCode: 0 };
+    const out = spawnSync(argv[0] ?? "", argv.slice(1), {
+      cwd: home,
+      env: { HOME: home, PATH: `${nodeBin}:/usr/bin:/bin` },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    return {
+      exitCode: out.status ?? 1,
+      stdout: out.stdout,
+      stderr: out.stderr,
+    };
+  };
+}
+
+// `enable --install-directory <dir>` writes shims that log which path ran them, so a host pnpm can't pass
+const COREPACK_STAND_IN = `#!/bin/sh
+[ "$1 $2" = "enable --install-directory" ] || exit 1
+for pm in pnpm yarn; do printf '#!/bin/sh\\necho "$0 $*" >>"$HOME/shim-runs"\\n' >"$3/$pm"; chmod +x "$3/$pm"; done
+`;
 
 test("POST returns 202 provisioning, then the sprite is created, cloned, set up and checkpointed", async () => {
   const res = await post(kru);
@@ -103,9 +151,45 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/sky-setup.log`,
+    setupCall(sprite, "pnpm install"),
     `checkpoint ${sprite}`,
   ]);
+});
+
+test("the setup script finds pnpm though the sprite ships only node, and a rerun finds it too", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  runSetupLocally(home, COREPACK_STAND_IN);
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(
+      (await patch(id, { setup: "pnpm install --frozen-lockfile" })).status,
+    ).toBe(202);
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(readFileSync(join(home, "shim-runs"), "utf8")).toBe(
+      `${home}/.local/bin/pnpm install\n${home}/.local/bin/pnpm install --frozen-lockfile\n`,
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a corepack that can't enable its shims ends failed at the setup step with its stderr, and the setup never runs", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  runSetupLocally(
+    home,
+    '#!/bin/sh\necho "Internal Error: EACCES" >&2\nexit 1\n',
+  );
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({
+      status: "failed",
+      failure: { step: "setup", stderr: "Internal Error: EACCES\n" },
+    });
+    expect(existsSync(join(home, "shim-runs"))).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 const ghToken = `ghp_${"a1B2".repeat(9)}`;
@@ -135,7 +219,7 @@ test.each([
     step: "setup",
     arrange: () => {
       wire.exec = (argv) =>
-        argv[0] === "bash"
+        isSetup(argv)
           ? {
               exitCode: 1,
               stdout: "installing\n",
@@ -181,8 +265,7 @@ test("a runner SDK install that fails ends failed at the setup step", async () =
 });
 
 test("a setup that fails with no stderr names its exit code", async () => {
-  wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 2 } : { exitCode: 0 };
+  wire.exec = (argv) => (isSetup(argv) ? { exitCode: 2 } : { exitCode: 0 });
   const { id } = (await (await post(kru)).json()) as { id: string };
   expect(await settled(id)).toMatchObject({
     failure: { step: "setup", stderr: "exited with code 2" },
@@ -192,7 +275,7 @@ test("a setup that fails with no stderr names its exit code", async () => {
 test("a setup whose large output arrives re-chunked still ends ready", async () => {
   wire.execChunkBytes = 1024;
   wire.exec = (argv) =>
-    argv[0] === "bash"
+    isSetup(argv)
       ? {
           exitCode: 0,
           stdout: "Progress: resolved 1, reused 1\n".repeat(20_000),
@@ -205,7 +288,7 @@ test("a setup whose large output arrives re-chunked still ends ready", async () 
 test("a failed setup's tail is the last 4000 bytes of its stdout and stderr, however its output arrives", async () => {
   wire.execChunkBytes = 1024;
   wire.exec = (argv) =>
-    argv[0] === "bash"
+    isSetup(argv)
       ? {
           exitCode: 1,
           stdout: `${"Progress: resolved 1\n".repeat(20_000)}ERR_PNPM_NO_LOCKFILE\n`,
@@ -396,7 +479,7 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install --frozen-lockfile &> /tmp/sky-setup.log`,
+    setupCall(sprite, "pnpm install --frozen-lockfile"),
     `checkpoint ${sprite}`,
   ]);
 });
@@ -597,7 +680,7 @@ test("DELETE of an env whose sprite never got created still removes the row", as
 
 test("a failure is persisted, so it survives the app that recorded it", async () => {
   wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+    isSetup(argv) ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   expect(
@@ -611,7 +694,7 @@ test("a failure is persisted, so it survives the app that recorded it", async ()
 
 test("a retry clears the previous failure while it provisions", async () => {
   wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+    isSetup(argv) ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   wire.exec = () => ({ exitCode: 0 });
@@ -628,7 +711,7 @@ const retry = (id: string, headers: Record<string, string> = auth) =>
 
 test("retry of a setup failure reruns provisioning on the same spec and ends ready", async () => {
   wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+    isSetup(argv) ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   wire.exec = () => ({ exitCode: 0 });
@@ -647,7 +730,7 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/sky-setup.log`,
+    setupCall(sprite, "pnpm install"),
     `checkpoint ${sprite}`,
   ]);
 });
@@ -750,8 +833,7 @@ test("retry is 409 not_failed unless failed, 404 for an unknown env, 401 without
 });
 
 test("a second retry while the first provisions is 409 and starts nothing", async () => {
-  wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1 } : { exitCode: 0 };
+  wire.exec = (argv) => (isSetup(argv) ? { exitCode: 1 } : { exitCode: 0 });
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   wire.exec = () => ({ exitCode: 0 });

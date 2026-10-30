@@ -20,6 +20,16 @@ export const RUNNER_DIR = "/opt/sky";
 const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
 // no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep
 const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK}`;
+// the sprite's node ships corepack but no pnpm or yarn; corepack's shims go under $HOME, so need no
+// root, and resolve the repo's `packageManager` version when run
+const PACKAGE_MANAGERS_DIR = "$HOME/.local/bin";
+/**
+ * Puts the shims first on PATH for a non-login shell, which reads no profile. Turns corepack's
+ * download prompt off, since with a TTY it can stop to ask before fetching a package manager.
+ */
+export const WITH_PACKAGE_MANAGERS = `export PATH="${PACKAGE_MANAGERS_DIR}:$PATH" COREPACK_ENABLE_DOWNLOAD_PROMPT=0`;
+// enables the shims, then execs its argv (the setup); enabling again on a rerun is harmless
+const PREPARE_SETUP = `mkdir -p "${PACKAGE_MANAGERS_DIR}" && corepack enable --install-directory "${PACKAGE_MANAGERS_DIR}" && ${WITH_PACKAGE_MANAGERS} && exec "$@"`;
 // ≤ the length CHECK on environments.failure_stderr in db/src/schema.ts
 const TAIL_CHARS = 4000;
 
@@ -86,7 +96,7 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
       begin("setup");
       await execNoisy(["sh", "-c", installRunnerSdk], "/tmp/sky-sdk.log");
       await execNoisy(
-        ["bash", "-c", env.setup],
+        ["sh", "-c", PREPARE_SETUP, "sh", "bash", "-c", env.setup],
         "/tmp/sky-setup.log",
         REPO_DIR,
       );

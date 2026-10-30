@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
@@ -181,6 +182,39 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   expect(session?.argv.join(" ")).toMatch(
     /set -a && \. "\$ENV_FILE" && set \+a && rm -f "\$ENV_FILE" && /,
   );
+});
+
+test("the runner, and so its agent's shell, finds the pnpm provisioning enabled under ~/.local/bin", async () => {
+  await launched(readyEnv());
+  await sessionOpened();
+  const session = wire.sessions[0];
+  if (!session) throw new Error("no session");
+  // runs the session's command locally, where a stub node prints what pnpm resolves to, as an agent's shell would
+  writeFileSync(join(dir, "node"), "#!/bin/sh\ncommand -v pnpm\n", {
+    mode: 0o755,
+  });
+  mkdirSync(join(dir, ".local/bin"), { recursive: true });
+  writeFileSync(join(dir, ".local/bin/pnpm"), "#!/bin/sh\n", { mode: 0o755 });
+  const local = (path: string) => {
+    const at = join(dir, path.replaceAll("/", "_"));
+    writeFileSync(at, wire.files.get(path) ?? "");
+    return at;
+  };
+  const out = spawnSync(session.argv[0] ?? "", session.argv.slice(1), {
+    env: {
+      ...session.env,
+      ENV_FILE: local(session.env.ENV_FILE ?? ""),
+      PROMPT_FILE: local(session.env.PROMPT_FILE ?? ""),
+      HOME: dir,
+      PATH: `${dir}:/usr/bin:/bin`,
+    },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  expect({ stdout: out.stdout, stderr: out.stderr }).toEqual({
+    stdout: `${dir}/.local/bin/pnpm\n`,
+    stderr: "",
+  });
 });
 
 test("the runner gets the env's approval policy as a JSON array", async () => {
