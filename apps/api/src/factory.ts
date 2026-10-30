@@ -10,6 +10,8 @@ export type AppEnv = {
     secrets: KnownSecrets;
     /** Wakes the delivery loop; call after the transaction that enqueued deliveries commits. */
     nudgeDeliveries: () => void;
+    /** Aborts when the process begins shutting down; open streams and parked polls end on it. */
+    closing: AbortSignal;
   };
 };
 

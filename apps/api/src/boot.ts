@@ -1,3 +1,4 @@
+import { setMaxListeners } from "node:events";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@sky/db";
@@ -56,6 +57,9 @@ export function boot(config: Config, log: (line: string) => void) {
   sweeper.unref();
   const sprites = new SpritesClient(config.spritesToken);
   dispatcher.start();
+  const closing = new AbortController();
+  // one listener per open stream or parked poll; past 10, Node would warn of a leak that isn't one
+  setMaxListeners(0, closing.signal);
   return {
     db,
     app: createApp({
@@ -65,7 +69,10 @@ export function boot(config: Config, log: (line: string) => void) {
       log,
       nudgeDeliveries: dispatcher.nudge,
       secrets,
+      closing: closing.signal,
     }),
+    /** Ends every event stream with a `server.shutdown` frame and answers parked event polls; call before `shutdown`. */
+    closeStreams: () => closing.abort(),
     stopSweeping: () => clearInterval(sweeper),
     stopDelivering: dispatcher.stop,
   };
@@ -73,14 +80,17 @@ export function boot(config: Config, log: (line: string) => void) {
 
 type Closable = {
   close(done: (err?: Error) => void): unknown;
+  closeIdleConnections(): void;
   closeAllConnections(): void;
 };
 
+const IDLE_SWEEP_MS = 100;
+
 /**
  * Stops accepting requests and gives in-flight ones `drainMs` before closing every connection still
- * open, then closes the DB. Run streams and runner long-polls never end on their own; their clients
- * reconnect (SSE with `Last-Event-ID`) and lose nothing. 5 s keeps the whole of it inside fly.toml's
- * `kill_timeout`.
+ * open, then closes the DB. Event streams end at `closeStreams`, before this; runner long-polls never
+ * end on their own, so the cutoff takes them and their runners retry. 5 s keeps the whole of it inside
+ * fly.toml's `kill_timeout`.
  */
 export async function shutdown(
   server: Closable,
@@ -88,12 +98,19 @@ export async function shutdown(
   drainMs = 5_000,
 ): Promise<void> {
   const cutoff = setTimeout(() => server.closeAllConnections(), drainMs);
+  // close() drops only the keep-alive sockets idle at that moment; one whose response ends during the
+  // drain (a stream ended by closeStreams) would otherwise wait out Node's keepAliveTimeout
+  const idleSweep = setInterval(
+    () => server.closeIdleConnections(),
+    IDLE_SWEEP_MS,
+  );
   try {
     await new Promise<void>((resolve, reject) =>
       server.close((err) => (err ? reject(err) : resolve())),
     );
   } finally {
     clearTimeout(cutoff);
+    clearInterval(idleSweep);
     db.$client.close();
   }
 }

@@ -1,18 +1,25 @@
-import { setTimeout as sleep } from "node:timers/promises";
 import { Decision } from "@sky/shared";
 import { z } from "zod";
+import { isTransient, RetryError, type RetryTiming, retry } from "./retry.js";
 
 export type DecisionOutcome =
   | { kind: "decided"; decision: Decision }
   /** The API stopped or failed the run, and has already recorded how it ended. */
   | { kind: "run_ended" }
   /** The API holds no such request: the waiting event never landed. */
-  | { kind: "lost" };
+  | { kind: "lost" }
+  /** The deadline passed with the API answering, and nobody deciding. */
+  | { kind: "expired" };
 
-/** Waits for the person's decision on `requestId`; rejects with `signal.reason` once it aborts. */
+/**
+ * Waits until `deadline` (epoch ms) for the person's decision on `requestId`; rejects with
+ * `signal.reason` once it aborts, with an "API unreachable" error when the deadline passes with
+ * the API failing, and with a "decision poll failed" error on a status retrying won't change.
+ */
 export type AwaitDecision = (
   requestId: string,
   signal: AbortSignal,
+  deadline: number,
 ) => Promise<DecisionOutcome>;
 
 const Reply = z.discriminatedUnion("status", [
@@ -22,62 +29,76 @@ const Reply = z.discriminatedUnion("status", [
 
 const ErrorBody = z.object({ error: z.object({ code: z.string() }) });
 
-/** A status worth asking again for: the API or the path to it is having a moment. */
-const transient = (status: number) =>
-  status >= 500 || status === 408 || status === 429;
-
 /**
- * Long-polls the API for a decision. `pending` is asked again at once (the API holds
- * each poll open); a dropped connection or a transient status after `retryDelayMs`.
+ * Long-polls the API for a decision. `pending` is asked again at once (the API holds each poll
+ * open); a dropped connection, a transient status, or a poll still unanswered at `pollTimeoutMs`
+ * is asked again after a backoff. The timeout sits past the API's hold: a sprite pause can leave a
+ * poll's connection dead with nothing on this side to say so.
  */
-export function createDecisionWaiter(options: {
-  apiBaseUrl: string;
-  agentToken: string;
-  runId: string;
-  retryDelayMs?: number;
-}): AwaitDecision {
-  const retryDelayMs = options.retryDelayMs ?? 1000;
-  return async (requestId, signal) => {
+export function createDecisionWaiter(
+  options: RetryTiming & {
+    apiBaseUrl: string;
+    agentToken: string;
+    runId: string;
+    pollTimeoutMs?: number;
+  },
+): AwaitDecision {
+  const pollTimeoutMs = options.pollTimeoutMs ?? 60_000;
+  return async (requestId, signal, deadline) => {
     const url = new URL(
       `/internal/runs/${options.runId}/requests/${requestId}`,
       options.apiBaseUrl,
     );
-    for (;;) {
-      signal.throwIfAborted();
-      let status: number;
-      let body: unknown;
-      try {
-        const res = await fetch(url, {
-          headers: { authorization: `Bearer ${options.agentToken}` },
+    try {
+      return await retry<DecisionOutcome>(
+        async (_attempt, cut) => {
+          const res = await fetch(url, {
+            headers: { authorization: `Bearer ${options.agentToken}` },
+            signal: cut,
+          });
+          const body = parseJson(await res.text());
+          if (res.status === 200) {
+            const reply = Reply.safeParse(body);
+            if (!reply.success) return { retry: "unreadable reply" };
+            return reply.data.status === "decided"
+              ? { done: { kind: "decided", decision: reply.data.decision } }
+              : { again: true };
+          }
+          if (res.status === 404) return { done: { kind: "lost" } };
+          if (
+            res.status === 401 &&
+            ErrorBody.safeParse(body).data?.error.code === "run_ended"
+          )
+            return { done: { kind: "run_ended" } };
+          const failure = `HTTP ${res.status}`;
+          return isTransient(res.status)
+            ? { retry: failure }
+            : { fail: `decision poll failed: ${failure}` };
+        },
+        {
+          sleep: options.sleep,
+          random: options.random,
+          now: options.now,
+          deadline,
+          attemptTimeoutMs: pollTimeoutMs,
           signal,
-        });
-        status = res.status;
-        body = await res.json().catch(() => undefined);
-      } catch {
-        signal.throwIfAborted();
-        await pause(retryDelayMs, signal);
-        continue;
-      }
-      if (status === 200) {
-        const reply = Reply.safeParse(body);
-        if (reply.success && reply.data.status === "decided")
-          return { kind: "decided", decision: reply.data.decision };
-        if (reply.success) continue;
-      } else if (status === 404) {
-        return { kind: "lost" };
-      } else if (
-        status === 401 &&
-        ErrorBody.safeParse(body).data?.error.code === "run_ended"
-      ) {
-        return { kind: "run_ended" };
-      } else if (!transient(status)) {
-        throw new Error(`decision poll failed: HTTP ${status}`);
-      }
-      await pause(retryDelayMs, signal);
+        },
+      );
+    } catch (error) {
+      if (!(error instanceof RetryError)) throw error;
+      if (error.why === "final") throw new Error(error.lastFailure);
+      if (error.lastFailure === undefined) return { kind: "expired" };
+      throw new Error(
+        `API unreachable while waiting for request ${requestId}: ${error.lastFailure}`,
+      );
     }
   };
 }
 
-/** Resolves after `ms`, or early on abort; the loop's next check rejects with the reason. */
-const pause = (ms: number, signal: AbortSignal) =>
-  sleep(ms, undefined, { signal }).catch(() => {});
+function parseJson(text: string): unknown {
+  try {
+    return JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+}

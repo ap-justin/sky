@@ -1,32 +1,50 @@
+import { createHash } from "node:crypto";
 import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
 
-/** The one sprite an environment owns. */
-export const spriteNameFor = (envId: string) => `sky-${envId}`;
+/**
+ * The one sprite an environment owns. Hashed because the API rejects names outside lowercase
+ * letters, digits and hyphens, and env ids carry uppercase and an underscore.
+ */
+export const spriteNameFor = (envId: string) =>
+  `sky-${createHash("sha256").update(envId).digest("hex").slice(0, 24)}`;
+
+const isNotFound = (err: unknown) =>
+  err instanceof APIError && err.statusCode === 404;
+
+/** Whether the sprite exists; any error but a 404 throws. */
+export async function spriteExists(
+  client: SpritesClient,
+  name: string,
+): Promise<boolean> {
+  try {
+    await client.getSprite(name);
+    return true;
+  } catch (err) {
+    if (isNotFound(err)) return false;
+    throw err;
+  }
+}
 
 /** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
 export async function ensureSprite(
   client: SpritesClient,
   name: string,
 ): Promise<void> {
-  try {
-    await client.getSprite(name);
-  } catch (err) {
-    if (!(err instanceof APIError && err.statusCode === 404)) throw err;
-    await client.createSprite(name);
-  }
+  if (!(await spriteExists(client, name))) await client.createSprite(name);
 }
 
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
 
 /**
  * Runs `argv` in the sprite over the SDK's HTTP exec (no WebSocket, no TTY) and waits for it to
- * exit. A nonzero exit resolves with its outcome; only transport and API errors throw.
+ * exit. A nonzero exit resolves with its outcome; only transport and API errors throw, including a
+ * `timeout` (ms) running out. Without a `timeout`, nothing bounds the wait.
  */
 export async function execInSprite(
   client: SpritesClient,
   name: string,
   [file, ...args]: [string, ...string[]],
-  options: { cwd?: string } = {},
+  options: { cwd?: string; timeout?: number } = {},
 ): Promise<ExecOutcome> {
   try {
     const result = await client.sprite(name).execFileHTTP(file, args, options);
@@ -111,7 +129,7 @@ export async function destroySprite(
   try {
     await client.deleteSprite(name);
   } catch (err) {
-    if (err instanceof APIError && err.statusCode === 404) return;
+    if (isNotFound(err)) return;
     throw err;
   }
 }

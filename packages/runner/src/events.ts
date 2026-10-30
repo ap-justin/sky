@@ -1,78 +1,112 @@
-import { setTimeout as sleep } from "node:timers/promises";
 import { RunnerEventPost } from "@sky/shared";
+import { isTransient, RetryError, type RetryTiming, retry } from "./retry.js";
 
 const TIMEOUT_MS = 10_000;
-/** The pause before each retry. Progress gives up fast; losing it costs one line on a timeline. */
-const PROGRESS_RETRIES_MS = [500, 1000];
+/** The timeout on the one attempt an event queued behind a stop gets: each holds up the ending event. */
+const GIVEN_UP_TIMEOUT_MS = 2_000;
 /**
- * An ending event that never lands leaves the run open until the API's sweep fails it, so it
- * rides out an API restart: backoff to ~2 min in all, the last tries 60 s+ after the first.
+ * How long an event that matters past its moment keeps trying: long enough to ride out an API
+ * redeploy. An ending event that never lands leaves the run open until the API's sweep fails it,
+ * and a lost `claude.PreToolUse` leaves a gated call missing from the timeline.
  */
-const ENDING_RETRIES_MS = [
-  500, 1000, 2000, 4000, 8000, 16_000, 30_000, 30_000, 30_000,
-];
-const ENDING_EVENTS = new Set(["run.waiting", "run.finished", "run.failed"]);
+const RIDE_OUT_MS = 120_000;
+const RIDES_OUT = new Set(["run.finished", "run.failed", "claude.PreToolUse"]);
+/** Other progress gives up fast; losing it costs one line on a timeline. */
+const PROGRESS_ATTEMPTS = 3;
 
-export type PostEvent = (event: RunnerEventPost) => Promise<void>;
+export type PostEvent = (
+  event: RunnerEventPost,
+  options?: {
+    /** Epoch ms the retries stop at; `run.waiting` passes its wait's deadline. */
+    deadline?: number;
+    /** A stop: the post rejects with its reason at once. */
+    signal?: AbortSignal;
+    /** A stop that ends retrying, not sending: once aborted, the post gets one short attempt, then is dropped. */
+    giveUp?: AbortSignal;
+  },
+) => Promise<void>;
 
 /**
- * A post that fails is retried, then dropped with one line on `warn`: losing an event must not
- * take down the run that produced it. A 4xx other than 408/429 is final and isn't retried.
+ * Posts an event, retrying a dropped connection, a timeout, a 5xx, 408 or 429; any other 4xx is
+ * final. A `run.waiting` that doesn't land rejects, since the run can't wait on a request the API
+ * never stored, and rejects with a `RunEndedError` when the API has already ended the run. Every
+ * other event is dropped with one line on `warn`: losing it must not take down the run that
+ * produced it.
  */
-export function createPoster(options: {
-  apiBaseUrl: string;
-  agentToken: string;
-  warn: (message: string) => void;
-  sleep?: (ms: number) => Promise<void>;
-}): PostEvent {
+export function createPoster(
+  options: RetryTiming & {
+    apiBaseUrl: string;
+    agentToken: string;
+    warn: (message: string) => void;
+  },
+): PostEvent {
   const url = new URL("/internal/events", options.apiBaseUrl);
-  const pause = options.sleep ?? ((ms: number) => sleep(ms));
-  return async (event) => {
+  const now = options.now ?? Date.now;
+  return async (event, { deadline, signal, giveUp } = {}) => {
     const body = JSON.stringify(RunnerEventPost.parse(event));
-    const retries = ENDING_EVENTS.has(event.type)
-      ? ENDING_RETRIES_MS
-      : PROGRESS_RETRIES_MS;
-    let failure = "";
-    let attempt = 0;
-    while (attempt <= retries.length) {
-      if (attempt > 0) await pause(retries[attempt - 1] ?? 0);
-      attempt++;
-      try {
-        const res = await fetch(url, {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${options.agentToken}`,
-            "content-type": "application/json",
-          },
-          body,
-          signal: AbortSignal.timeout(TIMEOUT_MS),
-        });
-        // read every body so the keep-alive socket is released
-        const text = await res.text();
-        if (res.ok) return;
-        // an earlier attempt opened this request, and only its response was lost
-        if (
-          attempt > 1 &&
-          event.type === "run.waiting" &&
-          res.status === 409 &&
-          errorCode(text) === "request_open"
-        )
-          return;
-        failure = `HTTP ${res.status}`;
-        if (isFinal(res.status)) break;
-      } catch (error) {
-        const cause = error instanceof Error ? (error.cause ?? error) : error;
-        failure = cause instanceof Error ? cause.message : String(cause);
-      }
+    const waiting = event.type === "run.waiting";
+    let landed: "stored" | "run_ended" | undefined;
+    try {
+      landed = await retry<"stored" | "run_ended">(
+        async (attempt, cut) => {
+          const res = await fetch(url, {
+            method: "POST",
+            headers: {
+              authorization: `Bearer ${options.agentToken}`,
+              "content-type": "application/json",
+            },
+            body,
+            signal: cut,
+          });
+          // read every body so the keep-alive socket is released
+          const text = await res.text();
+          if (res.ok) return { done: "stored" };
+          // an earlier attempt opened this request, and only its response was lost
+          if (
+            attempt > 1 &&
+            waiting &&
+            res.status === 409 &&
+            errorCode(text) === "request_open"
+          )
+            return { done: "stored" };
+          if (waiting && res.status === 401 && errorCode(text) === "run_ended")
+            return { done: "run_ended" };
+          const failure = `HTTP ${res.status}`;
+          return isTransient(res.status)
+            ? { retry: failure }
+            : { fail: failure };
+        },
+        {
+          sleep: options.sleep,
+          random: options.random,
+          now,
+          deadline: deadline ?? now() + RIDE_OUT_MS,
+          attemptTimeoutMs: giveUp?.aborted ? GIVEN_UP_TIMEOUT_MS : TIMEOUT_MS,
+          ...(!waiting &&
+            !RIDES_OUT.has(event.type) && { maxAttempts: PROGRESS_ATTEMPTS }),
+          signal,
+          giveUp,
+        },
+      );
+    } catch (error) {
+      if (!(error instanceof RetryError)) throw error;
+      const failure = `after ${error.attempts} attempts: ${error.lastFailure ?? "no reply by the deadline"}`;
+      if (event.type === "run.waiting")
+        throw new Error(
+          `run.waiting for request ${event.payload.request.requestId} not recorded ${failure}`,
+        );
+      options.warn(`runner: dropped ${event.type} ${failure}`);
     }
-    options.warn(
-      `runner: dropped ${event.type} after ${attempt} attempts: ${failure}`,
-    );
+    if (landed === "run_ended") throw new RunEndedError();
   };
 }
 
-const isFinal = (status: number) =>
-  status >= 400 && status < 500 && status !== 408 && status !== 429;
+/** A `run.waiting` the API refused because it already stopped or failed the run, and recorded how. */
+export class RunEndedError extends Error {
+  constructor() {
+    super("the run has already ended");
+  }
+}
 
 function errorCode(body: string): unknown {
   try {

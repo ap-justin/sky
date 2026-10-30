@@ -1,4 +1,14 @@
-import { readFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
 import { type Db, migrate, openDb } from "@sky/db";
 import { HttpResponse, http } from "msw";
@@ -6,6 +16,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import { failInterruptedProvisioning } from "./provision.js";
+import { spriteNameFor } from "./sprites.js";
 import {
   type SpritesWire,
   spritesToken,
@@ -70,6 +81,52 @@ const runnerSdk = JSON.parse(
   ),
 ).dependencies["@anthropic-ai/claude-agent-sdk"];
 const installRunnerSdk = `[ -w /opt/sky ] || sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/sky; npm install --prefix /opt/sky --no-audit --no-fund @anthropic-ai/claude-agent-sdk@${runnerSdk}`;
+// the setup runs as `bash -c <setup>` behind an `sh -c` wrapper; what the wrapper does, the shell-run tests pin
+const isSetup = (argv: string[]) => argv[0] === "sh" && argv[4] === "bash";
+const setupCall = (sprite: string, setup: string) =>
+  expect.stringMatching(
+    new RegExp(
+      `^exec ${sprite} /workspace/repo sh -c .+ sh bash -c ${setup.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")} &> /tmp/sky-setup\\.log$`,
+    ),
+  );
+
+// the plugin step's script is opaque here; the plugin tests below run it in node and pin what it does
+const pluginsCall = (sprite: string) =>
+  expect.stringMatching(
+    new RegExp(
+      `^exec ${sprite} /workspace/repo node -e [\\s\\S]+ /opt/sky &> /tmp/sky-plugins\\.log$`,
+    ),
+  );
+
+/**
+ * Runs the setup in a real local shell, as a sprite would: HOME is `home`, and node's bin holds
+ * `corepack` (a script standing in for it) but no pnpm. Git, rm and the runner SDK's install stay stubbed.
+ */
+function runSetupLocally(home: string, corepack: string) {
+  const nodeBin = join(home, "node-bin");
+  mkdirSync(nodeBin);
+  writeFileSync(join(nodeBin, "corepack"), corepack, { mode: 0o755 });
+  wire.exec = (argv) => {
+    if (!isSetup(argv)) return { exitCode: 0 };
+    const out = spawnSync(argv[0] ?? "", argv.slice(1), {
+      cwd: home,
+      env: { HOME: home, PATH: `${nodeBin}:/usr/bin:/bin` },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    return {
+      exitCode: out.status ?? 1,
+      stdout: out.stdout,
+      stderr: out.stderr,
+    };
+  };
+}
+
+// `enable --install-directory <dir>` writes shims that log which path ran them, so a host pnpm can't pass
+const COREPACK_STAND_IN = `#!/bin/sh
+[ "$1 $2" = "enable --install-directory" ] || exit 1
+for pm in pnpm yarn; do printf '#!/bin/sh\\necho "$0 $*" >>"$HOME/shim-runs"\\n' >"$3/$pm"; chmod +x "$3/$pm"; done
+`;
 
 test("POST returns 202 provisioning, then the sprite is created, cloned, set up and checkpointed", async () => {
   const res = await post(kru);
@@ -79,7 +136,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     id: expect.stringMatching(/^env_[0-9A-Za-z]+$/),
     ...kru,
     status: "provisioning",
-    spriteName: `sky-${created.id}`,
+    spriteName: spriteNameFor(created.id),
     checkpointId: null,
     concurrency: 3,
     approvalPolicy: [],
@@ -95,17 +152,280 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     checkpointId: "v1",
     failure: null,
   });
-  const sprite = `sky-${created.id}`;
+  const sprite = spriteNameFor(created.id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `create ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/sky-setup.log`,
+    pluginsCall(sprite),
+    setupCall(sprite, "pnpm install"),
     `checkpoint ${sprite}`,
   ]);
 });
+
+test("the setup script finds pnpm though the sprite ships only node, and a rerun finds it too", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  runSetupLocally(home, COREPACK_STAND_IN);
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(
+      (await patch(id, { setup: "pnpm install --frozen-lockfile" })).status,
+    ).toBe(202);
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(readFileSync(join(home, "shim-runs"), "utf8")).toBe(
+      `${home}/.local/bin/pnpm install\n${home}/.local/bin/pnpm install --frozen-lockfile\n`,
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a corepack that can't enable its shims ends failed at the setup step with its stderr, and the setup never runs", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  runSetupLocally(
+    home,
+    '#!/bin/sh\necho "Internal Error: EACCES" >&2\nexit 1\n',
+  );
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({
+      status: "failed",
+      failure: { step: "setup", stderr: "Internal Error: EACCES\n" },
+    });
+    expect(existsSync(join(home, "shim-runs"))).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+const isPluginInstall = (argv: string[]) =>
+  argv[0] === "node" && argv[1] === "-e";
+
+/**
+ * Runs the plugin step in a real local node, as a sprite would: the clone carries `settings`, and
+ * the runner dir holds the SDK's bundled `claude` as a script that logs its argv.
+ */
+function runPluginsLocally(home: string, settings: unknown, claude?: string) {
+  const repo = join(home, "repo");
+  mkdirSync(join(repo, ".claude"), { recursive: true });
+  if (settings !== undefined) {
+    writeFileSync(
+      join(repo, ".claude", "settings.json"),
+      JSON.stringify(settings),
+    );
+  }
+  const runner = join(home, "runner");
+  const sdkPlatform = join(
+    runner,
+    "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64",
+  );
+  mkdirSync(sdkPlatform, { recursive: true });
+  writeFileSync(
+    join(sdkPlatform, "claude"),
+    claude ?? '#!/bin/sh\necho "$*" >>"$HOME/claude-runs"\n',
+    { mode: 0o755 },
+  );
+  wire.exec = (argv) => {
+    if (!isPluginInstall(argv)) return { exitCode: 0 };
+    const out = spawnSync(
+      process.execPath,
+      argv.slice(1).map((a) => (a === "/opt/sky" ? runner : a)),
+      {
+        cwd: repo,
+        env: { HOME: home, PATH: "/usr/bin:/bin" },
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+    return {
+      exitCode: out.status ?? 1,
+      stdout: out.stdout,
+      stderr: out.stderr,
+    };
+  };
+  return () => {
+    const runs = join(home, "claude-runs");
+    return existsSync(runs) ? readFileSync(runs, "utf8") : "";
+  };
+}
+
+const kruSettings = {
+  extraKnownMarketplaces: {
+    kru: {
+      source: {
+        source: "github",
+        repo: "ap-justin/kru",
+        ref: "v2",
+        sparsePaths: [".claude-plugin", "plugins"],
+      },
+    },
+    tools: {
+      source: {
+        source: "git",
+        url: "https://example.com/tools.git",
+        ref: "main",
+      },
+    },
+    // no enabled plugin comes from it, so its unsupported source is never checked
+    unused: { source: { source: "npm", package: "@acme/marketplace" } },
+  },
+  enabledPlugins: {
+    "kru@kru": true,
+    "lint@tools": true,
+    "off@kru": false,
+  },
+};
+
+test("the plugins the clone's .claude/settings.json enables are installed for the user and brought to their marketplace's latest, after their marketplaces are added and refreshed, before the setup", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const claudeRuns = runPluginsLocally(home, kruSettings);
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(claudeRuns()).toBe(
+      [
+        "plugin marketplace add ap-justin/kru#v2 --sparse .claude-plugin plugins",
+        "plugin marketplace add https://example.com/tools.git#main",
+        "plugin marketplace update",
+        "plugin install kru@kru --scope user",
+        "plugin install lint@tools --scope user",
+        "plugin update kru@kru --scope user",
+        "plugin update lint@tools --scope user",
+        "",
+      ].join("\n"),
+    );
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  ["no .claude/settings.json", undefined],
+  ["settings that enable no plugin", { enabledPlugins: { "off@kru": false } }],
+])("a clone with %s installs no plugin and ends ready", async (_, settings) => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const claudeRuns = runPluginsLocally(home, settings);
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(claudeRuns()).toBe("");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a plugin that fails to install ends failed at the setup step with claude's output, and the setup never runs", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  runPluginsLocally(
+    home,
+    kruSettings,
+    '#!/bin/sh\n[ "$2" = install ] || exit 0\necho "Plugin not found in marketplace" >&2\nexit 1\n',
+  );
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({
+      status: "failed",
+      failure: {
+        step: "setup",
+        stderr: expect.stringContaining("Plugin not found in marketplace"),
+      },
+    });
+    expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test.each([
+  "https://github.com/acme/tools",
+  "git@git.example.com:acme/tools",
+  "https://dev.azure.com/acme/_git/tools",
+])(
+  "a git marketplace at %s, which marketplace add clones without .git, is added as is",
+  async (url) => {
+    const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+    const claudeRuns = runPluginsLocally(home, {
+      extraKnownMarketplaces: { tools: { source: { source: "git", url } } },
+      enabledPlugins: { "lint@tools": true },
+    });
+    try {
+      const { id } = (await (await post(kru)).json()) as { id: string };
+      expect(await settled(id)).toMatchObject({
+        status: "ready",
+        failure: null,
+      });
+      expect(claudeRuns()).toContain(`plugin marketplace add ${url}\n`);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
+
+test.each([
+  [
+    "an npm source",
+    { source: { source: "npm", package: "@acme/tools" } },
+    "unsupported source: npm",
+  ],
+  [
+    "a git url that marketplace add would fetch as JSON",
+    { source: { source: "git", url: "https://git.example.com/acme/tools" } },
+    "isn't a url marketplace add clones",
+  ],
+  [
+    "a url source with headers",
+    {
+      source: {
+        source: "url",
+        url: "https://example.com/marketplace.json",
+        headers: { Authorization: "Bearer t" },
+      },
+    },
+    "headers",
+  ],
+  [
+    "a github source with a path",
+    {
+      source: {
+        source: "github",
+        repo: "acme/tools",
+        path: "meta/marketplace.json",
+      },
+    },
+    "path",
+  ],
+  ["no source", {}, "no source"],
+])(
+  "a used marketplace with %s ends failed at the setup step naming it, before claude or the setup runs",
+  async (_, tools, reason) => {
+    const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+    const claudeRuns = runPluginsLocally(home, {
+      ...kruSettings,
+      extraKnownMarketplaces: { ...kruSettings.extraKnownMarketplaces, tools },
+    });
+    try {
+      const { id } = (await (await post(kru)).json()) as { id: string };
+      expect(await settled(id)).toMatchObject({
+        status: "failed",
+        failure: {
+          step: "setup",
+          stderr: expect.stringMatching(
+            new RegExp(
+              `marketplace "tools" in \\.claude/settings\\.json: .*${reason}`,
+            ),
+          ),
+        },
+      });
+      expect(claudeRuns()).toBe("");
+      expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+);
 
 const ghToken = `ghp_${"a1B2".repeat(9)}`;
 
@@ -134,7 +454,7 @@ test.each([
     step: "setup",
     arrange: () => {
       wire.exec = (argv) =>
-        argv[0] === "bash"
+        isSetup(argv)
           ? {
               exitCode: 1,
               stdout: "installing\n",
@@ -180,8 +500,7 @@ test("a runner SDK install that fails ends failed at the setup step", async () =
 });
 
 test("a setup that fails with no stderr names its exit code", async () => {
-  wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 2 } : { exitCode: 0 };
+  wire.exec = (argv) => (isSetup(argv) ? { exitCode: 2 } : { exitCode: 0 });
   const { id } = (await (await post(kru)).json()) as { id: string };
   expect(await settled(id)).toMatchObject({
     failure: { step: "setup", stderr: "exited with code 2" },
@@ -191,7 +510,7 @@ test("a setup that fails with no stderr names its exit code", async () => {
 test("a setup whose large output arrives re-chunked still ends ready", async () => {
   wire.execChunkBytes = 1024;
   wire.exec = (argv) =>
-    argv[0] === "bash"
+    isSetup(argv)
       ? {
           exitCode: 0,
           stdout: "Progress: resolved 1, reused 1\n".repeat(20_000),
@@ -204,7 +523,7 @@ test("a setup whose large output arrives re-chunked still ends ready", async () 
 test("a failed setup's tail is the last 4000 bytes of its stdout and stderr, however its output arrives", async () => {
   wire.execChunkBytes = 1024;
   wire.exec = (argv) =>
-    argv[0] === "bash"
+    isSetup(argv)
       ? {
           exitCode: 1,
           stdout: `${"Progress: resolved 1\n".repeat(20_000)}ERR_PNPM_NO_LOCKFILE\n`,
@@ -389,13 +708,14 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     status: "ready",
     checkpointId: "v2",
   });
-  const sprite = `sky-${id}`;
+  const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install --frozen-lockfile &> /tmp/sky-setup.log`,
+    pluginsCall(sprite),
+    setupCall(sprite, "pnpm install --frozen-lockfile"),
     `checkpoint ${sprite}`,
   ]);
 });
@@ -408,7 +728,7 @@ test("PATCH that changes repo re-clones from the new remote", async () => {
     repo: "acme/kru-next",
   });
   expect(wire.calls).toContain(
-    `exec sky-${id} - git clone https://github.com/acme/kru-next.git /workspace/repo &> /tmp/sky-clone.log`,
+    `exec ${spriteNameFor(id)} - git clone https://github.com/acme/kru-next.git /workspace/repo &> /tmp/sky-clone.log`,
   );
 });
 
@@ -500,7 +820,7 @@ test("DELETE destroys the sprite, then the row and its agents' history", async (
   seedRun(id, "finished");
   const res = await del(id);
   expect(res.status).toBe(204);
-  expect(wire.calls).toEqual([`delete sky-${id}`]);
+  expect(wire.calls).toEqual([`delete ${spriteNameFor(id)}`]);
   expect(wire.sprites.size).toBe(0);
   expect((await get(id)).status).toBe(404);
   expect(db.$client.prepare("select count(*) as n from agents").get()).toEqual({
@@ -596,7 +916,7 @@ test("DELETE of an env whose sprite never got created still removes the row", as
 
 test("a failure is persisted, so it survives the app that recorded it", async () => {
   wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+    isSetup(argv) ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   expect(
@@ -610,7 +930,7 @@ test("a failure is persisted, so it survives the app that recorded it", async ()
 
 test("a retry clears the previous failure while it provisions", async () => {
   wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+    isSetup(argv) ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   wire.exec = () => ({ exitCode: 0 });
@@ -627,7 +947,7 @@ const retry = (id: string, headers: Record<string, string> = auth) =>
 
 test("retry of a setup failure reruns provisioning on the same spec and ends ready", async () => {
   wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
+    isSetup(argv) ? { exitCode: 1, stderr: "boom\n" } : { exitCode: 0 };
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   wire.exec = () => ({ exitCode: 0 });
@@ -640,13 +960,14 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
     failure: null,
   });
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  const sprite = `sky-${id}`;
+  const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/sky-setup.log`,
+    pluginsCall(sprite),
+    setupCall(sprite, "pnpm install"),
     `checkpoint ${sprite}`,
   ]);
 });
@@ -659,7 +980,10 @@ test("retry of a create failure recreates the sprite before cloning", async () =
   wire.calls.length = 0;
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls.slice(0, 2)).toEqual([`get sky-${id}`, `create sky-${id}`]);
+  expect(wire.calls.slice(0, 2)).toEqual([
+    `get ${spriteNameFor(id)}`,
+    `create ${spriteNameFor(id)}`,
+  ]);
 });
 
 test("an env a restart interrupts mid-setup is failed at that step, its detail saying so", async () => {
@@ -717,10 +1041,13 @@ const interruptedAtBoot = async () => {
 
 test("retry after a boot interruption creates the sprite it never got", async () => {
   const id = await interruptedAtBoot();
-  wire.sprites.delete(`sky-${id}`);
+  wire.sprites.delete(spriteNameFor(id));
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls.slice(0, 2)).toEqual([`get sky-${id}`, `create sky-${id}`]);
+  expect(wire.calls.slice(0, 2)).toEqual([
+    `get ${spriteNameFor(id)}`,
+    `create ${spriteNameFor(id)}`,
+  ]);
 });
 
 test("retry after a boot interruption keeps the sprite that exists", async () => {
@@ -743,8 +1070,7 @@ test("retry is 409 not_failed unless failed, 404 for an unknown env, 401 without
 });
 
 test("a second retry while the first provisions is 409 and starts nothing", async () => {
-  wire.exec = (argv) =>
-    argv[0] === "bash" ? { exitCode: 1 } : { exitCode: 0 };
+  wire.exec = (argv) => (isSetup(argv) ? { exitCode: 1 } : { exitCode: 0 });
   const { id } = (await (await post(kru)).json()) as { id: string };
   await settled(id);
   wire.exec = () => ({ exitCode: 0 });

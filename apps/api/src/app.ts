@@ -33,6 +33,8 @@ export type AppDeps = {
   launchWatchMs?: number;
   /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
   secrets?: KnownSecrets;
+  /** Aborted at shutdown: event streams send a final `server.shutdown` frame and end, parked event polls answer. */
+  closing?: AbortSignal;
 };
 
 export function createApp({
@@ -45,6 +47,7 @@ export function createApp({
   longPollMs = 25_000,
   launchWatchMs = 3_000,
   secrets = KnownSecrets.fromConfig(config),
+  closing = new AbortController().signal,
 }: AppDeps) {
   // bearerAuth answers a malformed header with 400; every auth failure here is one 401
   const unauthorized = (message: string) => (c: Context) =>
@@ -91,6 +94,7 @@ export function createApp({
       c.set("config", config);
       c.set("secrets", secrets);
       c.set("nudgeDeliveries", nudgeDeliveries);
+      c.set("closing", closing);
       await next();
     })
     .get("/healthz", (c) => {

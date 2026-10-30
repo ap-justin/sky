@@ -23,8 +23,9 @@ import {
   type Usage,
 } from "@sky/shared";
 import type { Config } from "./config.js";
-import type { PostEvent } from "./events.js";
+import { type PostEvent, RunEndedError } from "./events.js";
 import { matchesPolicy } from "./policy.js";
+import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
 import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
 
@@ -70,7 +71,11 @@ function sessionOptions(
     resume: config.sessionId,
     abortController,
     env: { ...env, ...SESSION_GIT_IDENTITY },
-    systemPrompt: { type: "preset", preset: "claude_code" },
+    systemPrompt: {
+      type: "preset",
+      preset: "claude_code",
+      ...(env[CONNECTOR_ENV] && { append: publishInstructions() }),
+    },
     // the approval policy holds calls in the PreToolUse hook; everything else runs unasked
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
@@ -79,6 +84,20 @@ function sessionOptions(
     canUseTool,
   };
 }
+
+/**
+ * The sprite holds no GitHub credential, so `git push` and `gh` fail there; the runner's own
+ * `publish` reaches GitHub through the Sprites connector instead.
+ */
+const publishInstructions = () =>
+  [
+    "This sandbox has no GitHub credential, so `git push` and `gh` fail here.",
+    "To publish your branch and open a pull request, commit your work, then run",
+    `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
+    "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
+    "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
+    "Pass a multi-line body from a quoted heredoc, `--body \"$(cat <<'EOF'` … `EOF` `)\"`, so the shell leaves its backticks and `$` alone. A large branch can take minutes to send, so give the Bash call a 10-minute timeout.",
+  ].join("\n");
 
 /**
  * Hooks forward what Claude is doing without holding it up: the event is queued
@@ -245,9 +264,9 @@ export async function runSession(
   const { runId } = config;
   // one queue keeps the API's order the order things happened, hooks included
   let queue = Promise.resolve();
-  const post = (event: RunnerEvent) => {
+  const post = (event: RunnerEvent, options?: Parameters<PostEvent>[1]) => {
     const posted = queue.then(() =>
-      deps.post({ runId, ...event } as RunnerEventPost),
+      deps.post({ runId, ...event } as RunnerEventPost, options),
     );
     queue = posted.catch(() => {});
     return posted;
@@ -303,45 +322,65 @@ export async function runSession(
     );
     return decided;
   };
-  /** The person's decision, or undefined once the session is being torn down. */
+  /**
+   * The person's decision, or undefined when there is none: the SDK cancelled the wait, the session
+   * is being torn down, or the API gave something short of a decision (a request it never stored,
+   * an API unreachable until the deadline, a wait that expired), which stops the session and fails
+   * the run.
+   */
   const waitForDecision = async (
     request: DistributiveOmit<PendingRequest, "requestId">,
     signal: AbortSignal,
   ): Promise<Decision | undefined> => {
     if (abortController.signal.aborted || signal.aborted) return undefined;
     const requestId: RequestId = `req_${randomUUID().replaceAll("-", "")}`;
-    await post({
-      type: "run.waiting",
-      payload: { request: { ...request, requestId } },
-    }).catch(() => {});
-    const expired = new AbortController();
-    const timer = setTimeout(() => expired.abort(), config.waitTimeoutMs);
+    // one budget for opening the request and polling it
+    const deadline = Date.now() + config.waitTimeoutMs;
+    const stop = AbortSignal.any([abortController.signal, signal]);
+    const runEnded = () => {
+      // the API already recorded how the run ended
+      ended = true;
+      stopSession("run ended while waiting");
+      return undefined;
+    };
     try {
-      const outcome = await deps.awaitDecision(
-        requestId,
-        AbortSignal.any([abortController.signal, signal, expired.signal]),
+      await post(
+        {
+          type: "run.waiting",
+          payload: { request: { ...request, requestId } },
+        },
+        { deadline, signal: stop },
       );
+      const outcome = await deps.awaitDecision(requestId, stop, deadline);
       switch (outcome.kind) {
         case "decided":
           return outcome.decision;
         case "run_ended":
-          // the API already recorded how the run ended
-          ended = true;
-          stopSession("run ended while waiting");
-          return undefined;
+          return runEnded();
         case "lost":
           stopSession(`request ${requestId} was never recorded`);
           return undefined;
+        case "expired":
+          stopSession("waiting_timeout");
+          return undefined;
       }
     } catch (error) {
-      if (expired.signal.aborted) stopSession("waiting_timeout");
-      else if (!abortController.signal.aborted && !signal.aborted)
-        stopSession(`waiting failed: ${messageOf(error)}`);
+      if (error instanceof RunEndedError) return runEnded();
+      if (!stop.aborted) stopSession(messageOf(error));
       return undefined;
-    } finally {
-      clearTimeout(timer);
     }
   };
+
+  /** Why a held call can't go ahead: the run is ending, which is not the person's answer. */
+  const endingReason = () =>
+    `The run is ending: ${stopReason ?? "it was stopped"}.`;
+  /** The SDK cancelled this one hook or permission prompt; the session goes on. */
+  const WAIT_CANCELLED = "The approval wait was cancelled.";
+  const denyCall = (reason: string) => ({
+    hookEventName: "PreToolUse" as const,
+    permissionDecision: "deny" as const,
+    permissionDecisionReason: reason,
+  });
 
   const gate = async (
     input: PreToolUseHookInput,
@@ -364,15 +403,23 @@ export async function runSession(
     );
     // approve adds nothing: an explicit allow would also skip canUseTool, which answers AskUserQuestion
     if (decision?.decision === "approve") return { continue: true };
+    if (decision === undefined) {
+      if (!abortController.signal.aborted)
+        return { continue: true, hookSpecificOutput: denyCall(WAIT_CANCELLED) };
+      // a stop, not a denial; the deny is still needed: Claude Code runs the tool on `continue: false` alone, then stops
+      const reason = endingReason();
+      return {
+        continue: false,
+        stopReason: reason,
+        hookSpecificOutput: denyCall(reason),
+      };
+    }
     return {
       continue: true,
-      hookSpecificOutput: {
-        hookEventName: "PreToolUse",
-        permissionDecision: "deny",
-        permissionDecisionReason:
-          (decision?.decision === "deny" && decision.reason) ||
-          (decision ? "The user denied this tool call." : "The run is ending."),
-      },
+      hookSpecificOutput: denyCall(
+        (decision.decision === "deny" && decision.reason) ||
+          "The user denied this tool call.",
+      ),
     };
   };
 
@@ -389,12 +436,16 @@ export async function runSession(
       { kind: "question", prompt: questionPrompt(input) },
       signal,
     );
-    if (decision?.decision !== "answer")
+    if (decision === undefined)
+      return abortController.signal.aborted
+        ? { behavior: "deny", interrupt: true, message: endingReason() }
+        : { behavior: "deny", message: WAIT_CANCELLED };
+    if (decision.decision !== "answer")
       return {
         behavior: "deny",
         message:
-          (decision?.decision === "deny" && decision.reason) ||
-          (decision ? "The user declined to answer." : "The run is ending."),
+          (decision.decision === "deny" && decision.reason) ||
+          "The user declined to answer.",
       };
     // one answer covers every question: the person replies once, in their own words
     const answers = Object.fromEntries(
@@ -410,9 +461,12 @@ export async function runSession(
   let streamError: string | undefined;
   let started = false;
   let stopMessage: string | undefined;
+  // Claude's activity stops retrying once the session stops, so the ending event isn't queued behind
+  // its backoff; each event still gets its one attempt
+  const progress = { giveUp: abortController.signal };
   const hooks = sessionHooks(gateTimeoutS(config.waitTimeoutMs), {
     // a failed post must not fail the tool call that triggered it
-    event: (event) => void post(event).catch(() => {}),
+    event: (event) => void post(event, progress).catch(() => {}),
     stop: (lastMessage) => {
       stopMessage = lastMessage || stopMessage;
     },
@@ -434,10 +488,13 @@ export async function runSession(
         const parent = message.parent_tool_use_id;
         // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
-          void post({
-            type: "claude.Message",
-            payload: { text, ...(parent && { parentToolUseId: parent }) },
-          }).catch(() => {});
+          void post(
+            {
+              type: "claude.Message",
+              payload: { text, ...(parent && { parentToolUseId: parent }) },
+            },
+            progress,
+          ).catch(() => {});
       } else if (message.type === "result") {
         result = message;
       }

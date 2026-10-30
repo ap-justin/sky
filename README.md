@@ -46,6 +46,19 @@ sky secret set web NPM_TOKEN < token.txt
 
 Stores a secret on an environment; on a terminal it prompts without echo. `sky --help` lists the options, the config file location, and exit codes.
 
+## Pull requests
+
+An agent's sandbox holds no GitHub token, so `git push` and `gh` don't work there. Agents publish through a Sprites connector to GitHub instead:
+
+1. In the Sprites org whose token Sky runs with (`SPRITES_TOKEN`), connect GitHub and give the connector a policy with `name_prefix: sky-`, so every Sky sandbox can use it.
+2. Hand its connection id to an environment:
+
+   ```
+   sky secret set web GITHUB_CONNECTOR --connector=<connection id>
+   ```
+
+Agents in that environment then get `GITHUB_CONNECTOR` and are told to publish with Sky's own command, which sends the branch's commits to GitHub and opens a pull request into the default branch, or updates the one already open. The connector must belong to the same Sprites org as `SPRITES_TOKEN`; another org's connector doesn't recognize Sky's sandboxes.
+
 ## REST API
 
 All routes live under `/v1`. Ids are prefixed: `env_…`, `agent_…`, `run_…`.
@@ -105,7 +118,7 @@ The `claude.*` names are Claude Code's own hook names. Each text field is redact
 Three ways to receive them:
 
 - **MCP:** `wait_for_events`, above.
-- **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. `GET /v1/events?after=&wait=` is the same feed as a long poll.
+- **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. When the server restarts, the stream ends with an `event: server.shutdown` frame whose `id` is your resume point and whose `retry: 2000` asks you to reconnect in 2 seconds; `EventSource` does this on its own. `GET /v1/events?after=&wait=` is the same feed as a long poll.
 - **Webhooks:** `POST /v1/webhooks` with an `https` URL and the `eventTypes` you want. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
 
 ```

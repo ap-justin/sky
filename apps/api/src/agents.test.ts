@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
@@ -10,12 +11,14 @@ import {
   type RunId,
   truncationMarker,
 } from "@sky/shared";
-import { ws } from "msw";
+import { eq } from "drizzle-orm";
+import { HttpResponse, http, ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { failStaleRuns } from "./runs.js";
+import { spriteNameFor } from "./sprites.js";
 import {
   envFileOf,
   type SpritesWire,
@@ -69,12 +72,12 @@ function readyEnv(
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `sky-${id}`,
+      spriteName: spriteNameFor(id),
       checkpointId: "v1",
       ...overrides,
     })
     .run();
-  wire.sprites.add(`sky-${id}`);
+  wire.sprites.add(spriteNameFor(id));
   return id;
 }
 
@@ -136,7 +139,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   const envId = readyEnv();
   const { agent, run } = await launched(envId);
   await sessionOpened();
-  const sprite = `sky-${envId}`;
+  const sprite = spriteNameFor(envId);
   expect(wire.calls).toEqual([
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
     // written beside it, then renamed over it: a node starting on the bundle never reads it half-written
@@ -182,6 +185,39 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   );
 });
 
+test("the runner, and so its agent's shell, finds the pnpm provisioning enabled under ~/.local/bin", async () => {
+  await launched(readyEnv());
+  await sessionOpened();
+  const session = wire.sessions[0];
+  if (!session) throw new Error("no session");
+  // runs the session's command locally, where a stub node prints what pnpm resolves to, as an agent's shell would
+  writeFileSync(join(dir, "node"), "#!/bin/sh\ncommand -v pnpm\n", {
+    mode: 0o755,
+  });
+  mkdirSync(join(dir, ".local/bin"), { recursive: true });
+  writeFileSync(join(dir, ".local/bin/pnpm"), "#!/bin/sh\n", { mode: 0o755 });
+  const local = (path: string) => {
+    const at = join(dir, path.replaceAll("/", "_"));
+    writeFileSync(at, wire.files.get(path) ?? "");
+    return at;
+  };
+  const out = spawnSync(session.argv[0] ?? "", session.argv.slice(1), {
+    env: {
+      ...session.env,
+      ENV_FILE: local(session.env.ENV_FILE ?? ""),
+      PROMPT_FILE: local(session.env.PROMPT_FILE ?? ""),
+      HOME: dir,
+      PATH: `${dir}:/usr/bin:/bin`,
+    },
+    encoding: "utf8",
+    timeout: 10_000,
+  });
+  expect({ stdout: out.stdout, stderr: out.stderr }).toEqual({
+    stdout: `${dir}/.local/bin/pnpm\n`,
+    stderr: "",
+  });
+});
+
 test("the runner gets the env's approval policy as a JSON array", async () => {
   await launched(readyEnv({ approvalPolicy: ["Bash", "mcp__github__*"] }));
   await sessionOpened();
@@ -197,7 +233,7 @@ const putSecret = (envId: string, name: string, body: unknown) =>
     body: JSON.stringify(body),
   });
 
-test("the env's value secrets reach the runner through the env file, quotes intact; a connector injects nothing", async () => {
+test("the env's secrets reach the runner through the env file, quotes intact; a connector as its connection id", async () => {
   const envId = readyEnv();
   const tricky = `it's "quoted" $HOME \`x\`\nline two`;
   expect((await putSecret(envId, "TRICKY", { value: tricky })).status).toBe(
@@ -206,15 +242,17 @@ test("the env's value secrets reach the runner through the env file, quotes inta
   expect(
     (await putSecret(envId, "DB_URL", { value: "postgres://u:p@db/x" })).status,
   ).toBe(200);
-  expect((await putSecret(envId, "GH", { connector: "github" })).status).toBe(
-    200,
-  );
+  expect(
+    (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
+      .status,
+  ).toBe(200);
   const { agent, run } = await launched(envId);
   await sessionOpened();
   const session = wire.sessions[0];
   expect(envFileOf(wire, session)).toEqual({
     TRICKY: tricky,
     DB_URL: "postgres://u:p@db/x",
+    GITHUB_CONNECTOR: "VPpb7x",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
   });
@@ -225,6 +263,7 @@ test("the env's value secrets reach the runner through the env file, quotes inta
   await vi.waitFor(async () =>
     expect((await getRun(agent.id, run.id)).body.secretNames).toEqual([
       "DB_URL",
+      "GITHUB_CONNECTOR",
       "TRICKY",
     ]),
   );
@@ -244,7 +283,7 @@ test("a runner session that fails to open fails the run and deletes the env file
     expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
   );
   expect(wire.calls).toContain(
-    `exec sky-${envId} - rm -f /workspace/runs/${run.id}.env`,
+    `exec ${spriteNameFor(envId)} - rm -f /workspace/runs/${run.id}.env`,
   );
 });
 
@@ -415,6 +454,159 @@ test("a launch the sprite rejects fails the run with a redacted error and frees 
     db.$client.prepare("select status from agents where id = ?").get(agent.id),
   ).toEqual({ status: "idle" });
   expect(wire.sessions).toEqual([]);
+});
+
+const envRow = (id: string) =>
+  db.$client
+    .prepare(
+      "select status, failure_step as failureStep, failure_stderr as failureStderr from environments where id = ?",
+    )
+    .get(id);
+
+const runStatus = (id: string) =>
+  db.$client.prepare("select status from runs where id = ?").get(id);
+
+// read from the event, since GET on a run reads its diff from the sprite, which is gone
+const runFailure = (id: string) =>
+  (
+    db.$client
+      .prepare(
+        "select json_extract(payload, '$.error') as error from events where run_id = ? and type = 'run.failed'",
+      )
+      .get(id) as { error: string } | undefined
+  )?.error;
+
+/** Runs `onBundleCheck` when the launch first execs in the sprite, so the sprite can vanish mid-launch. */
+const onFirstExec = (onBundleCheck: () => void) => {
+  const exec = wire.exec;
+  wire.exec = (argv) => {
+    if (argv[0] === "sha256sum") onBundleCheck();
+    return exec(argv);
+  };
+};
+
+test("a launch on a sprite that no longer exists fails the run and marks the ready environment failed", async () => {
+  const envId = readyEnv();
+  wire.sprites.delete(spriteNameFor(envId));
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({
+      status: "failed",
+      failureStep: "create",
+      failureStderr: expect.stringContaining(spriteNameFor(envId)),
+    }),
+  );
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect(runFailure(run.id)).toMatch(/^launch_failed: /);
+});
+
+test("a sprite that vanishes mid-launch, failing a file write rather than an exec, marks the environment failed", async () => {
+  const envId = readyEnv();
+  onFirstExec(() => {
+    wire.sprites.delete(spriteNameFor(envId));
+    wire.writeStatus = 404;
+  });
+  await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({ status: "failed" }),
+  );
+});
+
+test("a launch that fails on a sprite that still exists fails the run and leaves the environment ready", async () => {
+  wire.writeStatus = 404;
+  const envId = readyEnv();
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect(wire.calls).toContain(`get ${spriteNameFor(envId)}`);
+  expect(envRow(envId)).toMatchObject({
+    status: "ready",
+    failureStep: null,
+    failureStderr: null,
+  });
+});
+
+test("a missing sprite does not fail an environment that is no longer ready", async () => {
+  const envId = readyEnv();
+  onFirstExec(() => {
+    wire.sprites.delete(spriteNameFor(envId));
+    wire.writeStatus = 500;
+    db.update(environments)
+      .set({ status: "provisioning" })
+      .where(eq(environments.id, envId))
+      .run();
+  });
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect(wire.calls).toContain(`get ${spriteNameFor(envId)}`);
+  expect(envRow(envId)).toMatchObject({
+    status: "provisioning",
+    failureStderr: null,
+  });
+});
+
+test("a sprite lookup that errors leaves the environment ready and the run failed with the launch's own error", async () => {
+  wire.writeStatus = 500;
+  server.use(
+    http.get("https://api.sprites.dev/v1/sprites/:name", () =>
+      HttpResponse.json({ error: "upstream unavailable" }, { status: 503 }),
+    ),
+  );
+  const envId = readyEnv();
+  const { agent, run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect((await getRun(agent.id, run.id)).body.error).toMatch(
+    /^launch_failed: .*write failed/,
+  );
+  expect(envRow(envId)).toMatchObject({ status: "ready" });
+  expect(
+    logs.some((line) => line.startsWith("checking whether the sprite of")),
+  ).toBe(true);
+});
+
+test("retrying an environment failed for its missing sprite recreates the sprite, clears the failure and takes a new run", async () => {
+  const envId = readyEnv();
+  const sprite = spriteNameFor(envId);
+  wire.sprites.delete(sprite);
+  const first = await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({ status: "failed" }),
+  );
+  // the lost sprite took the agent's Claude session with it
+  db.$client
+    .prepare("update agents set session_id = 'sess_gone' where id = ?")
+    .run(first.agent.id);
+  const res = await app.request(`/v1/environments/${envId}/retry`, {
+    method: "POST",
+    headers: auth,
+  });
+  expect(res.status).toBe(202);
+  await vi.waitFor(
+    () =>
+      expect(envRow(envId)).toMatchObject({
+        status: "ready",
+        failureStep: null,
+        failureStderr: null,
+      }),
+    { timeout: 5000 },
+  );
+  expect(wire.calls).toContain(`create ${sprite}`);
+  expect(
+    db.$client
+      .prepare("select session_id as sessionId from agents where id = ?")
+      .get(first.agent.id),
+  ).toEqual({ sessionId: null });
+  const second = await launched(envId);
+  await sessionOpened();
+  expect(wire.sessions[0]?.sprite).toBe(sprite);
+  expect(runStatus(second.run.id)).toMatchObject({ status: "starting" });
 });
 
 const usage = {
@@ -849,7 +1041,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     secretNames: [],
   });
   expect(wire.calls.at(-1)).toBe(
-    `exec sky-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
+    `exec ${spriteNameFor(envId)} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
   );
 });
 
@@ -1030,7 +1222,7 @@ test("GET of an ended run whose branch never existed has a null diff", async () 
 
 test("GET while the sprite is unreachable gets 502", async () => {
   const { agent, run, envId } = await finishedRun();
-  wire.sprites.delete(`sky-${envId}`);
+  wire.sprites.delete(spriteNameFor(envId));
   const { status, body } = await getRun(agent.id, run.id);
   expect(status).toBe(502);
   expect(body).toMatchObject({ error: { code: "sprite_unreachable" } });
@@ -1305,7 +1497,7 @@ test("stop SIGTERMs the run's runner, marks the run stopped and frees its cap sl
     'exec node /opt/sky/runner.mjs "$RUN_ID"',
   );
   expect(wire.calls.at(-1)).toBe(
-    `exec sky-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+    `exec ${spriteNameFor(envId)} - pkill -TERM -f ${runnerPattern(run.id)}`,
   );
   expect(
     db.$client.prepare("select type from events order by id").all(),
@@ -1350,7 +1542,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   ).toEqual({ status: "idle" });
   // the wait is bounded on the sprite, to the same 30 s archive allows
   const wait = wire.calls.at(-1) ?? "";
-  expect(wait.startsWith(`exec sky-${envId} - bash -c `)).toBe(true);
+  expect(wait.startsWith(`exec ${spriteNameFor(envId)} - bash -c `)).toBe(true);
   expect(wait).toContain("seq 30");
 
   alive = false;
@@ -1362,7 +1554,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
 
 test("a follow-up whose wait for the previous runner can't reach the sprite gets 502 and starts nothing", async () => {
   const { agent, envId } = await finishedRun();
-  wire.sprites.delete(`sky-${envId}`);
+  wire.sprites.delete(spriteNameFor(envId));
   const res = await followUp(agent.id, { prompt: "again" });
   expect(res.status).toBe(502);
   expect(await res.json()).toMatchObject({
@@ -1389,7 +1581,7 @@ test("stopping an agent with no active run is a 200 no-op that never wakes the s
 
 test("a stop whose signal can't reach the sprite still stops the run, and logs it", async () => {
   const { agent, run, envId } = await runningRun();
-  wire.sprites.delete(`sky-${envId}`);
+  wire.sprites.delete(spriteNameFor(envId));
   const res = await action(agent.id, "stop");
   expect(res.status).toBe(200);
   expect(await res.json()).toMatchObject({ run: { status: "stopped" } });
@@ -1430,7 +1622,7 @@ test("stop or archive without a bearer gets 401 and touches nothing", async () =
 
 const worktreeRemoval = (envId: string, agentId: string) =>
   new RegExp(
-    `^exec sky-${envId} /workspace/repo bash -c .*git worktree remove --force "\\$1".* _ /workspace/worktrees/${agentId}`,
+    `^exec ${spriteNameFor(envId)} /workspace/repo bash -c .*git worktree remove --force "\\$1".* _ /workspace/worktrees/${agentId}`,
   );
 
 test("archive stops the active run, waits for its runner, then removes the worktree and keeps the branch", async () => {
@@ -1446,7 +1638,7 @@ test("archive stops the active run, waits for its runner, then removes the workt
   });
   const [signal, removal] = wire.calls.slice(-2);
   expect(signal).toBe(
-    `exec sky-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+    `exec ${spriteNameFor(envId)} - pkill -TERM -f ${runnerPattern(run.id)}`,
   );
   expect(removal).toMatch(worktreeRemoval(envId, agent.id));
   // the runner commits after SIGTERM, so removal waits until no process matches it
@@ -1510,7 +1702,7 @@ test.each([
   [
     "the sprite is unreachable",
     (w: SpritesWire, envId: string) => {
-      w.sprites.delete(`sky-${envId}`);
+      w.sprites.delete(spriteNameFor(envId));
     },
   ],
 ])("an archive where %s gets 502 and stays archived", async (_, breakIt) => {

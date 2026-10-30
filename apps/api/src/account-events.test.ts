@@ -12,6 +12,8 @@ import {
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
 import { anyRun, runEvents } from "./run-events.js";
+import { recordEvent } from "./runs.js";
+import { spriteNameFor } from "./sprites.js";
 import {
   type SpritesWire,
   spritesToken,
@@ -25,6 +27,7 @@ const auth = { Authorization: `Bearer ${config.apiKey}` };
 let db: Db;
 let app: ReturnType<typeof createApp>;
 let wire: SpritesWire;
+let closing: AbortController;
 
 const subscriptions: (() => void)[] = [];
 let subscribeSpy: MockInstance<typeof runEvents.subscribe>;
@@ -41,6 +44,7 @@ beforeEach(() => {
   db = openDb(":memory:");
   migrate(db);
   wire = stubSprites();
+  closing = new AbortController();
   app = createApp({
     db,
     config,
@@ -48,6 +52,7 @@ beforeEach(() => {
     log: () => {},
     nudgeDeliveries: () => {},
     heartbeatMs: 50,
+    closing: closing.signal,
   });
 });
 afterEach(() => {
@@ -71,7 +76,7 @@ function runningRun() {
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `sky-${envId}`,
+      spriteName: spriteNameFor(envId),
       checkpointId: "v1",
     })
     .run();
@@ -234,6 +239,115 @@ const pings = (s: ReturnType<typeof sseReader>, count: number, ms: number) =>
     new Promise<boolean>((r) => setTimeout(() => r(false), ms)),
   ]);
 
+test("closing ends the stream with a shutdown frame carrying its cursor, and releases its listener", async () => {
+  const a = runningRun();
+  const s = sseReader(await stream());
+  await until(() => runEvents.listenerCount(anyRun) === 1);
+  const id = await say(a.runId, "before shutdown");
+  expect((await s.event())?.id).toBe(String(id));
+  closing.abort();
+  expect(await s.event()).toEqual({
+    event: "server.shutdown",
+    retry: "2000",
+    id: String(id),
+    data: '{"reason":"shutdown"}',
+  });
+  expect(await s.next()).toBeNull();
+  await until(() => runEvents.listenerCount(anyRun) === 0);
+});
+
+test("a stream opened after closing gets the shutdown frame and ends at once", async () => {
+  const a = runningRun();
+  const id = await say(a.runId, "before shutdown");
+  closing.abort();
+  const s = sseReader(await stream("?types=run.waiting"));
+  expect(await s.event()).toEqual({
+    event: "server.shutdown",
+    retry: "2000",
+    id: String(id),
+    data: '{"reason":"shutdown"}',
+  });
+  expect(await s.next()).toBeNull();
+  expect(runEvents.listenerCount(anyRun)).toBe(0);
+});
+
+/** Stores and publishes an event in one synchronous step, so a caller can act in the same tick. */
+const publishNow = (runId: RunId, text: string) =>
+  db.transaction((tx) => recordEvent(tx, runId, "claude.Message", { text }).id);
+
+/** A fresh app on the same db, standing in for the next process, streaming from `lastEventId`. */
+const streamOnNextProcess = (lastEventId: string | undefined) =>
+  createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: () => {},
+    nudgeDeliveries: () => {},
+    heartbeatMs: 50,
+  }).request("/v1/stream", {
+    headers: { ...auth, "Last-Event-ID": lastEventId ?? "" },
+  });
+
+/** Event ids up to the shutdown frame, and that frame. */
+async function untilShutdown(s: ReturnType<typeof sseReader>) {
+  const ids: string[] = [];
+  for (let f = await s.event(); f; f = await s.event()) {
+    if (f.event === "server.shutdown") return { ids, shutdown: f };
+    ids.push(f.id ?? "");
+  }
+  throw new Error("the stream ended without a shutdown frame");
+}
+
+test.each([2, 120])(
+  "a client resuming from the shutdown frame's id on the next process gets each of %i missed events once, then live ones",
+  async (count) => {
+    const a = runningRun();
+    const s = sseReader(await stream());
+    await until(() => runEvents.listenerCount(anyRun) === 1);
+    const seen = await say(a.runId, "A");
+    expect((await s.event())?.id).toBe(String(seen));
+    closing.abort();
+    const { shutdown: shutdownFrame } = await untilShutdown(s);
+    expect(shutdownFrame.id).toBe(String(seen));
+    const missed: number[] = [];
+    for (let i = 0; i < count; i++) missed.push(publishNow(a.runId, `m${i}`));
+
+    const resumed = sseReader(await streamOnNextProcess(shutdownFrame.id));
+    const got: (string | undefined)[] = [];
+    for (let i = 0; i < count; i++) got.push((await resumed.event())?.id);
+    expect(got).toEqual(missed.map(String));
+    // still live after the replay, and nothing was repeated
+    const live = await say(a.runId, "live");
+    expect((await resumed.event())?.id).toBe(String(live));
+    await resumed.cancel();
+  },
+);
+
+test("an abort that lands in the same tick as publishes loses and repeats none of them across the resume", async () => {
+  const a = runningRun();
+  const s = sseReader(await stream());
+  await until(() => runEvents.listenerCount(anyRun) === 1);
+  // no await between the publishes and the abort, so the stream is mid-read when it exits
+  const published = [
+    publishNow(a.runId, "r1"),
+    publishNow(a.runId, "r2"),
+    publishNow(a.runId, "r3"),
+  ];
+  closing.abort();
+  const { ids: before, shutdown: shutdownFrame } = await untilShutdown(s);
+
+  const resumed = sseReader(await streamOnNextProcess(shutdownFrame.id));
+  const after: (string | undefined)[] = [];
+  for (let i = before.length; i < published.length; i++) {
+    after.push((await resumed.event())?.id);
+  }
+  // a live event read right after the replay proves nothing repeated, so the two lists are exact
+  const live = await say(a.runId, "live");
+  expect((await resumed.event())?.id).toBe(String(live));
+  await resumed.cancel();
+  expect([...before, ...after]).toEqual(published.map(String));
+});
+
 test("a stream filtered to run.waiting keeps pinging every heartbeat while unrelated events flow", async () => {
   const a = runningRun();
   const s = sseReader(await stream("?types=run.waiting"));
@@ -287,9 +401,15 @@ const poll = (query = "", signal?: AbortSignal) =>
 
 type Page = { data: { id: string; type: string }[]; cursor: string };
 
-/** Resolves once a poll is subscribed and waiting; setImmediate isn't among the faked timers. */
+/**
+ * Resolves once a poll is subscribed and waiting; setImmediate isn't among the faked timers. The turns a
+ * request takes to reach the handler vary with load, so the wait is bounded by wall-clock time (Date isn't
+ * faked) and fails here, under the default 5s test timeout, rather than leaving the loop spinning.
+ */
 const parked = async () => {
-  for (let i = 0; i < 100 && runEvents.listenerCount(anyRun) === 0; i++) {
+  const deadline = Date.now() + 3_000;
+  while (runEvents.listenerCount(anyRun) === 0) {
+    if (Date.now() > deadline) throw new Error("the poll never subscribed");
     await new Promise((r) => setImmediate(r));
   }
   expect(runEvents.listenerCount(anyRun)).toBe(1);
@@ -363,6 +483,31 @@ test("a poll that times out returns no events and the start as its cursor", asyn
     data: [],
     cursor: `evt_${latest}`,
   });
+});
+
+test("closing answers a parked poll at once with no events and its cursor", async () => {
+  const a = runningRun();
+  const latest = await say(a.runId, "old");
+  const pending = poll("?wait=30");
+  await parked();
+  const started = Date.now();
+  closing.abort();
+  const res = await pending;
+  expect(Date.now() - started).toBeLessThan(1_000);
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ data: [], cursor: `evt_${latest}` });
+});
+
+test("a poll made after closing answers at once with no events and its cursor", async () => {
+  const a = runningRun();
+  const latest = await say(a.runId, "old");
+  closing.abort();
+  const started = Date.now();
+  const res = await poll(`?after=evt_${latest}&wait=30`);
+  expect(Date.now() - started).toBeLessThan(1_000);
+  expect(res.status).toBe(200);
+  expect(await res.json()).toEqual({ data: [], cursor: `evt_${latest}` });
+  expect(runEvents.listenerCount(anyRun)).toBe(0);
 });
 
 test("a timed-out poll's cursor moves past the events its filter skipped", async () => {
@@ -453,6 +598,71 @@ test("reading events makes no sprite call", async () => {
   await s.cancel();
   await (await poll(`?after=evt_${start}`)).json();
   expect(wire.calls).toEqual([]);
+});
+
+test("the stream keeps delivering after an agent waits and is approved", async () => {
+  const { agentId, runId } = runningRun();
+  const s = sseReader(await stream());
+  await until(() => runEvents.listenerCount(anyRun) === 1);
+  const types: (string | undefined)[] = [];
+  // each step reads its frame, then waits past a heartbeat, as a live client does
+  const step = async (act: () => Promise<unknown>) => {
+    await act();
+    types.push((await s.event())?.event);
+    await new Promise((r) => setTimeout(r, 120));
+  };
+  // Grok Bot's wait_for_events long-poll, open alongside the stream
+  const bot = poll("?wait=5");
+  await step(() => toolUse(runId));
+  await step(() =>
+    post(runId, "run.waiting", {
+      request: {
+        kind: "approval",
+        requestId: "req_1",
+        toolName: "Bash",
+        toolSummary: "ls",
+      },
+    }),
+  );
+  // the runner's long-poll for the decision
+  const runner = app.request(`/internal/runs/${runId}/requests/req_1`, {
+    headers: {
+      Authorization: `Bearer ${mintAgentToken(config.apiKey, runId)}`,
+    },
+  });
+  await step(() =>
+    post(runId, "claude.Notification", {
+      message: "Claude needs your permission to use Bash",
+      notificationType: "permission_prompt",
+    }),
+  );
+  await step(async () => {
+    const res = await app.request(`/v1/agents/${agentId}/approvals`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ requestId: "req_1", decision: "approve" }),
+    });
+    expect(res.status).toBe(200);
+    expect((await runner).status).toBe(200);
+  });
+  await step(() =>
+    post(runId, "claude.PostToolUse", {
+      toolName: "Bash",
+      toolUseId: "t1",
+      input: '{"command":"ls"}',
+      output: "README.md",
+      durationMs: 3,
+    }),
+  );
+  await s.cancel();
+  await bot;
+  expect(types).toEqual([
+    "claude.PreToolUse",
+    "run.waiting",
+    "claude.Notification",
+    "run.resumed",
+    "claude.PostToolUse",
+  ]);
 });
 
 test("the sprite call log sees a sprite lookup and a file read", async () => {

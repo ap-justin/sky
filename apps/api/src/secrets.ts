@@ -79,21 +79,20 @@ const sealedOf = (row: {
   };
 };
 
-/** The env's value secrets, decrypted; connector secrets inject nothing. */
+/**
+ * The env's secrets as the runner gets them: a value secret decrypted, a connector secret as its
+ * Sprites connection id, which a call through the sprite's connector gateway names.
+ */
 export function openEnvSecrets(
   db: Db,
   key: Buffer,
   envId: EnvironmentId,
 ): Map<string, string> {
-  const rows = db
-    .select()
-    .from(secrets)
-    .where(and(eq(secrets.envId, envId), eq(secrets.kind, "value")))
-    .all();
+  const rows = db.select().from(secrets).where(eq(secrets.envId, envId)).all();
   return new Map(
     rows.map((row) => [
       row.name,
-      open(key, sealedOf(row), envSecretAad(envId, row.name)),
+      row.connector ?? open(key, sealedOf(row), envSecretAad(envId, row.name)),
     ]),
   );
 }

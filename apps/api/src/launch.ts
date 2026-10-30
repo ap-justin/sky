@@ -1,22 +1,32 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { SpritesClient } from "@fly/sprites";
-import { type Db, runs } from "@sky/db";
+import { type Db, environments, runs } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";
-import { REPO_DIR, RUNNER_DIR, WORKTREES_DIR } from "./provision.js";
+import {
+  REPO_DIR,
+  RUNNER_DIR,
+  WITH_PACKAGE_MANAGERS,
+  WORKTREES_DIR,
+} from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import { failRun, isActive } from "./runs.js";
 import { openEnvSecrets, openRunEnvVars } from "./secrets.js";
-import { execInSprite, startDetached, writeSpriteFile } from "./sprites.js";
+import {
+  execInSprite,
+  spriteExists,
+  startDetached,
+  writeSpriteFile,
+} from "./sprites.js";
 
 const RUNNER = `${RUNNER_DIR}/runner.mjs`;
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
 // the run id in argv is what `runnerPattern` matches; the runner itself ignores it
-const RUNNER_COMMAND = `set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
+const RUNNER_COMMAND = `${WITH_PACKAGE_MANAGERS} && set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
@@ -138,7 +148,10 @@ export type Launch = {
   approvalPolicy: string[];
 };
 
-/** Starts runners in the background; a launch that fails fails its run with a redacted `launch_failed` error. */
+/**
+ * Starts runners in the background; a launch that fails fails its run with a redacted
+ * `launch_failed` error, and its environment too when its sprite is gone.
+ */
 export function createLauncher({
   db,
   config,
@@ -260,10 +273,49 @@ export function createLauncher({
     });
   }
 
+  /**
+   * A failed launch may mean the sprite is gone (an org move, a manual delete). The SDK reports a
+   * missing sprite differently per call (an `APIError` from exec, a `FilesystemError` from a file
+   * write, a socket error from a session), so the lookup decides, not the error. When it confirms
+   * the sprite is gone, a ready environment fails at `create`, so `POST /v1/environments/:id/retry`
+   * recreates the sprite. Throws when the lookup fails.
+   */
+  async function failEnvIfSpriteGone(launch: Launch): Promise<void> {
+    if (await spriteExists(sprites, launch.spriteName)) return;
+    const marked = db
+      .update(environments)
+      .set({
+        status: "failed",
+        failureStep: "create",
+        failureStderr: `sprite ${launch.spriteName} no longer exists; a retry recreates it`,
+      })
+      .where(
+        and(
+          eq(environments.id, launch.envId),
+          eq(environments.status, "ready"),
+        ),
+      )
+      .run();
+    if (marked.changes > 0) {
+      log(
+        `sprite ${launch.spriteName} is gone; environment ${launch.envId} marked failed`,
+      );
+    }
+  }
+
   return {
     start(launch: Launch): void {
       const agentToken = mintAgentToken(config.apiKey, launch.runId);
       run(launch, agentToken)
+        .catch(async (err: unknown) => {
+          await failEnvIfSpriteGone(launch).catch((checkErr: unknown) => {
+            log(
+              `checking whether the sprite of environment ${launch.envId} exists failed: ${checkErr}`,
+            );
+          });
+          // rethrown: the next catch still fails the run
+          throw err;
+        })
         .catch((err: unknown) => {
           // the SDK's socket errors quote the session URL, which carries the env
           const detail = redact(
