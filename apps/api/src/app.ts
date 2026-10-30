@@ -5,6 +5,7 @@ import type { Context } from "hono";
 import { bearerAuth } from "hono/bearer-auth";
 import { HTTPException } from "hono/http-exception";
 import { logger } from "hono/logger";
+import { accountEventRoutes } from "./account-events.js";
 import { agentRoutes } from "./agents.js";
 import type { Config } from "./config.js";
 import { environmentRoutes } from "./environments.js";
@@ -24,7 +25,7 @@ export type AppDeps = {
   log: (line: string) => void;
   /** Wakes the delivery loop after ingestion enqueues webhook deliveries; must not block. */
   nudgeDeliveries: () => void;
-  /** Quiet time before a run stream sends a `: ping` comment; 15 s unless a test shortens it. */
+  /** Quiet time before an event stream sends a `: ping` comment; 15 s unless a test shortens it. */
   heartbeatMs?: number;
   /** How long the runner's decision long-poll waits before answering pending; 25 s unless a test shortens it. */
   longPollMs?: number;
@@ -79,7 +80,8 @@ export function createApp({
     .route("/environments", environmentRoutes(provisioner, sprites, log))
     .route("/environments", secretRoutes())
     .route("/agents", agentRoutes(launcher, sprites, log, heartbeatMs))
-    .route("/webhooks", webhookRoutes());
+    .route("/webhooks", webhookRoutes())
+    .route("/", accountEventRoutes(heartbeatMs, log));
 
   const app = factory
     .createApp()

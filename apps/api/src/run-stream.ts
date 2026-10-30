@@ -2,29 +2,30 @@ import { events, runs } from "@sky/db";
 import type { RunId } from "@sky/shared";
 import { and, asc, eq, gt } from "drizzle-orm";
 import type { Context } from "hono";
-import { streamSSE } from "hono/streaming";
+import { type SSEMessage, streamSSE } from "hono/streaming";
 import type { AppEnv } from "./factory.js";
 import { presentEvent, runEvents } from "./run-events.js";
 import { isActive } from "./runs.js";
 
+/** One read's frames; `done` ends the stream once they're written, `more` reads again without waiting. */
+export type Batch = { frames: SSEMessage[]; done?: boolean; more?: boolean };
+
 /**
- * Streams the run's events after row id `after` as SSE, then live-tails until its terminal event,
- * with a `: ping` comment after each `heartbeatMs` of quiet.
+ * Streams `read()`'s frames as SSE, reading again after each publish on `channel`, with a `: ping`
+ * comment after each `heartbeatMs` of quiet. `read` runs after an await, never inside the publish.
  */
-export function streamRunEvents(
+export function tailSSE(
   c: Context<AppEnv>,
-  runId: RunId,
-  after: number,
+  channel: Parameters<typeof runEvents.subscribe>[0],
+  read: () => Batch,
   heartbeatMs: number,
-  log: (line: string) => void,
+  onFail: (err: unknown) => void,
 ) {
-  const db = c.var.db;
   return streamSSE(c, async (stream) => {
-    let cursor = after;
     // set by every publish, so one landing mid-read is never missed
     let dirty = true;
     let wake = () => {};
-    const unsubscribe = runEvents.subscribe(runId, () => {
+    const unsubscribe = runEvents.subscribe(channel, () => {
       dirty = true;
       wake();
     });
@@ -45,34 +46,58 @@ export function streamRunEvents(
           continue;
         }
         dirty = false;
-        // read together in one tick, so no commit lands between the rows and the status
-        const rows = db
-          .select()
-          .from(events)
-          .where(and(eq(events.runId, runId), gt(events.id, cursor)))
-          .orderBy(asc(events.id))
-          .all();
-        const run = db
-          .select({ agentId: runs.agentId, status: runs.status })
-          .from(runs)
-          .where(eq(runs.id, runId))
-          .get();
-        if (!run) return;
-        for (const row of rows) {
-          await stream.writeSSE({
-            id: String(row.id),
-            event: row.type,
-            data: JSON.stringify(presentEvent(row, run.agentId)),
-          });
-          cursor = row.id;
-        }
-        // an ended run's terminal event is its last row, so it went out in `rows` or before `after`
-        if (!isActive(run.status)) return;
+        const batch = read();
+        for (const frame of batch.frames) await stream.writeSSE(frame);
+        if (batch.done) return;
+        if (batch.more) dirty = true;
       }
     } catch (err) {
-      log(`streaming ${runId} failed: ${err}`);
+      onFail(err);
     } finally {
       unsubscribe();
     }
   });
+}
+
+/**
+ * Streams the run's events after row id `after` as SSE, then live-tails until its terminal event,
+ * with a `: ping` comment after each `heartbeatMs` of quiet.
+ */
+export function streamRunEvents(
+  c: Context<AppEnv>,
+  runId: RunId,
+  after: number,
+  heartbeatMs: number,
+  log: (line: string) => void,
+) {
+  const db = c.var.db;
+  let cursor = after;
+  const read = (): Batch => {
+    // read together in one tick, so no commit lands between the rows and the status
+    const rows = db
+      .select()
+      .from(events)
+      .where(and(eq(events.runId, runId), gt(events.id, cursor)))
+      .orderBy(asc(events.id))
+      .all();
+    const run = db
+      .select({ agentId: runs.agentId, status: runs.status })
+      .from(runs)
+      .where(eq(runs.id, runId))
+      .get();
+    if (!run) return { frames: [], done: true };
+    cursor = rows.at(-1)?.id ?? cursor;
+    return {
+      frames: rows.map((row) => ({
+        id: String(row.id),
+        event: row.type,
+        data: JSON.stringify(presentEvent(row, run.agentId)),
+      })),
+      // an ended run's terminal event is its last row, so it went out in `rows` or before `after`
+      done: !isActive(run.status),
+    };
+  };
+  return tailSSE(c, runId, read, heartbeatMs, (err) =>
+    log(`streaming ${runId} failed: ${err}`),
+  );
 }
