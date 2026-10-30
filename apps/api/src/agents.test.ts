@@ -11,7 +11,8 @@ import {
   type RunId,
   truncationMarker,
 } from "@sky/shared";
-import { ws } from "msw";
+import { eq } from "drizzle-orm";
+import { HttpResponse, http, ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
@@ -453,6 +454,159 @@ test("a launch the sprite rejects fails the run with a redacted error and frees 
     db.$client.prepare("select status from agents where id = ?").get(agent.id),
   ).toEqual({ status: "idle" });
   expect(wire.sessions).toEqual([]);
+});
+
+const envRow = (id: string) =>
+  db.$client
+    .prepare(
+      "select status, failure_step as failureStep, failure_stderr as failureStderr from environments where id = ?",
+    )
+    .get(id);
+
+const runStatus = (id: string) =>
+  db.$client.prepare("select status from runs where id = ?").get(id);
+
+// read from the event, since GET on a run reads its diff from the sprite, which is gone
+const runFailure = (id: string) =>
+  (
+    db.$client
+      .prepare(
+        "select json_extract(payload, '$.error') as error from events where run_id = ? and type = 'run.failed'",
+      )
+      .get(id) as { error: string } | undefined
+  )?.error;
+
+/** Runs `onBundleCheck` when the launch first execs in the sprite, so the sprite can vanish mid-launch. */
+const onFirstExec = (onBundleCheck: () => void) => {
+  const exec = wire.exec;
+  wire.exec = (argv) => {
+    if (argv[0] === "sha256sum") onBundleCheck();
+    return exec(argv);
+  };
+};
+
+test("a launch on a sprite that no longer exists fails the run and marks the ready environment failed", async () => {
+  const envId = readyEnv();
+  wire.sprites.delete(spriteNameFor(envId));
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({
+      status: "failed",
+      failureStep: "create",
+      failureStderr: expect.stringContaining(spriteNameFor(envId)),
+    }),
+  );
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect(runFailure(run.id)).toMatch(/^launch_failed: /);
+});
+
+test("a sprite that vanishes mid-launch, failing a file write rather than an exec, marks the environment failed", async () => {
+  const envId = readyEnv();
+  onFirstExec(() => {
+    wire.sprites.delete(spriteNameFor(envId));
+    wire.writeStatus = 404;
+  });
+  await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({ status: "failed" }),
+  );
+});
+
+test("a launch that fails on a sprite that still exists fails the run and leaves the environment ready", async () => {
+  wire.writeStatus = 404;
+  const envId = readyEnv();
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect(wire.calls).toContain(`get ${spriteNameFor(envId)}`);
+  expect(envRow(envId)).toMatchObject({
+    status: "ready",
+    failureStep: null,
+    failureStderr: null,
+  });
+});
+
+test("a missing sprite does not fail an environment that is no longer ready", async () => {
+  const envId = readyEnv();
+  onFirstExec(() => {
+    wire.sprites.delete(spriteNameFor(envId));
+    wire.writeStatus = 500;
+    db.update(environments)
+      .set({ status: "provisioning" })
+      .where(eq(environments.id, envId))
+      .run();
+  });
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect(wire.calls).toContain(`get ${spriteNameFor(envId)}`);
+  expect(envRow(envId)).toMatchObject({
+    status: "provisioning",
+    failureStderr: null,
+  });
+});
+
+test("a sprite lookup that errors leaves the environment ready and the run failed with the launch's own error", async () => {
+  wire.writeStatus = 500;
+  server.use(
+    http.get("https://api.sprites.dev/v1/sprites/:name", () =>
+      HttpResponse.json({ error: "upstream unavailable" }, { status: 503 }),
+    ),
+  );
+  const envId = readyEnv();
+  const { agent, run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect((await getRun(agent.id, run.id)).body.error).toMatch(
+    /^launch_failed: .*write failed/,
+  );
+  expect(envRow(envId)).toMatchObject({ status: "ready" });
+  expect(
+    logs.some((line) => line.startsWith("checking whether the sprite of")),
+  ).toBe(true);
+});
+
+test("retrying an environment failed for its missing sprite recreates the sprite, clears the failure and takes a new run", async () => {
+  const envId = readyEnv();
+  const sprite = spriteNameFor(envId);
+  wire.sprites.delete(sprite);
+  const first = await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({ status: "failed" }),
+  );
+  // the lost sprite took the agent's Claude session with it
+  db.$client
+    .prepare("update agents set session_id = 'sess_gone' where id = ?")
+    .run(first.agent.id);
+  const res = await app.request(`/v1/environments/${envId}/retry`, {
+    method: "POST",
+    headers: auth,
+  });
+  expect(res.status).toBe(202);
+  await vi.waitFor(
+    () =>
+      expect(envRow(envId)).toMatchObject({
+        status: "ready",
+        failureStep: null,
+        failureStderr: null,
+      }),
+    { timeout: 5000 },
+  );
+  expect(wire.calls).toContain(`create ${sprite}`);
+  expect(
+    db.$client
+      .prepare("select session_id as sessionId from agents where id = ?")
+      .get(first.agent.id),
+  ).toEqual({ sessionId: null });
+  const second = await launched(envId);
+  await sessionOpened();
+  expect(wire.sessions[0]?.sprite).toBe(sprite);
+  expect(runStatus(second.run.id)).toMatchObject({ status: "starting" });
 });
 
 const usage = {
