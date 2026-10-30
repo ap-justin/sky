@@ -4,6 +4,9 @@ import type { AgentId, Event, RunId } from "@sky/shared";
 
 const emitter = new EventEmitter().setMaxListeners(0);
 
+/** The channel every run's publish also wakes, for account-wide readers. */
+export const anyRun = Symbol("anyRun");
+
 /**
  * In-process wake-ups for a run's new event rows. A publish carries no event: listeners re-read the
  * table, so it is safe to publish inside the inserting transaction. better-sqlite3 commits before any
@@ -13,16 +16,17 @@ const emitter = new EventEmitter().setMaxListeners(0);
 export const runEvents = {
   publish(runId: RunId): void {
     emitter.emit(runId);
+    emitter.emit(anyRun);
   },
-  /** Calls `listener` after each publish for `runId`; returns the unsubscribe. */
-  subscribe(runId: RunId, listener: () => void): () => void {
+  /** Calls `listener` after each publish for `runId`, or for any run; returns the unsubscribe. */
+  subscribe(runId: RunId | typeof anyRun, listener: () => void): () => void {
     emitter.on(runId, listener);
     return () => emitter.off(runId, listener);
   },
-  listenerCount: (runId: RunId) => emitter.listenerCount(runId),
+  listenerCount: (runId: RunId | typeof anyRun) => emitter.listenerCount(runId),
 };
 
-/** The shared Event shape webhooks and the run stream send for a stored row of `agentId`'s run. */
+/** The shared Event shape webhooks, the event streams and the long poll send for a stored row of `agentId`'s run. */
 export const presentEvent = (
   row: typeof events.$inferSelect,
   agentId: AgentId,

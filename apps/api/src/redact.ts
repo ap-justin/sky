@@ -58,7 +58,11 @@ export class KnownSecrets {
 export function redact(text: string, known: readonly string[]): string {
   let out = text;
   for (const secret of known) {
-    if (secret) out = out.split(secret).join(REDACTED);
+    if (!secret) continue;
+    out = out.split(secret).join(REDACTED);
+    // as it appears inside JSON text, such as a tool's `input`: `"`, `\` and control characters escaped
+    const escaped = JSON.stringify(secret).slice(1, -1);
+    if (escaped !== secret) out = out.split(escaped).join(REDACTED);
   }
   for (const pattern of tokenPatterns) out = out.replace(pattern, REDACTED);
   return out;

@@ -9,7 +9,7 @@ import type {
   Options,
   SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { RunnerEventPost } from "@sky/shared";
+import { RUNNER_TEXT_MAX, type RunnerEventPost } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -62,6 +62,11 @@ const assistant = (...content: unknown[]) => ({
   session_id: "sess-new",
   parent_tool_use_id: null,
   message: { content },
+});
+/** Assistant text from inside the subagent the Agent call `parentToolUseId` started. */
+const subagentSays = (parentToolUseId: string, text: string) => ({
+  ...assistant({ type: "text", text }),
+  parent_tool_use_id: parentToolUseId,
 });
 const success = {
   type: "result",
@@ -142,7 +147,41 @@ const recorder = () => {
   return { posted, post: async (e: RunnerEventPost) => void posted.push(e) };
 };
 
-test("a finished run posts started, assistant text progress, then finished with the SDK usage, and exits 0", async () => {
+const finished = {
+  runId: "run_1",
+  type: "run.finished",
+  payload: {
+    summary: "Added hello.txt",
+    usage: {
+      inputTokens: 115,
+      outputTokens: 40,
+      costUsd: 0.02,
+      turns: 2,
+      durationMs: 1235,
+    },
+    rollup: expect.any(Object),
+  },
+};
+
+/** Events as the API receives them: through the real poster, so each one passed the shared schema. */
+function apiPoster() {
+  const sent: RunnerEventPost[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      sent.push((await request.json()) as RunnerEventPost);
+      return new HttpResponse(null, { status: 204 });
+    }),
+  );
+  const post = createPoster({
+    apiBaseUrl: "https://api.test",
+    agentToken: "agent-secret",
+    warn: () => {},
+    sleep: async () => {},
+  });
+  return { sent, post };
+}
+
+test("a finished run posts started, assistant text as claude.Message, then finished with the SDK usage, and exits 0", async () => {
   const { posted, post } = recorder();
   const query = scripted([
     init,
@@ -168,67 +207,73 @@ test("a finished run posts started, assistant text progress, then finished with 
     { runId: "run_1", type: "run.started", payload: { sessionId: "sess-new" } },
     {
       runId: "run_1",
-      type: "run.progress",
-      payload: { message: "I'll add the file." },
+      type: "claude.Message",
+      payload: { text: "I'll add the file." },
     },
-    {
-      runId: "run_1",
-      type: "run.finished",
-      payload: {
-        summary: "Added hello.txt",
-        usage: {
-          inputTokens: 115,
-          outputTokens: 40,
-          costUsd: 0.02,
-          turns: 2,
-          durationMs: 1235,
-        },
-        rollup: expect.any(Object),
-      },
-    },
+    finished,
   ]);
 });
 
-test("hooks reach the API in order: a notification, one progress per tool call from PreToolUse, and a single run.finished", async () => {
-  const sent: unknown[] = [];
-  server.use(
-    http.post("https://api.test/internal/events", async ({ request }) => {
-      sent.push(await request.json());
-      return new HttpResponse(null, { status: 204 });
-    }),
-  );
-  const post = createPoster({
-    apiBaseUrl: "https://api.test",
-    agentToken: "agent-secret",
-    warn: () => {},
-    sleep: async () => {},
-  });
+test("each hook reaches the API as its claude.* event, in hook order, and nothing posts run.progress", async () => {
+  const { sent, post } = apiPoster();
   const query = scripted([
     init,
     hook("Notification", {
       message: "Claude needs your attention",
+      title: "Waiting",
       notification_type: "idle_prompt",
     }),
-    assistant(
-      { type: "text", text: "Looking around." },
-      { type: "tool_use", id: "t1", name: "Bash", input: { command: "ls" } },
-    ),
+    assistant({ type: "text", text: "Looking around." }),
     hook("PreToolUse", {
       tool_name: "Bash",
-      tool_input: { command: "ls -la src", description: "" },
+      tool_input: { command: "ls -la src" },
       tool_use_id: "t1",
     }),
-    assistant({
-      type: "tool_use",
-      id: "t2",
-      name: "Read",
-      input: { file_path: "src/a.ts" },
+    hook("PostToolUse", {
+      tool_name: "Bash",
+      tool_input: { command: "ls -la src" },
+      tool_response: { stdout: "a.ts", stderr: "" },
+      tool_use_id: "t1",
+      duration_ms: 12,
     }),
+    hook("SubagentStart", { agent_id: "sub_1", agent_type: "Explore" }),
     hook("PreToolUse", {
+      agent_id: "sub_1",
       tool_name: "Read",
       tool_input: { file_path: "src/a.ts" },
       tool_use_id: "t2",
     }),
+    hook("PostToolUse", {
+      agent_id: "sub_1",
+      tool_name: "Read",
+      tool_input: { file_path: "src/a.ts" },
+      tool_response: "export {}",
+      tool_use_id: "t2",
+    }),
+    hook("PostToolUseFailure", {
+      agent_id: "sub_1",
+      tool_name: "Grep",
+      tool_input: { pattern: "x" },
+      tool_use_id: "t3",
+      error: "no matches",
+      is_interrupt: false,
+      duration_ms: 3,
+    }),
+    hook("SubagentStop", {
+      stop_hook_active: false,
+      agent_id: "sub_1",
+      agent_transcript_path: "/s.jsonl",
+      agent_type: "Explore",
+      last_assistant_message: "Found a.ts.",
+    }),
+    hook("TaskCreated", {
+      task_id: "1",
+      task_subject: "Add hello.txt",
+      task_description: "write the file",
+    }),
+    hook("TaskCompleted", { task_id: "1", task_subject: "Add hello.txt" }),
+    hook("PreCompact", { trigger: "auto", custom_instructions: null }),
+    hook("FileChanged", { file_path: "/w/.env", event: "change" }),
     hook("Stop", {
       stop_hook_active: false,
       last_assistant_message: "Done.",
@@ -242,43 +287,226 @@ test("hooks reach the API in order: a notification, one progress per tool call f
     awaitDecision: noDecision,
   });
   expect(code).toBe(0);
-  expect(sent).toEqual([
-    { runId: "run_1", type: "run.started", payload: { sessionId: "sess-new" } },
-    {
-      runId: "run_1",
-      type: "run.progress",
-      payload: { message: "Claude needs your attention" },
-    },
-    {
-      runId: "run_1",
-      type: "run.progress",
-      payload: { message: "Looking around." },
-    },
-    {
-      runId: "run_1",
-      type: "run.progress",
-      payload: { message: "ls -la src", tool: "Bash" },
-    },
-    {
-      runId: "run_1",
-      type: "run.progress",
-      payload: { message: "src/a.ts", tool: "Read" },
-    },
-    {
-      runId: "run_1",
-      type: "run.finished",
-      payload: {
-        summary: "Added hello.txt",
-        usage: {
-          inputTokens: 115,
-          outputTokens: 40,
-          costUsd: 0.02,
-          turns: 2,
-          durationMs: 1235,
+  const ls = JSON.stringify({ command: "ls -la src" });
+  const read = JSON.stringify({ file_path: "src/a.ts" });
+  expect(sent).toEqual(
+    [
+      { type: "run.started", payload: { sessionId: "sess-new" } },
+      {
+        type: "claude.Notification",
+        payload: {
+          message: "Claude needs your attention",
+          title: "Waiting",
+          notificationType: "idle_prompt",
         },
-        rollup: expect.any(Object),
       },
+      { type: "claude.Message", payload: { text: "Looking around." } },
+      {
+        type: "claude.PreToolUse",
+        payload: { toolName: "Bash", toolUseId: "t1", input: ls },
+      },
+      {
+        type: "claude.PostToolUse",
+        payload: {
+          toolName: "Bash",
+          toolUseId: "t1",
+          input: ls,
+          output: JSON.stringify({ stdout: "a.ts", stderr: "" }),
+          durationMs: 12,
+        },
+      },
+      {
+        type: "claude.SubagentStart",
+        payload: { subagentId: "sub_1", agentType: "Explore" },
+      },
+      {
+        type: "claude.PreToolUse",
+        payload: {
+          toolName: "Read",
+          toolUseId: "t2",
+          input: read,
+          subagentId: "sub_1",
+        },
+      },
+      {
+        type: "claude.PostToolUse",
+        payload: {
+          toolName: "Read",
+          toolUseId: "t2",
+          input: read,
+          output: "export {}",
+          subagentId: "sub_1",
+        },
+      },
+      {
+        type: "claude.PostToolUseFailure",
+        payload: {
+          toolName: "Grep",
+          toolUseId: "t3",
+          input: JSON.stringify({ pattern: "x" }),
+          subagentId: "sub_1",
+          error: "no matches",
+          isInterrupt: false,
+          durationMs: 3,
+        },
+      },
+      {
+        type: "claude.SubagentStop",
+        payload: {
+          subagentId: "sub_1",
+          agentType: "Explore",
+          lastAssistantMessage: "Found a.ts.",
+        },
+      },
+      {
+        type: "claude.TaskCreated",
+        payload: {
+          taskId: "1",
+          taskSubject: "Add hello.txt",
+          taskDescription: "write the file",
+        },
+      },
+      {
+        type: "claude.TaskCompleted",
+        payload: { taskId: "1", taskSubject: "Add hello.txt" },
+      },
+      {
+        type: "claude.PreCompact",
+        payload: { trigger: "auto", customInstructions: null },
+      },
+      {
+        type: "claude.FileChanged",
+        payload: { filePath: "/w/.env", event: "change" },
+      },
+      finished,
+    ].map((e) => ({ runId: "run_1", ...e })),
+  );
+});
+
+test("tool text is sent whole up to RUNNER_TEXT_MAX and cut there, never clipped short ahead of redaction", async () => {
+  const { sent, post } = apiPoster();
+  const big = "x".repeat(100_000);
+  const query = scripted([
+    init,
+    assistant({ type: "text", text: "y".repeat(20_000) }),
+    hook("PostToolUse", {
+      tool_name: "Bash",
+      tool_input: { command: big },
+      tool_response: big,
+      tool_use_id: "t1",
+    }),
+    success,
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  const message = sent.find((e) => e.type === "claude.Message");
+  expect(message?.type === "claude.Message" && message.payload.text).toBe(
+    "y".repeat(20_000),
+  );
+  const tool = sent.find((e) => e.type === "claude.PostToolUse");
+  expect(tool?.type === "claude.PostToolUse" && tool.payload).toMatchObject({
+    output: big.slice(0, RUNNER_TEXT_MAX),
+    input: JSON.stringify({ command: big }).slice(0, RUNNER_TEXT_MAX),
+  });
+});
+
+test("a subagent's text carries the Agent call's parentToolUseId; main-thread text has none", async () => {
+  const { sent, post } = apiPoster();
+  const query = scripted([
+    init,
+    assistant({ type: "text", text: "Delegating." }),
+    subagentSays("toolu_agent", "Found a.ts."),
+    success,
+  ]);
+  await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(sent.filter((e) => e.type === "claude.Message")).toEqual([
+    {
+      runId: "run_1",
+      type: "claude.Message",
+      payload: { text: "Delegating." },
     },
+    {
+      runId: "run_1",
+      type: "claude.Message",
+      payload: { text: "Found a.ts.", parentToolUseId: "toolu_agent" },
+    },
+  ]);
+});
+
+/** A query whose producer runs ahead of the consumer, as the SDK reads the CLI's stdout while the runner is still posting. */
+function eager(
+  produce: (options: Options, push: (m: unknown) => void) => Promise<void>,
+): QueryFn {
+  return ({ options }) => {
+    const buffered: unknown[] = [];
+    let done = false;
+    let wake = () => {};
+    void produce(options, (m) => {
+      buffered.push(m);
+      wake();
+    }).finally(() => {
+      done = true;
+      wake();
+    });
+    return (async function* () {
+      while (true) {
+        const next = buffered.shift();
+        if (next !== undefined) yield next as SDKMessage;
+        else if (done) return;
+        else await new Promise<void>((r) => (wake = r));
+      }
+    })();
+  };
+}
+
+test("with a slow API, text and hook events post in stream order and the ending event comes after all of them", async () => {
+  const posted: RunnerEventPost[] = [];
+  const post = async (e: RunnerEventPost) => {
+    await new Promise((r) => setTimeout(r, 20));
+    posted.push(e);
+  };
+  const query = eager(async (options, push) => {
+    push(init);
+    // run.started has landed before Claude says anything
+    await new Promise((r) => setTimeout(r, 60));
+    push(assistant({ type: "text", text: "First." }));
+    await setImmediate();
+    push(assistant({ type: "text", text: "Second." }));
+    await setImmediate();
+    await fire(options, "PreToolUse", {
+      tool_name: "Read",
+      tool_input: { file_path: "a.ts" },
+      tool_use_id: "t1",
+    });
+    await setImmediate();
+    push(success);
+  });
+  const code = await runSession(config, {
+    query,
+    post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(code).toBe(0);
+  expect(
+    posted.map((e) =>
+      e.type === "claude.Message" ? `${e.type}:${e.payload.text}` : e.type,
+    ),
+  ).toEqual([
+    "run.started",
+    "claude.Message:First.",
+    "claude.Message:Second.",
+    "claude.PreToolUse",
+    "run.finished",
   ]);
 });
 
@@ -312,7 +540,7 @@ test("a hook answers continue without waiting on its post, and a post that rejec
   let release = () => {};
   const held = new Promise<void>((r) => (release = r));
   const post = async (e: RunnerEventPost) => {
-    if (e.type === "run.progress" && e.payload.tool === "Bash") {
+    if (e.type === "claude.PreToolUse" && e.payload.toolName === "Bash") {
       await held;
       throw new Error("post blew up");
     }
@@ -345,7 +573,7 @@ test("a hook answers continue without waiting on its post, and a post that rejec
   expect(code).toBe(0);
   expect(posted.map((e) => e.type)).toEqual([
     "run.started",
-    "run.progress",
+    "claude.PreToolUse",
     "run.finished",
   ]);
 });
@@ -719,10 +947,34 @@ test("a held tool call posts approval waiting, polls past pending, and an approv
   ]);
   expect(sent.map((e) => e.type)).toEqual([
     "run.started",
-    "run.progress",
+    "claude.PreToolUse",
     "run.waiting",
     "run.finished",
   ]);
+});
+
+test("a long approval summary reaches run.waiting whole, for the API to redact before it trims", async () => {
+  const { sent, deps } = api(decided({ decision: "approve" }));
+  const command = `git push ${"x".repeat(5000)}`;
+  const query = scripted([
+    init,
+    async (options: Options) =>
+      void (await fire(options, "PreToolUse", {
+        ...gitPush,
+        tool_input: { command },
+      })),
+    success,
+  ]);
+  await runSession(
+    { ...config, approvalPolicy: ["Bash(git push:*)"] },
+    { ...deps, query },
+  );
+  const waiting = sent.find((e) => e.type === "run.waiting");
+  expect(
+    waiting?.type === "run.waiting" &&
+      waiting.payload.request.kind === "approval" &&
+      waiting.payload.request.toolSummary,
+  ).toBe(command);
 });
 
 test("a denial blocks the tool and hands Claude the reason", async () => {
@@ -873,7 +1125,7 @@ test("a run the API already ended stops the session and posts nothing terminal",
   expect(code).toBe(1);
   expect(sent.map((e) => e.type)).toEqual([
     "run.started",
-    "run.progress",
+    "claude.PreToolUse",
     "run.waiting",
   ]);
 });

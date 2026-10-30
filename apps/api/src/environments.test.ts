@@ -97,6 +97,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
   });
   const sprite = `sky-${created.id}`;
   expect(wire.calls).toEqual([
+    `get ${sprite}`,
     `create ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
@@ -390,6 +391,7 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
   });
   const sprite = `sky-${id}`;
   expect(wire.calls).toEqual([
+    `get ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
@@ -640,6 +642,7 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
   const sprite = `sky-${id}`;
   expect(wire.calls).toEqual([
+    `get ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
@@ -656,7 +659,7 @@ test("retry of a create failure recreates the sprite before cloning", async () =
   wire.calls.length = 0;
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls[0]).toBe(`create sky-${id}`);
+  expect(wire.calls.slice(0, 2)).toEqual([`get sky-${id}`, `create sky-${id}`]);
 });
 
 test("an env a restart interrupts mid-setup is failed at that step, its detail saying so", async () => {
@@ -717,7 +720,7 @@ test("retry after a boot interruption creates the sprite it never got", async ()
   wire.sprites.delete(`sky-${id}`);
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls[0]).toBe(`create sky-${id}`);
+  expect(wire.calls.slice(0, 2)).toEqual([`get sky-${id}`, `create sky-${id}`]);
 });
 
 test("retry after a boot interruption keeps the sprite that exists", async () => {

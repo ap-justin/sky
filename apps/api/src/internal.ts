@@ -2,12 +2,15 @@ import { zValidator } from "@hono/zod-validator";
 import { agents, type Db, runRequests, runs } from "@sky/db";
 import {
   canTransition,
+  EVENT_TEXT_MAX,
   type EventType,
+  type PendingRequest,
   RequestId,
   RunId,
   RunnerEventPost,
   RunRollup,
   type RunStatus,
+  truncationMarker,
 } from "@sky/shared";
 import { and, eq, inArray } from "drizzle-orm";
 import { z } from "zod";
@@ -25,15 +28,51 @@ import {
 } from "./runs.js";
 import { body, jsonBody } from "./validation.js";
 
-// the status each event moves its run to; progress leaves it where it is
+// the status each event moves its run to; claude.* events leave it, and decideRequest moves it on run.resumed
 const statusAfter: Record<EventType, RunStatus | null> = {
   "run.started": "running",
-  "run.progress": null,
   "run.waiting": "waiting",
+  "run.resumed": null,
   "run.finished": "finished",
   "run.failed": "failed",
   "run.stopped": "stopped",
+  "claude.PreToolUse": null,
+  "claude.PostToolUse": null,
+  "claude.PostToolUseFailure": null,
+  "claude.SubagentStart": null,
+  "claude.SubagentStop": null,
+  "claude.TaskCreated": null,
+  "claude.TaskCompleted": null,
+  "claude.Notification": null,
+  "claude.PreCompact": null,
+  "claude.FileChanged": null,
+  "claude.Message": null,
 };
+
+/** Most of an approval's `toolSummary` stored after redaction, before the truncation marker. */
+const TOOL_SUMMARY_MAX = 2_000;
+
+/** `text` cut to `max`, marking how much it dropped. */
+const cut = (text: string, max: number) =>
+  text.length > max
+    ? text.slice(0, max) + truncationMarker(text.length - max)
+    : text;
+
+/** Cuts each string field of a flat payload to `EVENT_TEXT_MAX`, marking how much it dropped. */
+function trimText<T extends object>(payload: T): T {
+  return Object.fromEntries(
+    Object.entries(payload).map(([k, v]) => [
+      k,
+      typeof v === "string" ? cut(v, EVENT_TEXT_MAX) : v,
+    ]),
+  ) as T;
+}
+
+/** `request` with an approval's `toolSummary` cut to `TOOL_SUMMARY_MAX`. */
+const trimRequest = (request: PendingRequest): PendingRequest =>
+  request.kind === "approval"
+    ? { ...request, toolSummary: cut(request.toolSummary, TOOL_SUMMARY_MAX) }
+    : request;
 
 const bearer = (header: string | undefined) =>
   /^Bearer ([A-Za-z0-9_-]+)$/.exec(header ?? "")?.[1];
@@ -125,14 +164,18 @@ export function internalRoutes(
             ...secrets.values(),
             ...liveTokens,
           ]);
+          // trimmed only after redaction, so a cut can't split a secret out of its match
           if (redacted.type === "run.waiting") {
+            redacted.payload.request = trimRequest(redacted.payload.request);
             openRequest(tx, run.id, redacted.payload.request);
           }
           const { id, enqueued } = recordEvent(
             tx,
             run.id,
             event.type,
-            redacted.payload,
+            event.type.startsWith("claude.")
+              ? trimText(redacted.payload)
+              : redacted.payload,
           );
           if (next) {
             const ended =

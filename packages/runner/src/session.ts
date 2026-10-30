@@ -13,13 +13,14 @@ import type {
   SyncHookJSONOutput,
 } from "@anthropic-ai/claude-agent-sdk";
 import type { AskUserQuestionInput } from "@anthropic-ai/claude-agent-sdk/sdk-tools";
-import type {
-  Decision,
-  PendingRequest,
-  RequestId,
-  RunnerEventPost,
-  RunRollup,
-  Usage,
+import {
+  type Decision,
+  type PendingRequest,
+  type RequestId,
+  RUNNER_TEXT_MAX,
+  type RunnerEventPost,
+  type RunRollup,
+  type Usage,
 } from "@sky/shared";
 import type { Config } from "./config.js";
 import type { PostEvent } from "./events.js";
@@ -33,7 +34,6 @@ export type QueryFn = (params: {
   options: Options;
 }) => AsyncIterable<SDKMessage>;
 
-const MAX_PROGRESS_CHARS = 2000;
 /**
  * Seconds before the SDK cancels a PreToolUse hook, and with it the approval gate (its default is
  * 600). `waitTimeoutMs` bounds each wait, but this clock also runs while a call queues behind
@@ -88,7 +88,7 @@ function sessionOptions(
 function sessionHooks(
   gateTimeout: number,
   on: {
-    progress: (event: RunnerEvent) => void;
+    event: (event: RunnerEvent) => void;
     stop: (lastMessage: string | undefined) => void;
     gate: (
       input: PreToolUseHookInput,
@@ -110,23 +110,121 @@ function sessionHooks(
       )) ?? { continue: true };
     return [{ hooks: [hook], ...(timeout && { timeout }) }];
   };
-  return {
-    Notification: matcher<"Notification">((input) => {
-      on.progress({
-        type: "run.progress",
-        payload: { message: clip(input.message) },
-      });
+  const tool = (input: {
+    tool_name: string;
+    tool_use_id: string;
+    tool_input: unknown;
+    agent_id?: string;
+  }) => ({
+    toolName: input.tool_name,
+    toolUseId: input.tool_use_id,
+    input: bound(JSON.stringify(input.tool_input) ?? ""),
+    ...(input.agent_id && { subagentId: input.agent_id }),
+  });
+  const task = (input: {
+    task_id: string;
+    task_subject: string;
+    task_description?: string;
+    teammate_name?: string;
+  }) => ({
+    taskId: input.task_id,
+    taskSubject: bound(input.task_subject),
+    ...(input.task_description !== undefined && {
+      taskDescription: bound(input.task_description),
     }),
+    ...(input.teammate_name && { teammateName: input.teammate_name }),
+  });
+  return {
     PreToolUse: matcher<"PreToolUse">((input, signal) => {
-      on.progress({
-        type: "run.progress",
-        payload: {
-          message: clip(toolHint(input.tool_input) ?? input.tool_name),
-          tool: input.tool_name,
-        },
-      });
+      on.event({ type: "claude.PreToolUse", payload: tool(input) });
       return on.gate(input, signal);
     }, gateTimeout),
+    PostToolUse: matcher<"PostToolUse">((input) => {
+      const response = input.tool_response;
+      on.event({
+        type: "claude.PostToolUse",
+        payload: {
+          ...tool(input),
+          output: bound(
+            typeof response === "string"
+              ? response
+              : (JSON.stringify(response) ?? ""),
+          ),
+          ...(input.duration_ms !== undefined && {
+            durationMs: input.duration_ms,
+          }),
+        },
+      });
+    }),
+    PostToolUseFailure: matcher<"PostToolUseFailure">((input) => {
+      on.event({
+        type: "claude.PostToolUseFailure",
+        payload: {
+          ...tool(input),
+          error: bound(input.error),
+          ...(input.is_interrupt !== undefined && {
+            isInterrupt: input.is_interrupt,
+          }),
+          ...(input.duration_ms !== undefined && {
+            durationMs: input.duration_ms,
+          }),
+        },
+      });
+    }),
+    SubagentStart: matcher<"SubagentStart">((input) => {
+      on.event({
+        type: "claude.SubagentStart",
+        payload: { subagentId: input.agent_id, agentType: input.agent_type },
+      });
+    }),
+    SubagentStop: matcher<"SubagentStop">((input) => {
+      on.event({
+        type: "claude.SubagentStop",
+        payload: {
+          subagentId: input.agent_id,
+          agentType: input.agent_type,
+          ...(input.last_assistant_message !== undefined && {
+            lastAssistantMessage: bound(input.last_assistant_message),
+          }),
+        },
+      });
+    }),
+    TaskCreated: matcher<"TaskCreated">((input) => {
+      on.event({ type: "claude.TaskCreated", payload: task(input) });
+    }),
+    TaskCompleted: matcher<"TaskCompleted">((input) => {
+      on.event({ type: "claude.TaskCompleted", payload: task(input) });
+    }),
+    Notification: matcher<"Notification">((input) => {
+      on.event({
+        type: "claude.Notification",
+        payload: {
+          message: bound(input.message),
+          ...(input.title !== undefined && { title: bound(input.title) }),
+          notificationType: input.notification_type,
+        },
+      });
+    }),
+    PreCompact: matcher<"PreCompact">((input) => {
+      on.event({
+        type: "claude.PreCompact",
+        payload: {
+          trigger: input.trigger,
+          customInstructions:
+            input.custom_instructions === null
+              ? null
+              : bound(input.custom_instructions),
+        },
+      });
+    }),
+    // fires only for paths a hook's matcher or `watchPaths` asks Claude Code to watch, which
+    // this session names none of; Claude's own edits report through PostToolUse
+    FileChanged: matcher<"FileChanged">((input) => {
+      on.event({
+        type: "claude.FileChanged",
+        payload: { filePath: bound(input.file_path), event: input.event },
+      });
+    }),
     Stop: matcher<"Stop">((input) => {
       on.stop(input.last_assistant_message);
     }),
@@ -257,8 +355,8 @@ export async function runSession(
       {
         kind: "approval",
         toolName: input.tool_name,
-        toolSummary: clip(
-          toolHint(input.tool_input, SUBJECT_KEYS) ??
+        toolSummary: bound(
+          toolHint(input.tool_input) ??
             (JSON.stringify(input.tool_input) || input.tool_name),
         ),
       },
@@ -314,7 +412,7 @@ export async function runSession(
   let stopMessage: string | undefined;
   const hooks = sessionHooks(gateTimeoutS(config.waitTimeoutMs), {
     // a failed post must not fail the tool call that triggered it
-    progress: (event) => void post(event).catch(() => {}),
+    event: (event) => void post(event).catch(() => {}),
     stop: (lastMessage) => {
       stopMessage = lastMessage || stopMessage;
     },
@@ -333,8 +431,13 @@ export async function runSession(
           payload: { sessionId: message.session_id },
         });
       } else if (message.type === "assistant") {
+        const parent = message.parent_tool_use_id;
+        // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
-          await post({ type: "run.progress", payload: { message: text } });
+          void post({
+            type: "claude.Message",
+            payload: { text, ...(parent && { parentToolUseId: parent }) },
+          }).catch(() => {});
       } else if (message.type === "result") {
         result = message;
       }
@@ -395,21 +498,15 @@ type AssistantContent = Extract<
   { type: "assistant" }
 >["message"]["content"];
 
-/** Assistant text, as progress lines; tool calls report through the PreToolUse hook instead. */
+/** Assistant text, one entry per text block; tool calls report through the PreToolUse hook instead. */
 function textOf(content: AssistantContent): string[] {
   return content.flatMap((block) =>
-    block.type === "text" && block.text.trim() ? [clip(block.text.trim())] : [],
+    block.type === "text" && block.text.trim()
+      ? [bound(block.text.trim())]
+      : [],
   );
 }
 
-const HINT_KEYS = [
-  "description",
-  "command",
-  "file_path",
-  "pattern",
-  "url",
-  "query",
-];
 /** What an approver judges: the command itself, not Claude's description of it. */
 const SUBJECT_KEYS = [
   "command",
@@ -421,9 +518,9 @@ const SUBJECT_KEYS = [
 ];
 
 /** The one input field that says what a built-in tool call is acting on. */
-function toolHint(input: unknown, keys = HINT_KEYS): string | undefined {
+function toolHint(input: unknown): string | undefined {
   if (typeof input !== "object" || input === null) return undefined;
-  for (const key of keys) {
+  for (const key of SUBJECT_KEYS) {
     const value = (input as Record<string, unknown>)[key];
     if (typeof value === "string" && value) return value;
   }
@@ -460,8 +557,8 @@ function usageOf(result: SDKResultMessage): Usage {
   };
 }
 
-const clip = (s: string) =>
-  s.length > MAX_PROGRESS_CHARS ? `${s.slice(0, MAX_PROGRESS_CHARS - 1)}…` : s;
+/** A plain cut at what the API accepts: it redacts the whole text, so nothing here may clip it shorter. */
+const bound = (s: string) => s.slice(0, RUNNER_TEXT_MAX);
 
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);

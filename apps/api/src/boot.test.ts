@@ -246,15 +246,15 @@ test("the sweep deletes envVars once their TTL passes, and redacts them only whi
       },
       body: JSON.stringify({
         runId: "run_a",
-        type: "run.progress",
-        payload: { message },
+        type: "claude.Message",
+        payload: { text: message },
       }),
     });
     expect(res.status).toBeLessThan(300);
     const last = db?.$client
       .prepare("select payload from events order by id desc limit 1")
       .get() as { payload: string };
-    return JSON.parse(last.payload).message;
+    return JSON.parse(last.payload).text;
   };
   expect(await echo("short-lived-value-01")).toBe("[redacted]");
 
@@ -264,4 +264,71 @@ test("the sweep deletes envVars once their TTL passes, and redacts them only whi
   ]);
   expect(await echo("short-lived-value-01")).toBe("short-lived-value-01");
   expect(await echo("long-lived-value-02")).toBe("[redacted]");
+});
+
+test("the sweep prunes claude.* events past 7 days with their deliveries; younger ones and run.* stay", async () => {
+  const first = booted().db;
+  const daysAgo = (d: number) =>
+    new Date(Date.now() - d * 86_400_000).toISOString();
+  first.$client.exec(`
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
+    insert into agents (id, env_id, branch, status) values ('agt_a', 'env_a', 'claude/agt_a', 'idle');
+    insert into runs (id, agent_id, status) values ('run_a', 'agt_a', 'finished');
+    insert into webhooks (id, url, event_types) values ('whk_a', 'https://hooks.example.com/a', '["claude.Message","run.finished"]');
+  `);
+  const event = (type: string, ts: string, payload: object) =>
+    first
+      .insert(events)
+      .values({
+        runId: "run_a" as RunId,
+        ts,
+        type: type as "run.finished",
+        payload,
+      })
+      .returning({ id: events.id })
+      .get().id;
+  const old = event("claude.Message", daysAgo(8), { text: "old" });
+  const young = event("claude.Message", daysAgo(6), { text: "young" });
+  const finished = event("run.finished", daysAgo(8), {
+    summary: "done",
+    usage: {
+      inputTokens: 1,
+      outputTokens: 1,
+      costUsd: 0,
+      turns: 1,
+      durationMs: 1,
+    },
+  });
+  for (const eventId of [old, young, finished]) {
+    first
+      .insert(webhookDeliveries)
+      .values({
+        webhookId: "whk_a",
+        eventId,
+        status: "delivered",
+        nextAttemptAt: daysAgo(8),
+      })
+      .run();
+  }
+  first.$client.close();
+
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  expect(db.$client.prepare("select id from events order by id").all()).toEqual(
+    [{ id: young }, { id: finished }],
+  );
+  expect(
+    db.$client
+      .prepare("select event_id from webhook_deliveries order by event_id")
+      .all(),
+  ).toEqual([{ event_id: young }, { event_id: finished }]);
+  expect(lines.filter((l) => l.includes("pruned"))).toEqual([
+    "pruned 1 claude.* events older than 7 days",
+  ]);
+});
+
+test("a sweep with nothing to prune logs nothing about pruning", () => {
+  const lines: string[] = [];
+  db = booted((line) => lines.push(line)).db;
+  expect(lines.filter((l) => l.includes("pruned"))).toEqual([]);
 });

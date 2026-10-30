@@ -156,8 +156,15 @@ const decide = (
     body: JSON.stringify(body),
   });
 
-test("an answer moves the run back to running and records the answer as progress", async () => {
-  await subscribe(["run.progress"]);
+const resumed = () =>
+  (
+    db.$client
+      .prepare("select payload from events where type = 'run.resumed'")
+      .all() as { payload: string }[]
+  ).map((r) => JSON.parse(r.payload));
+
+test("an answer moves the run back to running and records run.resumed, which reaches a subscriber", async () => {
+  await subscribe(["run.resumed"]);
   const received = subscriber();
   const { requestId } = await waitingOn(question());
   const res = await decide("answers", { requestId, answer: "main" });
@@ -166,11 +173,12 @@ test("an answer moves the run back to running and records the answer as progress
     run: { id: runId, status: "running" },
   });
   expect(statuses()).toEqual({ run: "running", agent: "running" });
+  expect(resumed()).toEqual([{ requestId, decision: "answered" }]);
   await expect.poll(() => received.length).toBe(1);
   expect(received[0]).toMatchObject({
     runId,
-    type: "run.progress",
-    payload: { message: `request ${requestId} answered` },
+    type: "run.resumed",
+    payload: { requestId, decision: "answered" },
   });
 });
 
@@ -185,18 +193,13 @@ test.each([
   ["approve", {}, "approved"],
   ["deny", { reason: "too broad" }, "denied"],
 ] as const)(
-  "an approval decision %s resumes the run as progress",
+  "an approval decision %s resumes the run and records run.resumed without the reason",
   async (decision, extra, verb) => {
-    await subscribe(["run.progress"]);
-    const received = subscriber();
     const { requestId } = await waitingOn(approval());
     const res = await decide("approvals", { requestId, decision, ...extra });
     expect(res.status).toBe(200);
     expect(statuses()).toEqual({ run: "running", agent: "running" });
-    await expect.poll(() => received.length).toBe(1);
-    expect(received[0]).toMatchObject({
-      payload: { message: `request ${requestId} ${verb}` },
-    });
+    expect(resumed()).toEqual([{ requestId, decision: verb }]);
   },
 );
 

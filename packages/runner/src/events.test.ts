@@ -64,8 +64,8 @@ test("retries a failed post", async () => {
   const post = createPoster({ ...options, warn: (m) => warnings.push(m) });
   await post({
     runId: "run_1",
-    type: "run.progress",
-    payload: { message: "hi" },
+    type: "claude.Message",
+    payload: { text: "hi" },
   });
   expect(calls).toBe(3);
   expect(warnings).toEqual([]);
@@ -82,11 +82,11 @@ test("gives up after its attempts without throwing, and says so on the warn chan
   const warnings: string[] = [];
   const post = createPoster({ ...options, warn: (m) => warnings.push(m) });
   await expect(
-    post({ runId: "run_1", type: "run.progress", payload: { message: "hi" } }),
+    post({ runId: "run_1", type: "claude.Message", payload: { text: "hi" } }),
   ).resolves.toBeUndefined();
   expect(calls).toBe(3);
   expect(warnings).toHaveLength(1);
-  expect(warnings[0]).toMatch(/run\.progress.*500/);
+  expect(warnings[0]).toMatch(/claude\.Message.*500/);
   expect(warnings[0]).not.toMatch(/agent-secret/);
 });
 
@@ -169,8 +169,8 @@ test("progress keeps the short budget through an outage", async () => {
   const post = createPoster({ ...options, sleep: clock.sleep, warn: () => {} });
   await post({
     runId: "run_1",
-    type: "run.progress",
-    payload: { message: "hi" },
+    type: "claude.Message",
+    payload: { text: "hi" },
   });
   expect(clock.now).toBeLessThanOrEqual(2_000);
 });

@@ -67,7 +67,7 @@ POST /v1/agents
 | `GET /v1/agents/:id/runs/:runId` · `…/stream`                           | a run's result, or its events as SSE                   |
 | `POST /v1/agents/:id/answers` · `…/approvals`                           | answer a waiting question; approve or deny a tool call |
 | `POST /v1/agents/:id/stop` · `…/archive`                                | stop the current run; archive the agent                |
-| `POST /v1/webhooks`                                                     | subscribe a URL to events                              |
+| `POST /v1/webhooks`                                                     | subscribe an https URL to events                       |
 
 Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you'll meet:
 
@@ -81,11 +81,32 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 
 ## MCP
 
-`POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve` and `stop`, so a chat bot can dispatch and answer agents.
+`POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
 
-## Webhooks
+`wait_for_events` waits up to 30 seconds and returns as soon as something happens, with a `cursor` to pass back as `after` on the next call. Call it in a loop to follow every agent live without a public URL. On a first call, use `status` for agents already waiting.
 
-Events: `run.started`, `run.progress`, `run.waiting`, `run.finished`, `run.failed`, `run.stopped`. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
+## Events
+
+What an agent does arrives as events, each with `agentId` and `runId`:
+
+| event                                                                  | when                                                                  |
+| ---------------------------------------------------------------------- | --------------------------------------------------------------------- |
+| `run.started`, `run.finished`, `run.failed`, `run.stopped`             | the run's lifecycle                                                   |
+| `run.waiting`                                                          | the agent needs an `answer` or an approval                            |
+| `run.resumed`                                                          | a question was answered or a tool call approved or denied             |
+| `claude.Message`                                                       | Claude, or a subagent (with `parentToolUseId`), wrote a message       |
+| `claude.PreToolUse`, `claude.PostToolUse`, `claude.PostToolUseFailure` | a tool call starts, finishes or fails, with its input and output      |
+| `claude.SubagentStart`, `claude.SubagentStop`                          | a subagent starts or finishes                                         |
+| `claude.TaskCreated`, `claude.TaskCompleted`                           | a todo item is added or finished                                      |
+| `claude.Notification`, `claude.PreCompact`, `claude.FileChanged`       | Claude Code's notifications, context compaction, watched-file changes |
+
+The `claude.*` names are Claude Code's own hook names. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters. `claude.*` events are kept for 7 days; `run.*` events are kept.
+
+Three ways to receive them:
+
+- **MCP:** `wait_for_events`, above.
+- **Stream:** `GET /v1/stream`, one SSE connection across every agent. Filter with `?types=claude.PostToolUse,run.waiting` and `?agentId=`. After a drop, reconnect with `Last-Event-ID` to receive what you missed. A `: ping` arrives every 15 seconds. `GET /v1/events?after=&wait=` is the same feed as a long poll.
+- **Webhooks:** `POST /v1/webhooks` with an `https` URL and the `eventTypes` you want. Each delivery carries `Sky-Event-Type`, `Sky-Event-Id`, and
 
 ```
 Sky-Signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of "<t>.<body>">
