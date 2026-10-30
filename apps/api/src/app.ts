@@ -16,6 +16,7 @@ import { internalRoutes } from "./internal.js";
 import { createLauncher } from "./launch.js";
 import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
+import { createBundleInstaller } from "./runner-bundle.js";
 import { registerStoredValues, secretRoutes } from "./secrets.js";
 import { webhookRoutes } from "./webhooks.js";
 
@@ -55,12 +56,21 @@ export function createApp({
     apiError(c, 401, "unauthorized", message);
 
   registerStoredValues(db, config.secretEncryptionKey, secrets);
-  const provisioner = createProvisioner({ db, secrets, sprites, log });
+  const ensureBundle = createBundleInstaller(sprites, config.runnerBundlePath);
+  const provisioner = createProvisioner({
+    db,
+    secretEncryptionKey: config.secretEncryptionKey,
+    secrets,
+    sprites,
+    ensureBundle,
+    log,
+  });
   const launcher = createLauncher({
     db,
     config,
     secrets,
     sprites,
+    ensureBundle,
     log,
     nudgeDeliveries,
     watchMs: launchWatchMs,

@@ -47,7 +47,7 @@ export type Session = {
  */
 export function envFileOf(
   wire: { files: Map<string, Uint8Array> },
-  session: Session | undefined,
+  session: Pick<Session, "env"> | undefined,
 ): Record<string, string> {
   const path = session?.env.ENV_FILE;
   const bytes = path ? wire.files.get(path) : undefined;

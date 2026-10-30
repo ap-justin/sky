@@ -164,9 +164,11 @@ async function changes(cwd: string, from: string, to: string) {
 // GitHub's secondary rate limit answers 403 or 429 with a `retry-after`; a pause this long is waited out
 const MAX_RETRY_AFTER_S = 60;
 const RETRIES = 3;
+// a stalled gateway call fails rather than holding the caller
+const REQUEST_TIMEOUT_MS = 120_000;
 
 /** GitHub's REST API for one repo, through the gateway, with no credential of its own. */
-function gateway(options: {
+export function gateway(options: {
   gatewayUrl: string;
   connectorId: string;
   owner: string;
@@ -185,6 +187,7 @@ function gateway(options: {
       try {
         response = await fetch(`${root}${repoPath}${path}`, {
           method,
+          signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           headers: {
             accept: "application/vnd.github+json",
             "x-github-api-version": "2022-11-28",

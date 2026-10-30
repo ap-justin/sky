@@ -18,6 +18,7 @@ import { createApp } from "./app.js";
 import { failInterruptedProvisioning } from "./provision.js";
 import { spriteNameFor } from "./sprites.js";
 import {
+  envFileOf,
   type SpritesWire,
   spritesToken,
   stubSprites,
@@ -718,6 +719,228 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     setupCall(sprite, "pnpm install --frozen-lockfile"),
     `checkpoint ${sprite}`,
   ]);
+});
+
+const STORE_ENV_FILE = "/tmp/sky-kru-store.env";
+/** The variables provisioning's store pull sources. */
+const storeEnv = () => envFileOf(wire, { env: { ENV_FILE: STORE_ENV_FILE } });
+
+type SecretInput = { value: string } | { connector: string };
+const githubConnector = { GITHUB_CONNECTOR: { connector: "VPpb7x" } };
+
+/**
+ * Reprovisions a ready env holding `stored` as its secrets, on an API that has `bundle` as its
+ * runner bundle to upload, or none when null; `beforePatch` runs once the secrets are stored.
+ */
+async function reprovisionWith(
+  stored: Record<string, SecretInput>,
+  bundle: string | null = "// runner",
+  beforePatch = () => {},
+) {
+  const id = await ready();
+  const dir = mkdtempSync(join(tmpdir(), "sky-bundle-"));
+  const runnerBundlePath = join(dir, "runner.mjs");
+  if (bundle !== null) writeFileSync(runnerBundlePath, bundle);
+  const logged: string[] = [];
+  app = createApp({
+    db,
+    config: testConfig({ runnerBundlePath }),
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logged.push(line),
+    nudgeDeliveries: () => {},
+  });
+  for (const [name, input] of Object.entries(stored)) {
+    const put = await app.request(`/v1/environments/${id}/secrets/${name}`, {
+      method: "PUT",
+      headers: json,
+      body: JSON.stringify(input),
+    });
+    expect(put.status).toBe(200);
+  }
+  beforePatch();
+  wire.calls.length = 0;
+  const res = await patch(id, { setup: "pnpm install --frozen-lockfile" });
+  expect(res.status).toBe(202);
+  const env = await settled(id);
+  rmSync(dir, { recursive: true, force: true });
+  return { id, env, logged };
+}
+
+test("with a connector, provisioning checks the Kru store out through the runner before the checkpoint, then runs the store's own setup", async () => {
+  const { id, env } = await reprovisionWith(githubConnector);
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  const sprite = spriteNameFor(id);
+  expect(wire.calls).toEqual([
+    `get ${sprite}`,
+    `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
+    pluginsCall(sprite),
+    setupCall(sprite, "pnpm install --frozen-lockfile"),
+    `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
+    `write ${sprite} /opt/sky/runner.mjs.provision-${id}`,
+    `exec ${sprite} - mv -f /opt/sky/runner.mjs.provision-${id} /opt/sky/runner.mjs`,
+    `write ${sprite} ${STORE_ENV_FILE}`,
+    expect.stringMatching(
+      new RegExp(
+        `^exec ${sprite} - sh -c .*node /opt/sky/runner\\.mjs store-sync pull sh ${STORE_ENV_FILE} &> /tmp/sky-kru-store\\.log$`,
+      ),
+    ),
+    expect.stringMatching(
+      new RegExp(
+        `^exec ${sprite} - bash -c .*setup\\.sh.* bash ${STORE_ENV_FILE} &> /tmp/sky-kru-setup\\.log$`,
+      ),
+    ),
+    `exec ${sprite} - rm -f ${STORE_ENV_FILE}`,
+    `checkpoint ${sprite}`,
+  ]);
+  // like a run's, the pull's env rides in a file only the sprite user reads, never in the exec URL
+  expect(wire.modes.get(STORE_ENV_FILE)).toBe("0600");
+  expect(storeEnv()).toEqual({
+    GITHUB_CONNECTOR: "VPpb7x",
+    KRU_STORE_REPO: "ap-justin/kru-store",
+  });
+  expect(wire.execUrls.join("\n")).not.toContain("VPpb7x");
+});
+
+test("provisioning's store steps see the env's own gateway and KRU_HOME, as a run does, and a KRU_STORE_REPO secret overrides nothing", async () => {
+  const local = mkdtempSync(join(tmpdir(), "sky-store-"));
+  const kruHome = join(local, "store");
+  mkdirSync(kruHome);
+  writeFileSync(join(kruHome, "setup.sh"), 'touch "$(dirname "$0")/ran"\n');
+  // the store's setup runs in a real shell, under a HOME with no Kru plugin; the pull stays stubbed
+  wire.exec = (argv) => {
+    if (argv[0] !== "bash" || !argv[2]?.includes("setup.sh")) {
+      return { exitCode: 0 };
+    }
+    const envPath = join(local, "store.env");
+    writeFileSync(envPath, wire.files.get(argv[4] ?? "") ?? "");
+    const out = spawnSync("bash", [...argv.slice(1, 4), envPath], {
+      env: { HOME: local, PATH: "/usr/bin:/bin" },
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    return { exitCode: out.status ?? 1, stderr: out.stderr };
+  };
+  const { env } = await reprovisionWith({
+    ...githubConnector,
+    GITHUB_GATEWAY_URL: { value: "https://gw.example/github" },
+    KRU_HOME: { value: kruHome },
+    KRU_STORE_REPO: { value: "someone/else" },
+  });
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  expect(storeEnv()).toEqual({
+    GITHUB_CONNECTOR: "VPpb7x",
+    GITHUB_GATEWAY_URL: "https://gw.example/github",
+    KRU_HOME: kruHome,
+    KRU_STORE_REPO: "ap-justin/kru-store",
+  });
+  expect(existsSync(join(kruHome, "ran"))).toBe(true);
+  rmSync(local, { recursive: true, force: true });
+});
+
+test("an env that stores KRU_NO_STORE_SYNC, which turns a run's sync off, gets no store pull or store setup", async () => {
+  const { id, env } = await reprovisionWith({
+    ...githubConnector,
+    KRU_NO_STORE_SYNC: { value: "1" },
+  });
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  const sprite = spriteNameFor(id);
+  expect(wire.calls.at(-2)).toEqual(
+    setupCall(sprite, "pnpm install --frozen-lockfile"),
+  );
+  expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
+});
+
+test("a GITHUB_CONNECTOR stored as a value, not a connector, triggers no store pull", async () => {
+  const { id, env } = await reprovisionWith({
+    GITHUB_CONNECTOR: { value: "ghp_pasted-token" },
+  });
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  const sprite = spriteNameFor(id);
+  expect(wire.calls.at(-2)).toEqual(
+    setupCall(sprite, "pnpm install --frozen-lockfile"),
+  );
+  expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
+});
+
+test("a Kru store checkout that fails is logged without the connector id and never fails provisioning", async () => {
+  const id = await ready();
+  wire.exec = (argv) =>
+    argv.some((arg) => arg.includes("store-sync pull"))
+      ? {
+          exitCode: 1,
+          stderr: "store sync: pull failed: GitHub gateway: 502 VPpb7x",
+        }
+      : { exitCode: 0 };
+  const dir = mkdtempSync(join(tmpdir(), "sky-bundle-"));
+  writeFileSync(join(dir, "runner.mjs"), "// runner");
+  const logged: string[] = [];
+  app = createApp({
+    db,
+    config: testConfig({ runnerBundlePath: join(dir, "runner.mjs") }),
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logged.push(line),
+    nudgeDeliveries: () => {},
+  });
+  await app.request(`/v1/environments/${id}/secrets/GITHUB_CONNECTOR`, {
+    method: "PUT",
+    headers: json,
+    body: JSON.stringify({ connector: "VPpb7x" }),
+  });
+  await patch(id, { setup: "pnpm install --frozen-lockfile" });
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+  rmSync(dir, { recursive: true, force: true });
+  expect(logged.join("\n")).toContain("checking out the Kru store");
+  expect(logged.join("\n")).toContain("pull failed");
+  expect(logged.join("\n")).not.toContain("VPpb7x");
+});
+
+test("env secrets that fail to decrypt for the store step are logged and never fail provisioning", async () => {
+  const { env, logged } = await reprovisionWith(
+    { ...githubConnector, TOKEN: { value: "t0ken" } },
+    "// runner",
+    () => {
+      db.$client
+        .prepare(
+          "UPDATE secrets SET ciphertext = zeroblob(16) WHERE name = 'TOKEN'",
+        )
+        .run();
+    },
+  );
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  expect(logged.join("\n")).toContain("checking out the Kru store");
+});
+
+test("with a connector but no runner bundle to upload, provisioning still ends ready", async () => {
+  const { env, logged } = await reprovisionWith(githubConnector, null);
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  expect(logged.join("\n")).toContain("checking out the Kru store");
+  // the pull is skipped, not attempted: no env file written, nothing exec'd with the runner
+  expect(
+    wire.calls.filter(
+      (c) => c.includes("store-sync") || c.includes(STORE_ENV_FILE),
+    ),
+  ).toEqual([]);
+});
+
+test("a Kru store setup.sh that fails is logged and still leaves provisioning ready, with the env file removed", async () => {
+  const { id, env, logged } = await reprovisionWith(
+    githubConnector,
+    "// runner",
+    () => {
+      wire.exec = (argv) =>
+        argv[0] === "bash" && argv[2]?.includes("setup.sh")
+          ? { exitCode: 3, stderr: "setup.sh: npm exploded" }
+          : { exitCode: 0 };
+    },
+  );
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  expect(logged.join("\n")).toContain("checking out the Kru store");
+  expect(logged.join("\n")).toContain("npm exploded");
+  const sprite = spriteNameFor(id);
+  expect(wire.calls.at(-2)).toBe(`exec ${sprite} - rm -f ${STORE_ENV_FILE}`);
+  expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
 });
 
 test("PATCH that changes repo re-clones from the new remote", async () => {

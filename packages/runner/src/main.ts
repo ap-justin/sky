@@ -6,6 +6,7 @@ import { holdSprite } from "./keepalive.js";
 import { publishMain } from "./publish.js";
 import { createDecisionWaiter } from "./requests.js";
 import { runSession } from "./session.js";
+import { storeSyncMain, syncStoreQuietly } from "./store.js";
 
 const warn = (message: string) => process.stderr.write(`${message}\n`);
 
@@ -40,6 +41,8 @@ async function main(): Promise<void> {
   // held through waits for a decision too: a paused sprite drops the long-poll and the event posts
   const hold = holdSprite({ runId: config.runId, warn });
 
+  // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
+  await syncStoreQuietly("pull", process.env, warn);
   try {
     process.exitCode = await runSession(config, {
       query,
@@ -49,6 +52,7 @@ async function main(): Promise<void> {
       warn,
     });
   } finally {
+    await syncStoreQuietly("push", process.env, warn);
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
     process.off("SIGHUP", onSignal);
@@ -58,17 +62,25 @@ async function main(): Promise<void> {
   if (caught) process.kill(process.pid, caught);
 }
 
-// `runner.mjs publish …` is the agent's own command, run from its worktree; anything else is a run
+const io = {
+  stdout: (s: string) => process.stdout.write(s),
+  stderr: (s: string) => process.stderr.write(s),
+};
+// `runner.mjs publish …` is the agent's own command, run from its worktree; `store-sync` is the
+// API's, at provisioning; anything else is a run
 const entry =
   process.argv[2] === "publish"
     ? publishMain(process.argv.slice(3), process.env, {
         cwd: process.cwd(),
-        stdout: (s) => process.stdout.write(s),
-        stderr: (s) => process.stderr.write(s),
+        ...io,
       }).then((code) => {
         process.exitCode = code;
       })
-    : main();
+    : process.argv[2] === "store-sync"
+      ? storeSyncMain(process.argv.slice(3), process.env, io).then((code) => {
+          process.exitCode = code;
+        })
+      : main();
 
 entry.catch((error: unknown) => {
   warn(`runner: ${error instanceof Error ? error.message : String(error)}`);

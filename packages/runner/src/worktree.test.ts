@@ -2,7 +2,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
 
 const git = (cwd: string, ...args: string[]) =>
@@ -14,6 +14,14 @@ let repoDir: string;
 let worktreesDir: string;
 
 beforeEach(() => {
+  // a host that exports git identity (a sandbox, a CI bot) would beat the `-c user.name` the commit sets
+  for (const name of [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+  ])
+    vi.stubEnv(name, undefined);
   root = mkdtempSync(join(tmpdir(), "runner-wt-"));
   origin = join(root, "origin");
   repoDir = join(root, "repo");
@@ -33,7 +41,10 @@ beforeEach(() => {
   );
   execFileSync("git", ["clone", "-q", origin, repoDir]);
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  vi.unstubAllEnvs();
+  rmSync(root, { recursive: true, force: true });
+});
 
 test("first run branches claude/<agentId> from the clone's default branch", async () => {
   const path = await ensureWorktree({
