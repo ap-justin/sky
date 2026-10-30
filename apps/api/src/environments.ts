@@ -258,6 +258,11 @@ export function environmentRoutes(
             .where(eq(environments.id, id))
             .returning()
             .get();
+          // reprovisioning wipes the sprite's sessions, so a resume would name one that is gone
+          tx.update(agents)
+            .set({ sessionId: null })
+            .where(eq(agents.envId, id))
+            .run();
           return { kind: "retrying", row } as const;
         },
         { behavior: "immediate" },

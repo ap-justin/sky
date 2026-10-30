@@ -8,18 +8,8 @@ import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
 export const spriteNameFor = (envId: string) =>
   `sky-${createHash("sha256").update(envId).digest("hex").slice(0, 24)}`;
 
-/** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
-export async function ensureSprite(
-  client: SpritesClient,
-  name: string,
-): Promise<void> {
-  try {
-    await client.getSprite(name);
-  } catch (err) {
-    if (!(err instanceof APIError && err.statusCode === 404)) throw err;
-    await client.createSprite(name);
-  }
-}
+const isNotFound = (err: unknown) =>
+  err instanceof APIError && err.statusCode === 404;
 
 /** Whether the sprite exists; any error but a 404 throws. */
 export async function spriteExists(
@@ -30,9 +20,17 @@ export async function spriteExists(
     await client.getSprite(name);
     return true;
   } catch (err) {
-    if (err instanceof APIError && err.statusCode === 404) return false;
+    if (isNotFound(err)) return false;
     throw err;
   }
+}
+
+/** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
+export async function ensureSprite(
+  client: SpritesClient,
+  name: string,
+): Promise<void> {
+  if (!(await spriteExists(client, name))) await client.createSprite(name);
 }
 
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
@@ -131,7 +129,7 @@ export async function destroySprite(
   try {
     await client.deleteSprite(name);
   } catch (err) {
-    if (err instanceof APIError && err.statusCode === 404) return;
+    if (isNotFound(err)) return;
     throw err;
   }
 }

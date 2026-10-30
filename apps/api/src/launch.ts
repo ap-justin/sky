@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { APIError, type SpritesClient } from "@fly/sprites";
+import type { SpritesClient } from "@fly/sprites";
 import { type Db, environments, runs } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { and, eq } from "drizzle-orm";
@@ -148,7 +148,10 @@ export type Launch = {
   approvalPolicy: string[];
 };
 
-/** Starts runners in the background; a launch that fails fails its run with a redacted `launch_failed` error. */
+/**
+ * Starts runners in the background; a launch that fails fails its run with a redacted
+ * `launch_failed` error, and its environment too when its sprite is gone.
+ */
 export function createLauncher({
   db,
   config,
@@ -271,22 +274,20 @@ export function createLauncher({
   }
 
   /**
-   * A launch the Sprites API answers 404 may mean the sprite is gone (an org move, a manual
-   * delete). When a lookup confirms it, a ready environment becomes failed at `create`, so
-   * `POST /environments/:id/retry` recreates the sprite.
+   * A failed launch may mean the sprite is gone (an org move, a manual delete). The SDK reports a
+   * missing sprite differently per call (an `APIError` from exec, a `FilesystemError` from a file
+   * write, a socket error from a session), so the lookup decides, not the error. When it confirms
+   * the sprite is gone, a ready environment fails at `create`, so `POST /v1/environments/:id/retry`
+   * recreates the sprite. Throws when the lookup fails.
    */
-  async function failEnvIfSpriteGone(
-    launch: Launch,
-    err: unknown,
-  ): Promise<void> {
-    if (!(err instanceof APIError && err.statusCode === 404)) return;
+  async function failEnvIfSpriteGone(launch: Launch): Promise<void> {
     if (await spriteExists(sprites, launch.spriteName)) return;
     const marked = db
       .update(environments)
       .set({
         status: "failed",
         failureStep: "create",
-        failureStderr: `sprite ${launch.spriteName} no longer exists; retry the environment to recreate it`,
+        failureStderr: `sprite ${launch.spriteName} no longer exists; a retry recreates it`,
       })
       .where(
         and(
@@ -296,7 +297,9 @@ export function createLauncher({
       )
       .run();
     if (marked.changes > 0) {
-      log(`sprite ${launch.spriteName} is gone; ${launch.envId} marked failed`);
+      log(
+        `sprite ${launch.spriteName} is gone; environment ${launch.envId} marked failed`,
+      );
     }
   }
 
@@ -305,9 +308,12 @@ export function createLauncher({
       const agentToken = mintAgentToken(config.apiKey, launch.runId);
       run(launch, agentToken)
         .catch(async (err: unknown) => {
-          await failEnvIfSpriteGone(launch, err).catch((checkErr: unknown) => {
-            log(`checking the sprite of ${launch.envId} failed: ${checkErr}`);
+          await failEnvIfSpriteGone(launch).catch((checkErr: unknown) => {
+            log(
+              `checking whether the sprite of environment ${launch.envId} exists failed: ${checkErr}`,
+            );
           });
+          // rethrown: the next catch still fails the run
           throw err;
         })
         .catch((err: unknown) => {
