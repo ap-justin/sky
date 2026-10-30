@@ -20,6 +20,71 @@ export const RUNNER_DIR = "/opt/sky";
 const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
 // no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep
 const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" -g "$(id -g)" ${RUNNER_DIR}; npm install --prefix ${RUNNER_DIR} --no-audit --no-fund ${RUNNER_SDK}`;
+/**
+ * Installs, for the sprite's user, the plugins the clone's `.claude/settings.json` enables, after
+ * adding the `extraKnownMarketplaces` entries they come from. A headless session honors
+ * `enabledPlugins` only for a plugin already installed; it never fetches one. Runs as `node -e` in
+ * the clone with the runner dir as its argument, so it uses the `claude` the SDK bundles.
+ * `$HOME/.claude` outlives reprovisioning and a repeat add or install fetches nothing, so every
+ * run refreshes the marketplaces and updates each plugin.
+ */
+const INSTALL_PLUGINS = `
+const { execFileSync } = require("node:child_process");
+const { existsSync, readdirSync, readFileSync } = require("node:fs");
+const file = ".claude/settings.json";
+const settings = existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : {};
+const enabled = settings.enabledPlugins ?? {};
+const plugins = Object.keys(enabled).filter((p) => enabled[p] === true);
+if (plugins.length === 0) process.exit(0);
+const sdk = process.argv[1] + "/node_modules/@anthropic-ai";
+const platform = readdirSync(sdk).find(
+  (d) => d.startsWith("claude-agent-sdk-") && existsSync(sdk + "/" + d + "/claude"),
+);
+if (!platform) throw new Error("no claude binary under " + sdk);
+const claude = (...args) => {
+  try {
+    execFileSync(sdk + "/" + platform + "/claude", args, { stdio: "inherit" });
+  } catch (err) {
+    process.exit(err.status || 1);
+  }
+};
+const fail = (name, why) => {
+  console.error('marketplace "' + name + '" in ' + file + ": " + why);
+  process.exit(1);
+};
+// the url forms marketplace add clones; any other http(s) url it fetches as a marketplace.json
+const addClones = (url) =>
+  /^[^/@:]+@[^/:]+:/.test(url) ||
+  (/^https?:/.test(url) && URL.canParse(url) &&
+    (url.endsWith(".git") || url.includes("/_git/") || ["github.com", "gitlab.com"].includes(new URL(url).hostname)));
+// marketplace add takes one source string, so a field that string can't carry is refused, not dropped
+const addArgs = (name, source) => {
+  if (typeof source?.source !== "string") fail(name, "no source object");
+  const { source: type, repo, url, path, ref, sparsePaths } = source;
+  const pinned = (where) => (ref ? where + "#" + ref : where);
+  const sparse = sparsePaths?.length ? ["--sparse", ...sparsePaths] : [];
+  if ((type === "github" || type === "git") && path) fail(name, "marketplace add can't read a " + type + " source's path");
+  if (type === "github") return [pinned(repo), ...sparse];
+  if (type === "git") {
+    if (typeof url !== "string" || !addClones(url)) fail(name, url + " isn't a url marketplace add clones; end it in .git");
+    return [pinned(url), ...sparse];
+  }
+  if (type === "url") {
+    if (source.headers || source.headersHelper) fail(name, "marketplace add can't send a url source's headers");
+    return [url];
+  }
+  if (type === "directory" || type === "file") return [path];
+  fail(name, "unsupported source: " + type);
+};
+const used = new Set(plugins.map((p) => p.slice(p.lastIndexOf("@") + 1)));
+const adds = Object.entries(settings.extraKnownMarketplaces ?? {})
+  .filter(([name]) => used.has(name))
+  .map(([name, entry]) => addArgs(name, entry?.source));
+for (const args of adds) claude("plugin", "marketplace", "add", ...args);
+claude("plugin", "marketplace", "update");
+for (const plugin of plugins) claude("plugin", "install", plugin, "--scope", "user");
+for (const plugin of plugins) claude("plugin", "update", plugin, "--scope", "user");
+`;
 // the sprite's node ships corepack but no pnpm or yarn; corepack's shims go under $HOME, so need no
 // root, and resolve the repo's `packageManager` version when run
 const PACKAGE_MANAGERS_DIR = "$HOME/.local/bin";
@@ -95,6 +160,11 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
       );
       begin("setup");
       await execNoisy(["sh", "-c", installRunnerSdk], "/tmp/sky-sdk.log");
+      await execNoisy(
+        ["node", "-e", INSTALL_PLUGINS, RUNNER_DIR],
+        "/tmp/sky-plugins.log",
+        REPO_DIR,
+      );
       await execNoisy(
         ["sh", "-c", PREPARE_SETUP, "sh", "bash", "-c", env.setup],
         "/tmp/sky-setup.log",
