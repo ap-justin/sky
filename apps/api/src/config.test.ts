@@ -25,6 +25,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       claudeOauthToken,
       publicBaseUrl: "https://sky.example.com",
       runnerBundlePath: expect.stringMatching(/\/runner\.mjs$/),
+      cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
       runTimeoutMs: 30 * 60_000,
       waitTimeoutMs: 120 * 60_000,
       webhookSigningKey: "w".repeat(32),

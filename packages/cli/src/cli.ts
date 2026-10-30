@@ -5,6 +5,7 @@ import { apply } from "./apply.js";
 import { type Config, configPath, type Env, resolveConfig } from "./config.js";
 import { createOutput, type Output, UsageError } from "./output.js";
 import { secretSet } from "./secret.js";
+import { version } from "./version.js";
 
 export interface Io {
   argv: string[];
@@ -67,6 +68,7 @@ Options:
   --json                 print the API's object on stdout (inbox, wait and
                          status: the newest run)
   -h, --help             show this help
+  -v, --version          print the version (on its own: sky --version)
 
 Configuration, first found wins:
   url:     --url, SKY_URL, "url" in the config file
@@ -98,6 +100,10 @@ export async function run(io: Io): Promise<number> {
   ) {
     (command === undefined ? io.stderr : io.stdout)(help(io));
     return command === undefined ? 2 : 0;
+  }
+  if (command === "--version" || command === "-v") {
+    io.stdout(`${version}\n`);
+    return 0;
   }
   try {
     switch (command) {
