@@ -21,6 +21,20 @@ export async function ensureSprite(
   }
 }
 
+/** Whether the sprite exists; any error but a 404 throws. */
+export async function spriteExists(
+  client: SpritesClient,
+  name: string,
+): Promise<boolean> {
+  try {
+    await client.getSprite(name);
+    return true;
+  } catch (err) {
+    if (err instanceof APIError && err.statusCode === 404) return false;
+    throw err;
+  }
+}
+
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
 
 /**

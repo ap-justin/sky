@@ -1,9 +1,9 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import type { SpritesClient } from "@fly/sprites";
-import { type Db, runs } from "@sky/db";
+import { APIError, type SpritesClient } from "@fly/sprites";
+import { type Db, environments, runs } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
-import { eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";
 import {
@@ -15,7 +15,12 @@ import {
 import { type KnownSecrets, redact } from "./redact.js";
 import { failRun, isActive } from "./runs.js";
 import { openEnvSecrets, openRunEnvVars } from "./secrets.js";
-import { execInSprite, startDetached, writeSpriteFile } from "./sprites.js";
+import {
+  execInSprite,
+  spriteExists,
+  startDetached,
+  writeSpriteFile,
+} from "./sprites.js";
 
 const RUNNER = `${RUNNER_DIR}/runner.mjs`;
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
@@ -265,10 +270,46 @@ export function createLauncher({
     });
   }
 
+  /**
+   * A launch the Sprites API answers 404 may mean the sprite is gone (an org move, a manual
+   * delete). When a lookup confirms it, a ready environment becomes failed at `create`, so
+   * `POST /environments/:id/retry` recreates the sprite.
+   */
+  async function failEnvIfSpriteGone(
+    launch: Launch,
+    err: unknown,
+  ): Promise<void> {
+    if (!(err instanceof APIError && err.statusCode === 404)) return;
+    if (await spriteExists(sprites, launch.spriteName)) return;
+    const marked = db
+      .update(environments)
+      .set({
+        status: "failed",
+        failureStep: "create",
+        failureStderr: `sprite ${launch.spriteName} no longer exists; retry the environment to recreate it`,
+      })
+      .where(
+        and(
+          eq(environments.id, launch.envId),
+          eq(environments.status, "ready"),
+        ),
+      )
+      .run();
+    if (marked.changes > 0) {
+      log(`sprite ${launch.spriteName} is gone; ${launch.envId} marked failed`);
+    }
+  }
+
   return {
     start(launch: Launch): void {
       const agentToken = mintAgentToken(config.apiKey, launch.runId);
       run(launch, agentToken)
+        .catch(async (err: unknown) => {
+          await failEnvIfSpriteGone(launch, err).catch((checkErr: unknown) => {
+            log(`checking the sprite of ${launch.envId} failed: ${checkErr}`);
+          });
+          throw err;
+        })
         .catch((err: unknown) => {
           // the SDK's socket errors quote the session URL, which carries the env
           const detail = redact(

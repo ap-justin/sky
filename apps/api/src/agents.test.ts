@@ -455,6 +455,63 @@ test("a launch the sprite rejects fails the run with a redacted error and frees 
   expect(wire.sessions).toEqual([]);
 });
 
+const envRow = (id: string) =>
+  db.$client
+    .prepare(
+      "select status, failure_step as failureStep, failure_stderr as failureStderr from environments where id = ?",
+    )
+    .get(id);
+
+test("a launch on a sprite that no longer exists fails the run and marks its ready environment failed", async () => {
+  const envId = readyEnv();
+  wire.sprites.delete(spriteNameFor(envId));
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({
+      status: "failed",
+      failureStep: "create",
+      failureStderr: expect.stringContaining(spriteNameFor(envId)),
+    }),
+  );
+  await vi.waitFor(() =>
+    expect(
+      db.$client.prepare("select status from runs where id = ?").get(run.id),
+    ).toEqual({ status: "failed" }),
+  );
+});
+
+test("a failed launch on a sprite that still exists leaves the environment ready", async () => {
+  wire.writeStatus = 404;
+  const envId = readyEnv();
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(
+      db.$client.prepare("select status from runs where id = ?").get(run.id),
+    ).toEqual({ status: "failed" }),
+  );
+  expect(envRow(envId)).toMatchObject({ status: "ready" });
+});
+
+test("retrying an environment marked failed for its missing sprite recreates the sprite and ends ready", async () => {
+  const envId = readyEnv();
+  const sprite = spriteNameFor(envId);
+  wire.sprites.delete(sprite);
+  await launched(envId);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({ status: "failed" }),
+  );
+  const res = await app.request(`/v1/environments/${envId}/retry`, {
+    method: "POST",
+    headers: auth,
+  });
+  expect(res.status).toBe(202);
+  await vi.waitFor(() =>
+    expect(envRow(envId)).toMatchObject({ status: "ready" }),
+  );
+  expect(wire.calls).toContain(`create ${sprite}`);
+  expect(wire.sprites.has(sprite)).toBe(true);
+});
+
 const usage = {
   inputTokens: 1200,
   outputTokens: 340,
