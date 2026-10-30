@@ -61,6 +61,16 @@ try {
     },
     sleep: (ms) => sleep(ms),
     now: () => Date.now(),
+    onInterrupt: (note) => {
+      const onSigint = () => {
+        // `once` has already removed this listener, so the re-raise takes the default death
+        process.stderr.write(`harness: ${note}\n`, () =>
+          process.kill(process.pid, "SIGINT"),
+        );
+      };
+      process.once("SIGINT", onSigint);
+      return () => process.off("SIGINT", onSigint);
+    },
   });
 } catch (err) {
   process.stderr.write(

@@ -373,3 +373,152 @@ test("usage errors exit 2 with a pointer to --help", async () => {
     expect(r.stdout).toBe("");
   }
 });
+
+const unavailable = () =>
+  HttpResponse.json(
+    { error: { code: "unavailable", message: "no healthy machines" } },
+    { status: 503 },
+  );
+
+test("a 503 while polling is retried with backoff and the wait completes", async () => {
+  let gets = 0;
+  server.use(
+    list(),
+    http.post(
+      `${apiUrl}/v1/environments`,
+      recordWrite(202, env({ status: "provisioning", checkpointId: null })),
+    ),
+    http.get(`${apiUrl}/v1/environments/:id`, () => {
+      gets++;
+      if (gets === 1) return HttpResponse.json(env({ status: "provisioning" }));
+      if (gets <= 4) return unavailable();
+      if (gets === 5) return HttpResponse.error();
+      return HttpResponse.json(env());
+    }),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("ready web env_1\n");
+  expect(r.sleeps).toEqual([3000, 3000, 6000, 12000, 24000, 30000]);
+  // one line for the burst, not one per failed poll
+  expect(r.stderr.match(/retrying/g)).toHaveLength(1);
+  expect(r.stderr).toContain("no healthy machines");
+});
+
+test("a 4xx while polling fails at once", async () => {
+  server.use(
+    list(),
+    http.post(
+      `${apiUrl}/v1/environments`,
+      recordWrite(202, env({ status: "provisioning", checkpointId: null })),
+    ),
+    http.get(`${apiUrl}/v1/environments/:id`, () =>
+      HttpResponse.json(
+        { error: { code: "not_found", message: "no such environment" } },
+        { status: 404 },
+      ),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(1);
+  expect(r.sleeps).toEqual([3000]);
+  expect(r.stderr).toContain("no such environment (not_found)");
+});
+
+test("polling through an outage still gives up at the 30 minute deadline", async () => {
+  server.use(
+    list(),
+    http.post(
+      `${apiUrl}/v1/environments`,
+      recordWrite(202, env({ status: "provisioning" })),
+    ),
+    http.get(`${apiUrl}/v1/environments/:id`, unavailable),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(1);
+  expect(r.sleeps.reduce((a, b) => a + b, 0)).toBeLessThanOrEqual(
+    30 * 60 * 1000,
+  );
+  expect(r.stderr).toMatch(/still provisioning after 30m/);
+  expect(r.stderr).toContain("last poll: no healthy machines");
+});
+
+test("a setup change while the env is still provisioning waits for it, then patches", async () => {
+  writeFileSync(file, yaml.replace("pnpm install", "make"));
+  writeFileSync(lockFile, JSON.stringify({ envId: "env_1" }));
+  const provisioning = env({ status: "provisioning", checkpointId: null });
+  server.use(
+    getSequence(
+      provisioning,
+      provisioning,
+      env(),
+      env({ setup: "make", checkpointId: "ckpt_2" }),
+    ),
+    http.patch(`${apiUrl}/v1/environments/env_1`, async ({ request }) => {
+      writes.push({ method: "PATCH", body: await request.json() });
+      return HttpResponse.json(
+        env({ status: "provisioning", setup: "make", checkpointId: null }),
+        { status: 202 },
+      );
+    }),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([{ method: "PATCH", body: { setup: "make" } }]);
+  expect(r.stderr).toContain(
+    "web (env_1) is still provisioning; waiting for it to finish before changing setup",
+  );
+  expect(r.stdout).toBe("ready web env_1\n");
+  expect(lock().checkpointId).toBe("ckpt_2");
+});
+
+test("Ctrl-C during a wait says the env keeps provisioning and how to pick it up", async () => {
+  server.use(
+    list(),
+    http.post(
+      `${apiUrl}/v1/environments`,
+      recordWrite(202, env({ status: "provisioning", checkpointId: null })),
+    ),
+    getSequence(env({ status: "provisioning" }), env()),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(r.interruptNotes).toEqual([
+    "interrupted; web (env_1) keeps provisioning on the server — re-run harness apply to pick it up",
+  ]);
+  expect(r.armedAtExit).toBe(0);
+});
+
+test("a HARNESS_URL without a scheme exits 2 showing the expected form, with no request", async () => {
+  const r = await runCli(["apply", file], {
+    env: { HARNESS_URL: "harness-api.fly.dev" },
+  });
+  expect(r.code).toBe(2);
+  expect(r.stderr).toBe(
+    'harness: HARNESS_URL "harness-api.fly.dev" is not a URL; expected https://<host>, e.g. https://harness-api.fly.dev\n',
+  );
+});
+
+test("a rejected API key exits 2 naming where the key came from", async () => {
+  server.use(
+    http.get(`${apiUrl}/v1/environments`, () =>
+      HttpResponse.json(
+        { error: { code: "unauthorized", message: "invalid API key" } },
+        { status: 401 },
+      ),
+    ),
+  );
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(2);
+  expect(r.stderr).toBe(
+    "harness: invalid API key (unauthorized); check the key from HARNESS_API_KEY\n",
+  );
+  const json = await runCli(["apply", "--json", file]);
+  expect(json.code).toBe(2);
+  expect(JSON.parse(json.stderr)).toEqual({
+    error: {
+      code: "unauthorized",
+      message: "invalid API key; check the key from HARNESS_API_KEY",
+    },
+  });
+});

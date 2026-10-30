@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,6 +9,20 @@ import { afterAll, beforeAll, expect, test } from "vitest";
 // the built binary in a child process: exit codes, streams and real stdin, which an in-process run can't show
 const pkg = join(import.meta.dirname, "..");
 const bin = join(pkg, "dist", "bundle", "harness.mjs");
+
+const provisioningEnv = {
+  id: "env_slow",
+  name: "web",
+  repo: "acme/web",
+  setup: "pnpm install",
+  concurrency: 3,
+  approvalPolicy: [],
+  status: "provisioning",
+  spriteName: "harness-env-slow",
+  checkpointId: null,
+  failure: null,
+  createdAt: "2026-10-30T00:00:00.000Z",
+};
 
 let api: Server;
 let apiUrl: string;
@@ -27,7 +41,13 @@ beforeAll(async () => {
     req.on("end", () => {
       received.push({ url: req.url ?? "", body });
       res.setHeader("content-type", "application/json");
-      res.end(JSON.stringify({ name: "TOKEN", kind: "value" }));
+      res.end(
+        JSON.stringify(
+          req.url === "/v1/environments/env_slow"
+            ? provisioningEnv
+            : { name: "TOKEN", kind: "value" },
+        ),
+      );
     });
   });
   await new Promise<void>((resolve) => api.listen(0, "127.0.0.1", resolve));
@@ -112,4 +132,40 @@ test("a piped secret reaches the API and neither output stream", async () => {
     url: "/v1/environments/env_1/secrets/TOKEN",
     body: JSON.stringify({ value }),
   });
+});
+
+test("Ctrl-C while waiting says the env keeps provisioning, then dies by SIGINT", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "harness-bin-apply-"));
+  const file = join(dir, "env.yaml");
+  writeFileSync(file, "name: web\nrepo: acme/web\nsetup: pnpm install\n");
+  writeFileSync(
+    join(dir, "harness-lock.json"),
+    JSON.stringify({ envId: "env_slow" }),
+  );
+  const child = spawn(process.execPath, [bin, "apply", file], {
+    env: {
+      PATH: process.env.PATH ?? "",
+      HOME: dir,
+      HARNESS_URL: apiUrl,
+      HARNESS_API_KEY: "k",
+    },
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (c) => {
+    stdout += c;
+  });
+  child.stderr.on("data", (c) => {
+    stderr += c;
+    if (stderr.includes("provisioning web (env_slow)")) child.kill("SIGINT");
+  });
+  const [code, signal] = await new Promise<[number | null, string | null]>(
+    (resolve) => child.on("close", (c, s) => resolve([c, s])),
+  );
+  expect({ code, signal }).toEqual({ code: null, signal: "SIGINT" });
+  expect(stdout).toBe("");
+  expect(stderr).toContain(
+    "harness: interrupted; web (env_slow) keeps provisioning on the server — re-run harness apply to pick it up\n",
+  );
 });

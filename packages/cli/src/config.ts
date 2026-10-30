@@ -7,6 +7,8 @@ export type Env = Record<string, string | undefined>;
 export interface Config {
   url: string;
   apiKey: string;
+  /** Where the key came from, for the message when the API rejects it. */
+  apiKeySource: string;
 }
 
 export interface ConfigFlags {
@@ -49,14 +51,19 @@ export function resolveConfig(
       };
     }
   }
-  let url = nonEmpty(flags.url) ?? nonEmpty(env.HARNESS_URL);
-  let apiKey = flagKey ?? nonEmpty(env.HARNESS_API_KEY);
   const path = configPath(env, home);
+  let url =
+    sourced(nonEmpty(flags.url), "--url") ??
+    sourced(nonEmpty(env.HARNESS_URL), "HARNESS_URL");
+  let apiKey =
+    flags.apiKeyEnv !== undefined
+      ? sourced(flagKey, `${flags.apiKeyEnv} (--api-key-env)`)
+      : sourced(nonEmpty(env.HARNESS_API_KEY), "HARNESS_API_KEY");
   if (url === undefined || apiKey === undefined) {
     const file = readConfigFile(path);
     if (!file.ok) return file;
-    url ??= file.value.url;
-    apiKey ??= file.value.apiKey;
+    url ??= sourced(file.value.url, `url in ${path}`);
+    apiKey ??= sourced(file.value.apiKey, `apiKey in ${path}`);
   }
   if (url === undefined) {
     return {
@@ -70,7 +77,37 @@ export function resolveConfig(
       error: `no API key: set HARNESS_API_KEY, pass --api-key-env=<VAR>, or add "apiKey" to ${path}`,
     };
   }
-  return { ok: true, config: { url: url.replace(/\/+$/, ""), apiKey } };
+  const urlError = checkUrl(url.value);
+  if (urlError !== undefined) {
+    return { ok: false, error: `${url.source} "${url.value}" ${urlError}` };
+  }
+  return {
+    ok: true,
+    config: {
+      url: url.value.replace(/\/+$/, ""),
+      apiKey: apiKey.value,
+      apiKeySource: apiKey.source,
+    },
+  };
+}
+
+const sourced = (value: string | undefined, source: string) =>
+  value === undefined ? undefined : { value, source };
+
+const localHosts = new Set(["localhost", "127.0.0.1"]);
+
+/** A reason the URL is unusable, or undefined; plain http only reaches a local dev server. */
+function checkUrl(value: string): string | undefined {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    return "is not a URL; expected https://<host>, e.g. https://harness-api.fly.dev";
+  }
+  if (url.protocol === "https:") return undefined;
+  if (url.protocol === "http:" && localHosts.has(url.hostname))
+    return undefined;
+  return "must use https (http only for localhost)";
 }
 
 function readConfigFile(

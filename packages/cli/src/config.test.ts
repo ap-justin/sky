@@ -18,7 +18,11 @@ test("flags beat env beat the config file", () => {
   );
   expect(resolveConfig({}, {}, dir)).toEqual({
     ok: true,
-    config: { url: "https://file.example", apiKey: "file-key" },
+    config: {
+      url: "https://file.example",
+      apiKey: "file-key",
+      apiKeySource: `apiKey in ${join(dir, ".config", "harness", "config.json")}`,
+    },
   });
   const env = {
     HARNESS_URL: "https://env.example",
@@ -27,7 +31,11 @@ test("flags beat env beat the config file", () => {
   };
   expect(resolveConfig({}, env, dir)).toEqual({
     ok: true,
-    config: { url: "https://env.example", apiKey: "env-key" },
+    config: {
+      url: "https://env.example",
+      apiKey: "env-key",
+      apiKeySource: "HARNESS_API_KEY",
+    },
   });
   expect(
     resolveConfig(
@@ -37,7 +45,11 @@ test("flags beat env beat the config file", () => {
     ),
   ).toEqual({
     ok: true,
-    config: { url: "https://flag.example", apiKey: "other-key" },
+    config: {
+      url: "https://flag.example",
+      apiKey: "other-key",
+      apiKeySource: "OTHER_KEY (--api-key-env)",
+    },
   });
 });
 
@@ -49,7 +61,11 @@ test("an empty env var doesn't count as set", () => {
     resolveConfig({}, { HARNESS_URL: "", HARNESS_API_KEY: "" }, dir),
   ).toEqual({
     ok: true,
-    config: { url: "https://file.example", apiKey: "file-key" },
+    config: {
+      url: "https://file.example",
+      apiKey: "file-key",
+      apiKeySource: `apiKey in ${join(dir, ".config", "harness", "config.json")}`,
+    },
   });
 });
 
@@ -104,4 +120,25 @@ test("a trailing slash on the URL is dropped", () => {
       home(),
     ),
   ).toMatchObject({ config: { url: "https://env.example" } });
+});
+
+test("the URL must be https, except on localhost", () => {
+  const env = { HARNESS_API_KEY: "k" };
+  for (const url of ["http://localhost:8080", "http://127.0.0.1:8080"]) {
+    expect(resolveConfig({ url }, env, home()).ok, url).toBe(true);
+  }
+  expect(resolveConfig({ url: "http://harness.example" }, env, home())).toEqual(
+    {
+      ok: false,
+      error:
+        '--url "http://harness.example" must use https (http only for localhost)',
+    },
+  );
+  const dir = withConfigFile(JSON.stringify({ url: "ftp://x" }));
+  expect(resolveConfig({}, env, dir)).toMatchObject({
+    ok: false,
+    error: expect.stringMatching(
+      /^url in .*config\.json "ftp:\/\/x" must use https/,
+    ),
+  });
 });

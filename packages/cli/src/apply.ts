@@ -9,6 +9,7 @@ import { type EnvSpec, parseSpec, specHash } from "./spec.js";
 const pollIntervalMs = 3_000;
 const provisionTimeoutMs = 30 * 60 * 1000;
 const progressEveryPolls = 10;
+const maxBackoffMs = 30_000;
 
 const lockName = "harness-lock.json";
 const Lock = z.object({ envId: z.string().min(1) });
@@ -39,6 +40,19 @@ export async function apply(
   const lockFile = join(dirname(file), lockName);
 
   let current = await findEnv(api, spec.name, readLockedId(lockFile, out));
+  if (current?.env.status === "provisioning") {
+    const blocked = reprovisioningFields(changedFields(spec, current.env));
+    if (blocked.length > 0) {
+      // the API refuses a reprovisioning PATCH mid-provision; let this one finish, then diff against its result
+      const { id, name } = current.env;
+      out.progress(
+        `${name} (${id}) is still provisioning; waiting for it to finish before changing ${blocked.join(", ")}`,
+      );
+      const waited = await waitForProvisioned(api, current, io, out);
+      if (!waited.done) return timedOut(current.env, waited.lastError, out);
+      current = waited.current;
+    }
+  }
   let changed = true;
   if (current === undefined) {
     current = await api.createEnvironment(spec);
@@ -60,14 +74,9 @@ export async function apply(
   }
 
   if (current.env.status === "provisioning") {
-    const done = await waitForProvisioned(api, current, io, out);
-    if (done === undefined) {
-      return out.fail(
-        "provision_timeout",
-        `${spec.name} (${current.env.id}) still provisioning after ${provisionTimeoutMs / 60_000}m; re-run apply to keep waiting`,
-      );
-    }
-    current = done;
+    const waited = await waitForProvisioned(api, current, io, out);
+    if (!waited.done) return timedOut(current.env, waited.lastError, out);
+    current = waited.current;
   }
 
   const { env } = current;
@@ -92,6 +101,18 @@ export async function apply(
     `${changed ? "ready" : "up to date"} ${env.name} ${env.id}`,
   );
   return 0;
+}
+
+function timedOut(
+  env: ApiEnvironment,
+  lastError: ApiError | undefined,
+  out: Output,
+): number {
+  return out.fail(
+    "provision_timeout",
+    `${env.name} (${env.id}) still provisioning after ${provisionTimeoutMs / 60_000}m; re-run apply to keep waiting`,
+    lastError && `last poll: ${lastError.message}`,
+  );
 }
 
 function readLockedId(lockFile: string, out: Output): string | undefined {
@@ -128,6 +149,9 @@ async function findEnv(
   return env === undefined ? undefined : { raw: env, env };
 }
 
+const reprovisioningFields = (patch: Partial<EnvSpec>) =>
+  (["repo", "setup"] as const).filter((key) => key in patch);
+
 function changedFields(spec: EnvSpec, env: ApiEnvironment): Partial<EnvSpec> {
   const patch: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(spec)) {
@@ -138,29 +162,63 @@ function changedFields(spec: EnvSpec, env: ApiEnvironment): Partial<EnvSpec> {
   return patch;
 }
 
+type Waited =
+  | { done: true; current: Fetched }
+  | { done: false; lastError: ApiError | undefined };
+
+/** Polls until the env leaves `provisioning`; an unreachable API or a 5xx is retried with backoff up to the deadline. */
 async function waitForProvisioned(
   api: Api,
   start: Fetched,
   io: Io,
   out: Output,
-): Promise<Fetched | undefined> {
+): Promise<Waited> {
   const { id, name } = start.env;
   const startedAt = io.now();
   out.progress(`provisioning ${name} (${id})…`);
-  let current = start;
-  for (let polls = 1; current.env.status === "provisioning"; polls++) {
-    if (io.now() - startedAt >= provisionTimeoutMs) return undefined;
-    await io.sleep(pollIntervalMs);
-    current = await api.getEnvironment(id);
-    if (
-      polls % progressEveryPolls === 0 &&
-      current.env.status === "provisioning"
-    ) {
-      out.progress(`still provisioning (${elapsed(io.now() - startedAt)})`);
-    }
+  const disarm = io.onInterrupt(
+    `interrupted; ${name} (${id}) keeps provisioning on the server — re-run harness apply to pick it up`,
+  );
+  try {
+    return await poll();
+  } finally {
+    disarm();
   }
-  return current;
+
+  async function poll(): Promise<Waited> {
+    let current = start;
+    let failures = 0;
+    let lastError: ApiError | undefined;
+    for (let polls = 1; current.env.status === "provisioning"; polls++) {
+      const remaining = provisionTimeoutMs - (io.now() - startedAt);
+      if (remaining <= 0) return { done: false, lastError };
+      const backoff = Math.min(pollIntervalMs * 2 ** failures, maxBackoffMs);
+      await io.sleep(Math.min(backoff, remaining));
+      try {
+        current = await api.getEnvironment(id);
+      } catch (err) {
+        if (!(err instanceof ApiError && isTransient(err))) throw err;
+        if (failures === 0) {
+          out.progress(`lost contact with the API (${err.message}); retrying`);
+        }
+        failures++;
+        lastError = err;
+        continue;
+      }
+      failures = 0;
+      lastError = undefined;
+      if (
+        polls % progressEveryPolls === 0 &&
+        current.env.status === "provisioning"
+      ) {
+        out.progress(`still provisioning (${elapsed(io.now() - startedAt)})`);
+      }
+    }
+    return { done: true, current };
+  }
 }
+
+const isTransient = (err: ApiError) => err.status === 0 || err.status >= 500;
 
 const elapsed = (ms: number) => {
   const s = Math.round(ms / 1000);

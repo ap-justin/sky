@@ -11,6 +11,10 @@ export interface Captured {
   stdout: string;
   stderr: string;
   sleeps: number[];
+  /** What a Ctrl-C would have printed, for each distinct note armed while the CLI slept. */
+  interruptNotes: string[];
+  /** Notes still armed when the run returned; a finished wait disarms its own. */
+  armedAtExit: number;
 }
 
 /** Runs the CLI in-process against MSW with a fake clock that `sleep` advances. */
@@ -26,6 +30,8 @@ export async function runCli(
   let stderr = "";
   let clock = 0;
   const sleeps: number[] = [];
+  const armed = new Set<string>();
+  const interruptNotes = new Set<string>();
   const code = await run({
     argv,
     env: {
@@ -52,8 +58,20 @@ export async function runCli(
     sleep: async (ms) => {
       sleeps.push(ms);
       clock += ms;
+      for (const note of armed) interruptNotes.add(note);
     },
     now: () => clock,
+    onInterrupt: (note) => {
+      armed.add(note);
+      return () => armed.delete(note);
+    },
   });
-  return { code, stdout, stderr, sleeps };
+  return {
+    code,
+    stdout,
+    stderr,
+    sleeps,
+    interruptNotes: [...interruptNotes],
+    armedAtExit: armed.size,
+  };
 }

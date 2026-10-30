@@ -1,7 +1,7 @@
 import { parseArgs } from "node:util";
 import { ApiError, createApi } from "./api.js";
 import { apply } from "./apply.js";
-import { configPath, type Env, resolveConfig } from "./config.js";
+import { type Config, configPath, type Env, resolveConfig } from "./config.js";
 import { createOutput, type Output, UsageError } from "./output.js";
 import { secretSet } from "./secret.js";
 
@@ -20,6 +20,8 @@ export interface Io {
   };
   sleep(ms: number): Promise<void>;
   now(): number;
+  /** Until the returned disarm runs, Ctrl-C prints `harness: <note>` on stderr before the process dies by SIGINT. */
+  onInterrupt(note: string): () => void;
 }
 
 const help = (io: Io) => `Usage:
@@ -41,7 +43,8 @@ Configuration, first found wins:
   API key: --api-key-env, HARNESS_API_KEY, "apiKey" in the config file
   config file: ${configPath(io.env, io.home)}
 
-Exit status: 0 done · 1 failed (API error, provisioning failed) · 2 usage or config error
+Exit status: 0 done · 1 failed (API error, provisioning failed) · 2 usage or
+  config error, a rejected API key included
 `;
 
 const commonOptions = {
@@ -102,7 +105,7 @@ function connect(values: { url?: string; "api-key-env"?: string }, io: Io) {
     io.home,
   );
   if (!resolved.ok) throw new UsageError(resolved.error);
-  return createApi(resolved.config);
+  return { api: createApi(resolved.config), config: resolved.config };
 }
 
 async function runApply(args: string[], io: Io): Promise<number> {
@@ -116,11 +119,11 @@ async function runApply(args: string[], io: Io): Promise<number> {
   }
   const out = createOutput(values.json ?? false, io.stdout, io.stderr);
   const file = positionals[0] as string;
-  const api = connect(values, io);
+  const { api, config } = connect(values, io);
   try {
     return await apply(file, api, io, out);
   } catch (err) {
-    if (err instanceof ApiError) return failApi(err, out);
+    if (err instanceof ApiError) return failApi(err, config, out);
     throw err;
   }
 }
@@ -151,19 +154,22 @@ async function runSecret(args: string[], io: Io): Promise<number> {
     );
   }
   const out = createOutput(values.json ?? false, io.stdout, io.stderr);
-  const api = connect(values, io);
+  const { api, config } = connect(values, io);
   try {
     return await secretSet(envRef, name, values.connector, api, io, out);
   } catch (err) {
-    if (err instanceof ApiError) return failApi(err, out);
+    if (err instanceof ApiError) return failApi(err, config, out);
     throw err;
   }
 }
 
-function failApi(err: ApiError, out: Output): number {
+/** A rejected key is a config error (2): retrying with the same key can't succeed. */
+function failApi(err: ApiError, config: Config, out: Output): number {
   const showCode = !out.json && err.code !== "unreachable";
-  return out.fail(
-    err.code,
-    showCode ? `${err.message} (${err.code})` : err.message,
-  );
+  const message = showCode ? `${err.message} (${err.code})` : err.message;
+  if (err.status === 401) {
+    out.fail(err.code, `${message}; check the key from ${config.apiKeySource}`);
+    return 2;
+  }
+  return out.fail(err.code, message);
 }
