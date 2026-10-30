@@ -402,12 +402,14 @@ const poll = (query = "", signal?: AbortSignal) =>
 type Page = { data: { id: string; type: string }[]; cursor: string };
 
 /**
- * Resolves once a poll is subscribed and waiting; setImmediate isn't among the faked timers. How many turns
- * the request takes to reach the handler depends on machine load, so this waits on the subscription itself
- * and leaves a poll that never parks to the test's own timeout.
+ * Resolves once a poll is subscribed and waiting; setImmediate isn't among the faked timers. The turns a
+ * request takes to reach the handler vary with load, so the wait is bounded by wall-clock time (Date isn't
+ * faked) and fails here, under the default 5s test timeout, rather than leaving the loop spinning.
  */
 const parked = async () => {
+  const deadline = Date.now() + 3_000;
   while (runEvents.listenerCount(anyRun) === 0) {
+    if (Date.now() > deadline) throw new Error("the poll never subscribed");
     await new Promise((r) => setImmediate(r));
   }
   expect(runEvents.listenerCount(anyRun)).toBe(1);
