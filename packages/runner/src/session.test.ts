@@ -11,7 +11,7 @@ import type {
 } from "@anthropic-ai/claude-agent-sdk";
 import { RUNNER_TEXT_MAX, type RunnerEventPost } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import type { Config } from "./config.js";
 import { createPoster } from "./events.js";
@@ -54,7 +54,10 @@ beforeEach(() => {
     waitTimeoutMs: 60_000,
   };
 });
-afterEach(() => rmSync(root, { recursive: true, force: true }));
+afterEach(() => {
+  vi.useRealTimers();
+  rmSync(root, { recursive: true, force: true });
+});
 
 const init = { type: "system", subtype: "init", session_id: "sess-new" };
 const assistant = (...content: unknown[]) => ({
@@ -885,7 +888,7 @@ function api(...replies: DecisionReply[]) {
       apiBaseUrl: "https://api.test",
       agentToken: "agent-secret",
       runId: "run_1",
-      retryDelayMs: 0,
+      sleep: async () => {},
     }),
     signal: new AbortController().signal,
   };
@@ -1089,6 +1092,8 @@ test("a declined question tells Claude the user declined", async () => {
 });
 
 test("a wait past the max aborts the session, commits, and fails the run with waiting_timeout", async () => {
+  // frozen Date: the run.waiting post can't spend the 50 ms, so the poll is what expires
+  vi.useFakeTimers({ toFake: ["Date"] });
   const { sent, deps } = api(async () => {
     await delay("infinite");
     return new HttpResponse(null, { status: 500 });
@@ -1128,6 +1133,588 @@ test("a run the API already ended stops the session and posts nothing terminal",
     "claude.PreToolUse",
     "run.waiting",
   ]);
+});
+
+/** Freezes `Date`; the sleep it returns moves the frozen clock forward instead of waiting. The file's afterEach restores it. */
+function virtualTiming() {
+  vi.useFakeTimers({ toFake: ["Date"] });
+  return {
+    sleep: async (ms: number) => void vi.setSystemTime(Date.now() + ms),
+    random: () => 0.5,
+  };
+}
+
+/**
+ * The API through a redeploy, as the runner sees it: events after `run.started` meet `outage`
+ * failed attempts (dropped connections and proxy 502/503s) before one lands; a poll for a request
+ * the API never stored is a 404, and polls for a stored one get `pollReplies` in turn, the last
+ * repeating. `virtualTime` freezes `Date` and lets each backoff pause advance it, so a small
+ * `waitTimeoutMs` is spent by pauses alone and never races the real clock.
+ */
+function restartingApi(options: {
+  outage: number;
+  pollReplies: DecisionReply[];
+  refuse?: (event: RunnerEventPost) => boolean;
+  virtualTime?: boolean;
+}) {
+  const timing = options.virtualTime
+    ? virtualTiming()
+    : { sleep: async () => {} };
+  const sent: RunnerEventPost[] = [];
+  const stored = new Set<string>();
+  let failures = 0;
+  let polls = 0;
+  const failure = () =>
+    [
+      HttpResponse.error(),
+      new HttpResponse(null, { status: 503 }),
+      new HttpResponse(null, { status: 502 }),
+    ][failures++ % 3] as Response;
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      const event = (await request.json()) as RunnerEventPost;
+      if (options.refuse?.(event))
+        return new HttpResponse(null, { status: 503 });
+      if (event.type !== "run.started" && failures < options.outage)
+        return failure();
+      sent.push(event);
+      if (event.type === "run.waiting")
+        stored.add(event.payload.request.requestId);
+      return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+    }),
+    http.get(
+      "https://api.test/internal/runs/run_1/requests/:requestId",
+      ({ params }) => {
+        const requestId = String(params.requestId);
+        if (!stored.has(requestId))
+          return HttpResponse.json(
+            { error: { code: "not_found", message: "no such request" } },
+            { status: 404 },
+          );
+        const replies = options.pollReplies;
+        const reply = replies[Math.min(++polls, replies.length) - 1];
+        return reply?.(requestId) ?? new HttpResponse(null, { status: 500 });
+      },
+    ),
+  );
+  const deps = {
+    post: createPoster({
+      apiBaseUrl: "https://api.test",
+      agentToken: "agent-secret",
+      warn: () => {},
+      ...timing,
+    }),
+    awaitDecision: createDecisionWaiter({
+      apiBaseUrl: "https://api.test",
+      agentToken: "agent-secret",
+      runId: "run_1",
+      ...timing,
+    }),
+    signal: new AbortController().signal,
+  };
+  return { sent, deps, polls: () => polls };
+}
+
+const dropped: DecisionReply = () => HttpResponse.error();
+const status =
+  (code: number): DecisionReply =>
+  () =>
+    new HttpResponse(null, { status: code });
+
+test("an API restart mid-approval is ridden out: the tool call is approved, and PreToolUse and run.waiting both land", async () => {
+  // longer than a fixed count of tries would survive: both posts ride it out on their deadlines
+  const { sent, deps } = restartingApi({
+    outage: 14,
+    pollReplies: [
+      dropped,
+      status(503),
+      status(502),
+      dropped,
+      decided({ decision: "approve" }),
+    ],
+  });
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(answers).toEqual([{ continue: true }]);
+  expect(code).toBe(0);
+  expect(sent.map((e) => e.type)).toEqual([
+    "run.started",
+    "claude.PreToolUse",
+    "run.waiting",
+    "run.finished",
+  ]);
+});
+
+test("a stop cuts a claude.PreToolUse retry short, so run.failed goes out without waiting out its budget", async () => {
+  // virtual time: every backoff pause advances it, and holds until the stop has happened
+  let time = 0;
+  let markStopped!: () => void;
+  const stopHappened = new Promise<void>((resolve) => {
+    markStopped = resolve;
+  });
+  let failedAt: number | undefined;
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      const event = (await request.json()) as RunnerEventPost;
+      if (event.type === "claude.PreToolUse")
+        return new HttpResponse(null, { status: 503 });
+      if (event.type === "run.failed") failedAt ??= time;
+      return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+    }),
+  );
+  const controller = new AbortController();
+  const query = scripted([
+    init,
+    hook("PreToolUse", gitPush),
+    async () => {
+      controller.abort("SIGTERM");
+      markStopped();
+    },
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post: createPoster({
+      apiBaseUrl: "https://api.test",
+      agentToken: "agent-secret",
+      warn: () => {},
+      now: () => time,
+      random: () => 0.5,
+      sleep: async (ms: number) => {
+        time += ms;
+        await stopHappened;
+      },
+    }),
+    awaitDecision: noDecision,
+    signal: controller.signal,
+  });
+  expect(code).toBe(1);
+  expect(failedAt).toBeLessThan(1_000);
+});
+
+test("a stop still sends Claude's queued activity to a healthy API, the teardown's interrupt included, before run.failed", async () => {
+  const sent: RunnerEventPost[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      await delay(20);
+      sent.push((await request.json()) as RunnerEventPost);
+      return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+    }),
+  );
+  const controller = new AbortController();
+  const query = scripted([
+    init,
+    hook("PostToolUse", {
+      tool_name: "Bash",
+      tool_input: { command: "ls" },
+      tool_response: "a.ts",
+      tool_use_id: "t1",
+    }),
+    assistant({ type: "text", text: "Listed." }),
+    async (options: Options) => {
+      controller.abort("SIGTERM");
+      await fire(options, "PostToolUseFailure", {
+        tool_name: "Bash",
+        tool_input: { command: "sleep 9" },
+        tool_use_id: "t2",
+        error: "interrupted",
+        is_interrupt: true,
+      });
+    },
+    success,
+  ]);
+  const code = await runSession(config, {
+    query,
+    post: createPoster({
+      apiBaseUrl: "https://api.test",
+      agentToken: "agent-secret",
+      warn: () => {},
+      sleep: async () => {},
+    }),
+    awaitDecision: noDecision,
+    signal: controller.signal,
+  });
+  expect(code).toBe(1);
+  expect(sent.map((e) => e.type)).toEqual([
+    "run.started",
+    "claude.PostToolUse",
+    "claude.Message",
+    "claude.PostToolUseFailure",
+    "run.failed",
+  ]);
+});
+
+test("a run the API ended before its run.waiting landed stops the session and posts nothing terminal", async () => {
+  const tried: string[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      const event = (await request.json()) as RunnerEventPost;
+      tried.push(event.type);
+      if (event.type === "run.waiting" || event.type === "run.failed")
+        return HttpResponse.json(
+          { error: { code: "run_ended", message: "the run has ended" } },
+          { status: 401 },
+        );
+      return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+    }),
+  );
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    {
+      query,
+      post: createPoster({
+        apiBaseUrl: "https://api.test",
+        agentToken: "agent-secret",
+        warn: () => {},
+        sleep: async () => {},
+      }),
+      awaitDecision: noDecision,
+      signal: new AbortController().signal,
+    },
+  );
+  expect(code).toBe(1);
+  expect(answers).toEqual([stopped(/run ended while waiting/)]);
+  expect(tried).toEqual(["run.started", "claude.PreToolUse", "run.waiting"]);
+});
+
+/** What the gate answers when the run has to end without a decision: a stop, not the person's denial. */
+const stopped = (reason: RegExp) => ({
+  continue: false,
+  stopReason: expect.stringMatching(reason),
+  hookSpecificOutput: {
+    hookEventName: "PreToolUse",
+    permissionDecision: "deny",
+    permissionDecisionReason: expect.stringMatching(reason),
+  },
+});
+
+test("the SDK cancelling a held call's hook denies that call without claiming the run is ending", async () => {
+  const { deps } = api(async () => {
+    await delay(20);
+    return HttpResponse.json({ status: "pending" });
+  });
+  let answer: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const [gate] = options.hooks?.PreToolUse?.[0]?.hooks ?? [];
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(new Error("hook timed out")), 50);
+      answer = await gate?.(
+        {
+          session_id: "sess-new",
+          transcript_path: "/t.jsonl",
+          cwd: options.cwd ?? "",
+          hook_event_name: "PreToolUse",
+          ...gitPush,
+        } as HookInput,
+        "toolu_1",
+        { signal: cancel.signal },
+      );
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(answer).toEqual({
+    continue: true,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: "The approval wait was cancelled.",
+    },
+  });
+  expect(code).toBe(0);
+});
+
+test("the SDK cancelling Claude's question declines it without interrupting the session", async () => {
+  const { deps } = api(async () => {
+    await delay(20);
+    return HttpResponse.json({ status: "pending" });
+  });
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      const cancel = new AbortController();
+      setTimeout(() => cancel.abort(new Error("cancelled")), 50);
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        { signal: cancel.signal, toolUseID: "t1", requestId: "perm_1" },
+      );
+    },
+    success,
+  ]);
+  expect(await runSession(config, { ...deps, query })).toBe(0);
+  expect(permission).toEqual({
+    behavior: "deny",
+    message: "The approval wait was cancelled.",
+  });
+});
+
+test("an API unreachable for the whole wait fails the run naming it, and stops the session instead of denying the call", async () => {
+  const { sent, deps } = restartingApi({
+    outage: 0,
+    pollReplies: [dropped, status(503), status(502)],
+    virtualTime: true,
+  });
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"], waitTimeoutMs: 100 },
+    { ...deps, query },
+  );
+  expect(code).toBe(1);
+  expect(answers).toEqual([stopped(/API unreachable/)]);
+  expect(sent.at(-1)).toEqual({
+    runId: "run_1",
+    type: "run.failed",
+    payload: {
+      error: expect.stringMatching(
+        /^API unreachable while waiting for request req_[0-9a-f]+: /,
+      ),
+      rollup: expect.any(Object),
+    },
+  });
+});
+
+test("a run.waiting that never lands fails the run before any poll, and stops the session instead of denying the call", async () => {
+  const { sent, deps, polls } = restartingApi({
+    outage: 0,
+    pollReplies: [decided({ decision: "approve" })],
+    refuse: (event) => event.type === "run.waiting",
+    virtualTime: true,
+  });
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"], waitTimeoutMs: 100 },
+    { ...deps, query },
+  );
+  expect(code).toBe(1);
+  expect(answers).toEqual([stopped(/run\.waiting/)]);
+  expect(polls()).toBe(0);
+  expect(sent.at(-1)).toMatchObject({
+    type: "run.failed",
+    payload: {
+      error: expect.stringMatching(/run\.waiting .*not recorded.*HTTP 503/),
+    },
+  });
+});
+
+test("a request the API lost fails the run instead of denying the call", async () => {
+  const { sent, deps } = api((requestId) =>
+    HttpResponse.json(
+      { error: { code: "not_found", message: `no request ${requestId}` } },
+      { status: 404 },
+    ),
+  );
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query },
+  );
+  expect(code).toBe(1);
+  expect(answers).toEqual([stopped(/never recorded/)]);
+  expect(sent.at(-1)).toMatchObject({
+    type: "run.failed",
+    payload: { error: expect.stringMatching(/never recorded/) },
+  });
+});
+
+test("Claude's question with the API unreachable interrupts the session rather than declining", async () => {
+  const { deps } = restartingApi({
+    outage: 0,
+    pollReplies: [status(503)],
+    virtualTime: true,
+  });
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "t1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  expect(
+    await runSession({ ...config, waitTimeoutMs: 100 }, { ...deps, query }),
+  ).toBe(1);
+  expect(permission).toEqual({
+    behavior: "deny",
+    interrupt: true,
+    message: expect.stringMatching(/API unreachable/),
+  });
+});
+
+/** A poll the API holds for a moment, as it does while nobody has decided. */
+const heldPending: DecisionReply = async () => {
+  await delay(20);
+  return HttpResponse.json({ status: "pending" });
+};
+
+test("a stop while a gated call awaits its decision answers continue:false naming the stop, not the person's denial", async () => {
+  const { deps } = api(heldPending);
+  const controller = new AbortController();
+  let answers: unknown[] = [];
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      setTimeout(() => controller.abort("SIGTERM"), 50);
+      answers = await fire(options, "PreToolUse", gitPush);
+    },
+    success,
+  ]);
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    { ...deps, query, signal: controller.signal },
+  );
+  expect(code).toBe(1);
+  expect(answers).toEqual([stopped(/it was stopped/)]);
+});
+
+test("a stop while Claude's question awaits its answer denies with interrupt, not a plain decline", async () => {
+  const { deps } = api(heldPending);
+  const controller = new AbortController();
+  let permission: unknown;
+  const query = scripted([
+    init,
+    async (options: Options) => {
+      setTimeout(() => controller.abort("SIGTERM"), 50);
+      permission = await options.canUseTool?.(
+        "AskUserQuestion",
+        { questions },
+        {
+          signal: new AbortController().signal,
+          toolUseID: "t1",
+          requestId: "perm_1",
+        },
+      );
+    },
+    success,
+  ]);
+  const code = await runSession(config, {
+    ...deps,
+    query,
+    signal: controller.signal,
+  });
+  expect(code).toBe(1);
+  expect(permission).toEqual({
+    behavior: "deny",
+    interrupt: true,
+    message: expect.stringMatching(/it was stopped/),
+  });
+});
+
+test("a run.waiting stored by the API whose response was lost is retried, answered request_open, and still decided under one requestId", async () => {
+  const opened: string[] = [];
+  const polled: string[] = [];
+  server.use(
+    http.post("https://api.test/internal/events", async ({ request }) => {
+      const event = (await request.json()) as RunnerEventPost;
+      if (event.type !== "run.waiting")
+        return HttpResponse.json({ id: "evt_1" }, { status: 201 });
+      opened.push(event.payload.request.requestId);
+      // the first open was stored, but its response never arrived
+      if (opened.length === 1) return HttpResponse.error();
+      return HttpResponse.json(
+        { error: { code: "request_open", message: "open" } },
+        { status: 409 },
+      );
+    }),
+    http.get(
+      "https://api.test/internal/runs/run_1/requests/:requestId",
+      ({ params }) => {
+        const requestId = String(params.requestId);
+        polled.push(requestId);
+        return opened.includes(requestId)
+          ? decided({ decision: "approve" })(requestId)
+          : HttpResponse.json(
+              { error: { code: "not_found", message: "no such request" } },
+              { status: 404 },
+            );
+      },
+    ),
+  );
+  const timing = { sleep: async () => {} };
+  let answers: unknown[] = [];
+  const code = await runSession(
+    { ...config, approvalPolicy: ["Bash"] },
+    {
+      query: scripted([
+        init,
+        async (options: Options) => {
+          answers = await fire(options, "PreToolUse", gitPush);
+        },
+        success,
+      ]),
+      post: createPoster({
+        apiBaseUrl: "https://api.test",
+        agentToken: "agent-secret",
+        warn: () => {},
+        ...timing,
+      }),
+      awaitDecision: createDecisionWaiter({
+        apiBaseUrl: "https://api.test",
+        agentToken: "agent-secret",
+        runId: "run_1",
+        ...timing,
+      }),
+      signal: new AbortController().signal,
+    },
+  );
+  expect(code).toBe(0);
+  expect(answers).toEqual([{ continue: true }]);
+  expect(opened).toHaveLength(2);
+  expect(new Set(opened).size).toBe(1);
+  expect(polled).toEqual([opened[0]]);
 });
 
 const rollupOf = (event: RunnerEventPost | undefined) =>
