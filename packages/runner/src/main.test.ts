@@ -1,9 +1,11 @@
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeAll, expect, test } from "vitest";
+import { afterAll, afterEach, beforeAll, expect, test } from "vitest";
 
 const pkg = join(import.meta.dirname, "..");
 const bundle = join(pkg, "dist/bundle/runner.mjs");
@@ -11,6 +13,10 @@ const bundle = join(pkg, "dist/bundle/runner.mjs");
 beforeAll(() => {
   execFileSync("pnpm", ["run", "--silent", "build"], { cwd: pkg });
 }, 30_000);
+
+// the runner writes Claude Code's credential file; keep it out of the real home
+const CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), "runner-claude-"));
+afterAll(() => rmSync(CLAUDE_CONFIG_DIR, { recursive: true, force: true }));
 
 const servers: Server[] = [];
 afterEach(() => {
@@ -22,7 +28,7 @@ afterEach(() => {
 
 async function runBundle(env: Record<string, string>) {
   const child = spawn(process.execPath, [bundle], {
-    env: { PATH: process.env.PATH ?? "", ...env },
+    env: { PATH: process.env.PATH ?? "", CLAUDE_CONFIG_DIR, ...env },
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
@@ -112,6 +118,7 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
   const child = spawn(process.execPath, [bundle], {
     env: {
       PATH: process.env.PATH ?? "",
+      CLAUDE_CONFIG_DIR,
       AGENT_ID: "agt_1",
       RUN_ID: "run_1",
       PROMPT: "do it",

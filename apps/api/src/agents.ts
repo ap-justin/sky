@@ -66,7 +66,11 @@ const AnswerInput = z.strictObject({
   answer: z.string().min(1),
 });
 const ApprovalInput = z.discriminatedUnion("decision", [
-  z.strictObject({ requestId: RequestId, decision: z.literal("approve") }),
+  z.strictObject({
+    requestId: RequestId,
+    decision: z.literal("approve"),
+    reason: z.string().min(1).optional(),
+  }),
   z.strictObject({
     requestId: RequestId,
     decision: z.literal("deny"),
@@ -203,12 +207,29 @@ async function decide(
         "wrong_kind",
         `the request is a ${outcome.requestKind}`,
       );
+    case "already_decided":
+      return c.json(
+        {
+          error: {
+            code: "already_decided",
+            message:
+              "an earlier decision on this request stands; this one was not applied",
+            decision: outcome.decision,
+          },
+        },
+        409,
+      );
     case "closed":
       return apiError(
         c,
         409,
         "request_closed",
-        "the request is already decided or its run is no longer waiting",
+        "the request's run is no longer waiting",
+      );
+    case "repeated":
+      return c.json(
+        { run: presentRun(outcome.run, runError(c.var.db, outcome.run.id)) },
+        200,
       );
   }
   if (outcome.enqueued > 0) c.var.nudgeDeliveries();

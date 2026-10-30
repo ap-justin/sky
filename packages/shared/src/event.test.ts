@@ -130,6 +130,9 @@ test("decision approves, denies or answers a request", () => {
     Decision.parse({ requestId: "req_1", decision: "approve" }).decision,
   ).toBe("approve");
   expect(
+    Decision.parse({ requestId: "req_1", decision: "approve", reason: "ok" }),
+  ).toEqual({ requestId: "req_1", decision: "approve", reason: "ok" });
+  expect(
     Decision.parse({ requestId: "req_1", decision: "deny", reason: "no" })
       .decision,
   ).toBe("deny");

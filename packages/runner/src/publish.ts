@@ -30,6 +30,8 @@ export type PublishResult = {
   sha: string;
   /** False when an open pull request for the branch already existed. */
   created: boolean;
+  /** True when an already-open pull request was sent a new title or body. */
+  updated: boolean;
   pullRequest: { number: number; url: string };
 };
 
@@ -78,7 +80,40 @@ function parseIdentity(line: string): Identity {
   return { name, email, date };
 }
 
-/** A commit's message, author and committer, byte for byte as git stores them. */
+const CLAUDE_ATTRIBUTION = [
+  /^\s*🤖\s*Generated with .*Claude Code.*$/i,
+  // keyed on the address, not the name: a person named Claude keeps their credit
+  /^\s*Co-Authored-By:.*<noreply@anthropic\.com>\s*$/i,
+];
+const isAttribution = (line: string) =>
+  CLAUDE_ATTRIBUTION.some((pattern) => pattern.test(line));
+const TRAILER = /^\s*[\w-]+:\s/;
+
+/**
+ * Drops the lines Claude Code appends on its own, the "Generated with Claude Code" footer and
+ * `Co-Authored-By: … <noreply@anthropic.com>` trailers, with the blank lines they leave. Only the
+ * trailing run of trailer, footer and blank lines is searched; the same line anywhere above it, a
+ * fenced example included, is kept.
+ */
+export function stripClaudeAttribution(text: string): string {
+  const all = text.split("\n");
+  let start = all.length;
+  while (start > 0) {
+    const line = all[start - 1] ?? "";
+    if (line.trim() && !isAttribution(line) && !TRAILER.test(line)) break;
+    start--;
+  }
+  const block = all.slice(start);
+  if (!block.some(isAttribution)) return text;
+  const kept = block
+    .filter((line) => !isAttribution(line))
+    // a dropped paragraph between two kept ones leaves its blank lines doubled
+    .filter((line, i, lines) => line.trim() || lines[i - 1]?.trim() !== "");
+  const body = [...all.slice(0, start), ...kept].join("\n").trimEnd();
+  return text.endsWith("\n") && body ? `${body}\n` : body;
+}
+
+/** A commit's author and committer as git stores them; its message less Claude's attribution. */
 async function readCommit(cwd: string, sha: string) {
   const raw = await git(cwd, "cat-file", "commit", sha);
   const split = raw.indexOf("\n\n");
@@ -89,7 +124,7 @@ async function readCommit(cwd: string, sha: string) {
     return parseIdentity(line.slice(key.length + 1));
   };
   return {
-    message: split === -1 ? "" : raw.slice(split + 2),
+    message: stripClaudeAttribution(split === -1 ? "" : raw.slice(split + 2)),
     author: header("author"),
     committer: header("committer"),
   };
@@ -195,16 +230,19 @@ function gateway(options: {
  * Publishes the worktree's branch through the GitHub gateway, which carries no git push: each
  * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
  * the commit with its own message and identities), then the branch ref is created or fast-forwarded
- * and a pull request into the base opened, or the open one returned. Only first-parent history is
- * replayed, so a merge commit arrives as a plain commit with the same content, and a merge from the
- * base shows the base's changes in the pull request's diff as the branch's own.
+ * and a pull request into the base opened, or the open one given the new title and body. Claude
+ * Code's attribution is stripped from each commit message and the pull request's body, never its
+ * title. Only first-parent history is replayed, so a merge commit arrives as a plain commit with
+ * the same content, and a merge from the base shows the base's changes in the pull request's diff
+ * as the branch's own.
  */
 export async function publish(options: {
   cwd: string;
   gatewayUrl: string;
   connectorId: string;
-  /** Required unless the branch already has an open pull request. */
+  /** Required unless the branch already has an open pull request; given for one, it replaces the title. */
   title?: string;
+  /** Given for an open pull request, it replaces the body. */
   body?: string;
   /** Defaults to the branch `origin/HEAD` names. */
   base?: string;
@@ -381,11 +419,21 @@ export async function publish(options: {
   }
 
   if (existing) {
+    // the title and body are given again on a re-publish so they follow the review fixes
+    const update = {
+      ...(options.title && { title: options.title }),
+      ...(options.body !== undefined && {
+        body: stripClaudeAttribution(options.body),
+      }),
+    };
+    const updated = Object.keys(update).length > 0;
+    if (updated) await call("PATCH", `/pulls/${existing.number}`, update);
     return {
       branch,
       base,
       sha: parent,
       created: false,
+      updated,
       pullRequest: { number: existing.number, url: existing.html_url },
     };
   }
@@ -394,7 +442,9 @@ export async function publish(options: {
     "/pulls",
     {
       title: options.title as string,
-      ...(options.body !== undefined && { body: options.body }),
+      ...(options.body !== undefined && {
+        body: stripClaudeAttribution(options.body),
+      }),
       head: branch,
       base,
     },
@@ -404,6 +454,7 @@ export async function publish(options: {
     base,
     sha: parent,
     created: true,
+    updated: false,
     pullRequest: { number: pull.number, url: pull.html_url },
   };
 }
@@ -458,7 +509,7 @@ export async function publishMain(
     io.stderr(
       result.created
         ? `sky publish: opened pull request #${result.pullRequest.number}\n`
-        : `sky publish: pull request #${result.pullRequest.number} was already open; ${result.branch} is now ${result.sha}\n`,
+        : `sky publish: pull request #${result.pullRequest.number} was already open${result.updated ? " and updated" : ""}; ${result.branch} is now ${result.sha}\n`,
     );
     io.stdout(`${result.pullRequest.url}\n`);
     return 0;

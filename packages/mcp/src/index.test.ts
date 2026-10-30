@@ -213,7 +213,7 @@ test("approve posts a deny decision with its reason", async () => {
   ]);
 });
 
-test("approve sends no reason with an approve, which the API rejects", async () => {
+test("approve sends its reason with an approve too", async () => {
   const decided = { id: "req_2", decision: { decision: "approve" } };
   const seen = route("post", "/v1/agents/agt_1/approvals", 200, decided);
   const client = await connect();
@@ -230,8 +230,123 @@ test("approve sends no reason with an approve, which the API rejects", async () 
 
   expect(result.isError).toBeFalsy();
   expect(seen.map((s) => s.body)).toEqual([
-    { requestId: "req_2", decision: "approve" },
+    { requestId: "req_2", decision: "approve", reason: "looks fine" },
   ]);
+});
+
+const decisions = [
+  {
+    tool: "answer",
+    path: "/answers",
+    args: { answer: "use pnpm" },
+    decision: "answered",
+  },
+  {
+    tool: "approve",
+    path: "/approvals",
+    args: { decision: "approve" },
+    decision: "approved",
+  },
+  {
+    tool: "approve",
+    path: "/approvals",
+    args: { decision: "deny" },
+    decision: "denied",
+  },
+];
+
+test.each(decisions)(
+  "$tool repeating the decision already $decision returns the run like a first success",
+  async ({ tool, path, args }) => {
+    const ok = { run: { id: "run_1", status: "running" } };
+    route("post", `/v1/agents/agt_1${path}`, 200, ok);
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: tool,
+      arguments: { agentId: "agt_1", requestId: "req_1", ...args },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toEqual(ok);
+  },
+);
+
+test.each(decisions)(
+  "$tool on a request already $decision differently is an error saying the earlier decision stands",
+  async ({ tool, path, args, decision }) => {
+    route("post", `/v1/agents/agt_1${path}`, 409, {
+      error: {
+        code: "already_decided",
+        message: "req_1 was already decided",
+        decision,
+      },
+    });
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: tool,
+      arguments: { agentId: "agt_1", requestId: "req_1", ...args },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toEqual({
+      status: 409,
+      error: {
+        code: "already_decided",
+        message: `req_1 was already ${decision}; that decision stands and this one was not applied`,
+        decision,
+      },
+    });
+  },
+);
+
+test.each(decisions)(
+  "$tool on a closed request is an error",
+  async ({ tool, path, args }) => {
+    const envelope = {
+      error: { code: "request_closed", message: "req_1's run has ended" },
+    };
+    route("post", `/v1/agents/agt_1${path}`, 409, envelope);
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: tool,
+      arguments: { agentId: "agt_1", requestId: "req_1", ...args },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toEqual({ status: 409, ...envelope });
+  },
+);
+
+test("archive tells the model the worktree is deleted and stop keeps it", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const description = tools.find((t) => t.name === "archive")?.description;
+
+  expect(description).toMatch(/worktree/);
+  expect(description).toMatch(/uncommitted/);
+  expect(description).toMatch(/stop/);
+});
+
+test("archive posts to the agent's archive route and is listed destructive", async () => {
+  const archived = { id: "agt_1", archivedAt: "2026-10-30T00:00:00Z" };
+  const seen = route("post", "/v1/agents/agt_1/archive", 200, archived);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "archive",
+    arguments: { agentId: "agt_1" },
+  });
+  const { tools } = await client.listTools();
+
+  expect(textOf(result)).toEqual(archived);
+  expect(seen).toEqual([{ auth: `Bearer ${KEY}`, body: null }]);
+  expect(
+    tools.find((t) => t.name === "archive")?.annotations?.destructiveHint,
+  ).toBe(true);
 });
 
 test("stop posts to the agent's stop route", async () => {
