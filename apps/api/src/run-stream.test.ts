@@ -20,11 +20,13 @@ const auth = { Authorization: `Bearer ${config.apiKey}` };
 let db: Db;
 let app: ReturnType<typeof createApp>;
 let wire: SpritesWire;
+let closing: AbortController;
 
 beforeEach(() => {
   db = openDb(":memory:");
   migrate(db);
   wire = stubSprites();
+  closing = new AbortController();
   app = createApp({
     db,
     config,
@@ -32,6 +34,7 @@ beforeEach(() => {
     log: () => {},
     nudgeDeliveries: () => {},
     heartbeatMs: 50,
+    closing: closing.signal,
   });
 });
 afterEach(() => {
@@ -148,6 +151,64 @@ test("a client disconnect releases its listener", async () => {
   expect(runEvents.listenerCount(runId)).toBe(1);
   await s.cancel();
   await until(() => runEvents.listenerCount(runId) === 0);
+});
+
+test("closing ends a live run stream with a shutdown frame and releases its listener", async () => {
+  const { agentId, runId } = runningRun();
+  const id = await say(runId, "one");
+  const s = sseReader(await stream(agentId, runId));
+  expect((await s.event())?.id).toBe(String(id));
+  closing.abort();
+  expect(await s.event()).toEqual({
+    event: "server.shutdown",
+    retry: "2000",
+    data: '{"reason":"shutdown"}',
+  });
+  expect(await s.next()).toBeNull();
+  await until(() => runEvents.listenerCount(runId) === 0);
+});
+
+/** An app whose stream-failure log lines land in the returned array; the request logger's lines are left out. */
+function loggingApp() {
+  const lines: string[] = [];
+  app = createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => {
+      if (line.startsWith("streaming ")) lines.push(line);
+    },
+    nudgeDeliveries: () => {},
+    heartbeatMs: 50,
+    closing: closing.signal,
+  });
+  return lines;
+}
+
+test("closing after a client has disconnected logs no stream failure and leaves no listener", async () => {
+  const lines = loggingApp();
+  const { agentId, runId } = runningRun();
+  const id = await say(runId, "one");
+  const s = sseReader(await stream(agentId, runId));
+  expect((await s.event())?.id).toBe(String(id));
+  await s.cancel();
+  closing.abort();
+  await until(() => runEvents.listenerCount(runId) === 0);
+  // let the handler's finally block and any late write failure run
+  await new Promise((r) => setTimeout(r, 100));
+  expect(lines).toEqual([]);
+});
+
+test("a read that throws mid-stream is logged against the run", async () => {
+  const lines = loggingApp();
+  const { agentId, runId } = runningRun();
+  const s = sseReader(await stream(agentId, runId));
+  await until(() => runEvents.listenerCount(runId) === 1);
+  db.$client.close();
+  runEvents.publish(runId);
+  await until(() => lines.length > 0);
+  expect(lines[0]).toMatch(new RegExp(`^streaming ${runId} failed: `));
+  await s.cancel();
 });
 
 test("a quiet stream sends heartbeat comments", async () => {

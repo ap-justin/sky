@@ -7,6 +7,8 @@ import type { AppEnv } from "./factory.js";
 import { presentEvent, runEvents } from "./run-events.js";
 import { isActive } from "./runs.js";
 
+const SHUTDOWN_RETRY_MS = 2_000;
+
 /** One read's frames; `done` ends the stream once they're written, `more` reads again without waiting. */
 export type Batch = { frames: SSEMessage[]; done?: boolean; more?: boolean };
 
@@ -14,7 +16,10 @@ export type Batch = { frames: SSEMessage[]; done?: boolean; more?: boolean };
  * Streams `read()`'s frames as SSE, reading again after each publish on `channel`, with a `: ping`
  * comment once `heartbeatMs` passes with nothing written. `read` runs after an await, never inside the
  * publish. With `cursor`, the stream opens with a bare `id:` field and every ping carries one, so a
- * client that reconnects before any matching event still resumes where the server read to.
+ * client that reconnects before any matching event still resumes where the server read to. When
+ * `c.var.closing` aborts, the stream ends with one `server.shutdown` frame (its `id` the cursor, when
+ * there is one) whose `retry` tells the client to reconnect to the next process soon; a stream stuck
+ * behind a stalled reader gets no frame and is cut at the shutdown drain.
  */
 export function tailSSE(
   c: Context<AppEnv>,
@@ -43,9 +48,12 @@ export function tailSSE(
       unsubscribe();
       wake();
     });
+    const closing = c.var.closing;
+    const onClosing = () => wake();
+    closing.addEventListener("abort", onClosing, { once: true });
     try {
       if (cursor) await tracked(stream.write(`${idField()}\n`));
-      while (!stream.aborted) {
+      while (!stream.aborted && !closing.aborted) {
         if (!dirty) {
           // publishes that yield no frames (a filtered stream) don't count as traffic
           const quiet = Date.now() - lastWrite;
@@ -67,10 +75,19 @@ export function tailSSE(
         if (batch.done) return;
         if (batch.more) dirty = true;
       }
+      if (!stream.aborted) {
+        await stream.writeSSE({
+          event: "server.shutdown",
+          data: JSON.stringify({ reason: "shutdown" }),
+          retry: SHUTDOWN_RETRY_MS,
+          id: cursor && String(cursor()),
+        });
+      }
     } catch (err) {
       onFail(err);
     } finally {
       unsubscribe();
+      closing.removeEventListener("abort", onClosing);
     }
   });
 }

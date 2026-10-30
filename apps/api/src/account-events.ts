@@ -137,6 +137,10 @@ export function accountEventRoutes(
         const timer = setTimeout(expire, wait * 1000);
         const signal = c.req.raw.signal;
         signal.addEventListener("abort", expire, { once: true });
+        // a shutdown answers like a timeout, so the client polls the next process from this cursor
+        const closing = c.var.closing;
+        if (closing.aborted) expired = true;
+        closing.addEventListener("abort", expire, { once: true });
         try {
           let page = readEvents(db, after ?? latestEventId(db), filter);
           while (page.data.length === 0 && !expired) {
@@ -155,6 +159,7 @@ export function accountEventRoutes(
           unsubscribe();
           clearTimeout(timer);
           signal.removeEventListener("abort", expire);
+          closing.removeEventListener("abort", expire);
         }
       },
     )

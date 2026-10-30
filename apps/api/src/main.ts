@@ -10,13 +10,17 @@ if (!result.ok) {
 }
 const { config } = result;
 
-const { app, db, stopSweeping, stopDelivering } = boot(config, console.log);
+const { app, db, closeStreams, stopSweeping, stopDelivering } = boot(
+  config,
+  console.log,
+);
 // with no `createServer` option, serve() builds an HTTP/1 server
 const server = serve({ fetch: app.fetch, port: config.port }, (info) =>
   console.log(`listening on :${info.port}`),
 ) as Server;
 
 process.once("SIGTERM", () => {
+  closeStreams();
   stopSweeping();
   stopDelivering()
     .then(() => shutdown(server, db))

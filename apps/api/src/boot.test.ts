@@ -68,6 +68,7 @@ test("shutdown closes the server before the DB", async () => {
         done();
       }, 1);
     },
+    closeIdleConnections() {},
     closeAllConnections() {},
   };
   await shutdown(server, db);
@@ -84,10 +85,15 @@ test("shutdown with an open SSE stream closes it after the drain, well inside Fl
     }),
   );
   const server = serve({ fetch: app.fetch, port: 0 }) as Server;
+  stops.push(() => {
+    server.closeAllConnections();
+    server.close();
+  });
   await once(server, "listening");
   const { port } = server.address() as AddressInfo;
   // a raw socket: MSW intercepts http and fetch, and would count the request as a leak
   const socket = connect(port, "127.0.0.1");
+  stops.push(() => socket.destroy());
   socket.write(`GET /stream HTTP/1.1\r\nHost: localhost\r\n\r\n`);
   await once(socket, "data");
   const closed = once(socket, "close");
@@ -97,6 +103,38 @@ test("shutdown with an open SSE stream closes it after the drain, well inside Fl
   await closed;
   expect(Date.now() - started).toBeLessThan(1_000);
   expect(db.$client.open).toBe(false);
+});
+
+test("closing the streams before shutdown ends an open /v1/stream with a shutdown frame, before the drain cutoff", async () => {
+  const b = booted();
+  db = b.db;
+  const server = serve({ fetch: b.app.fetch, port: 0 }) as Server;
+  stops.push(() => {
+    server.closeAllConnections();
+    server.close();
+  });
+  await once(server, "listening");
+  const { port } = server.address() as AddressInfo;
+  // a raw socket: MSW intercepts http and fetch, and would count the request as a leak
+  const socket = connect(port, "127.0.0.1");
+  stops.push(() => socket.destroy());
+  let received = "";
+  socket.on("data", (chunk) => {
+    received += chunk;
+  });
+  socket.write(
+    `GET /v1/stream HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer ${config().apiKey}\r\n\r\n`,
+  );
+  await once(socket, "data");
+  const closed = once(socket, "close");
+
+  const started = Date.now();
+  b.closeStreams();
+  await shutdown(server, db, 5_000);
+  await closed;
+  expect(Date.now() - started).toBeLessThan(1_000);
+  expect(received).toContain("event: server.shutdown");
+  expect(received).toContain("retry: 2000");
 });
 
 test("an env a previous process left provisioning boots as failed; others keep their status", async () => {
