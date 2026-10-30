@@ -14,7 +14,7 @@ pnpm test                     # vitest; Sprites, GitHub and Anthropic are mocked
 pnpm build                    # bundles the API, the runner and the CLI
 ```
 
-All four green is the bar for a pull request.
+All four commands must pass before a pull request is ready to merge.
 
 ## Running it locally
 
