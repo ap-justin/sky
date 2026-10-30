@@ -1,5 +1,6 @@
 import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type Config, ConfigError, loadConfig } from "./config.js";
+import { writeClaudeCredentials } from "./credentials.js";
 import { createPoster } from "./events.js";
 import { holdSprite } from "./keepalive.js";
 import { publishMain } from "./publish.js";
@@ -30,6 +31,12 @@ async function main(): Promise<void> {
   process.once("SIGINT", onSignal);
   // a hangup from the exec session that started the runner is a stop, not a death
   process.once("SIGHUP", onSignal);
+  // so a nested `claude -p` in the sandbox is logged in; a failure costs the Kru checks, not the run
+  await writeClaudeCredentials(process.env).catch((error: unknown) =>
+    warn(
+      `runner: nested claude login not set up: ${error instanceof Error ? error.message : String(error)}`,
+    ),
+  );
   // held through waits for a decision too: a paused sprite drops the long-poll and the event posts
   const hold = holdSprite({ runId: config.runId, warn });
 

@@ -633,13 +633,37 @@ test("with a GitHub connector in its env, the session is told to publish through
   };
   try {
     vi.stubEnv("GITHUB_CONNECTOR", undefined);
-    expect(await start()).toEqual({ type: "preset", preset: "claude_code" });
+    const bare = (await start()) as { append?: string };
+    expect(bare.append).not.toContain("publish --title");
     vi.stubEnv("GITHUB_CONNECTOR", "conn_123");
     const prompt = await start();
     expect(prompt).toMatchObject({ type: "preset", preset: "claude_code" });
     const append = (prompt as { append?: string }).append ?? "";
     expect(append).toContain(" publish --title <title>");
     expect(append).toContain("instead of `git push` or `gh pr create`");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("the session is told how to run the Kru checks, and its env never holds an API key", async () => {
+  vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-api-secret");
+  try {
+    const query = scripted([init, success]);
+    await runSession(config, {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    });
+    const options = query.calls[0]?.options;
+    const append =
+      (options?.systemPrompt as { append?: string } | undefined)?.append ?? "";
+    expect(append).toContain(
+      'env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"',
+    );
+    expect(append).toContain('claude -p "/kru:text-fix"');
+    expect(options?.env).not.toHaveProperty("ANTHROPIC_API_KEY");
   } finally {
     vi.unstubAllEnvs();
   }

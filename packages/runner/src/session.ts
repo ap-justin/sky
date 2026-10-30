@@ -64,8 +64,9 @@ function sessionOptions(
   hooks: Options["hooks"],
   canUseTool: CanUseTool,
 ): Options {
-  // the session's tools can read their env; the event token stays with the runner
-  const { AGENT_TOKEN: _, ...env } = process.env;
+  // the session's tools can read their env; the event token stays with the runner, and an API key
+  // never reaches a nested `claude`, which must bill the subscription
+  const { AGENT_TOKEN: _, ANTHROPIC_API_KEY: __, ...env } = process.env;
   return {
     cwd,
     resume: config.sessionId,
@@ -74,7 +75,10 @@ function sessionOptions(
     systemPrompt: {
       type: "preset",
       preset: "claude_code",
-      ...(env[CONNECTOR_ENV] && { append: publishInstructions() }),
+      append: [
+        ...(env[CONNECTOR_ENV] ? [publishInstructions()] : []),
+        KRU_CHECK_INSTRUCTIONS,
+      ].join("\n\n"),
     },
     // the approval policy holds calls in the PreToolUse hook; everything else runs unasked
     permissionMode: "bypassPermissions",
@@ -98,6 +102,16 @@ const publishInstructions = () =>
     "Once commits are published, add new commits rather than amending or rebasing them: a rewritten branch can't be published again.",
     "Pass a multi-line body from a quoted heredoc, `--body \"$(cat <<'EOF'` … `EOF` `)\"`, so the shell leaves its backticks and `$` alone. A large branch can take minutes to send, so give the Bash call a 10-minute timeout.",
   ].join("\n");
+
+/**
+ * Plugin skills can't be invoked by the model, so the Kru checks run as a nested, headless session;
+ * the runner has logged it in with the subscription, and an API key must stay out of it.
+ */
+const KRU_CHECK_INSTRUCTIONS = [
+  "To run the Kru checks on your change, run them from the repo root through a nested headless session; the Skill tool can't invoke them (they are reserved for the user):",
+  '`env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"`, then `env -u ANTHROPIC_API_KEY claude -p "/kru:text-fix"`.',
+  "The nested session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
+].join("\n");
 
 /**
  * Hooks forward what Claude is doing without holding it up: the event is queued
