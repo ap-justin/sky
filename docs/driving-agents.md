@@ -5,10 +5,10 @@ A bot (a cron job, a chat bot, a CI step) can run an agent end to end with the `
 ## 1. Start
 
 ```
-sky agent start web --prompt @task.md
+sky agent start web --prompt=@task.md
 ```
 
-`web` is an environment name or id; `--prompt` takes the text itself, or `@path` to read it from a file. It prints the agent id and the run id:
+`web` is an environment name or id; `--prompt=` takes the text itself, or `@path` to read it from a file. Keep the `=`: without it, a prompt starting with `-` (a markdown list, say) is read as an option. It prints the agent id and the run id:
 
 ```
 agt_… run_…
@@ -30,7 +30,7 @@ Blocks until the agent's newest run needs input or ends, then prints what `sky i
 | 5    | failed                                          |
 | 6    | was stopped                                     |
 
-Exit 1 means the command itself failed (the API was unreachable or refused the call), and 2 a bad argument or config.
+`wait` rides out a dropped connection or a 5xx by retrying, up to 30 seconds apart, so without `--timeout` it waits through an outage for as long as the outage lasts; pass `--timeout` to bound that too. Exit 1 means the API refused the call (an unknown agent, say), and 2 a bad argument, config or API key.
 
 `sky inbox agt_…` and `sky status agt_…` exit the same way without waiting.
 
@@ -57,12 +57,14 @@ With `--json` it prints the run, whose `pendingRequest` is `null` or the request
 ## 4. Answer, approve or deny
 
 ```
-sky answer  agt_… req_… "staging"
-sky approve agt_… req_… [--reason="ticket OPS-12"]
+sky answer  agt_… req_… -- "staging"
+sky approve agt_… req_…
 sky deny    agt_… req_… --reason="not on production"
 ```
 
-These are safe to repeat. If the request was already resolved the same way, the command succeeds and says `req_… already resolved (approved)`, so a bot that crashed after sending a decision can send it again. It fails (exit 1) when the request was resolved differently, or when its run stopped or failed before anyone decided.
+Put the answer after `--`, so one starting with `-` (`- staging`, `-1`) isn't read as an option; options such as `--json` go before it. `approve` also takes `--reason=`.
+
+These are safe to repeat. Sending exactly the same decision again succeeds like the first, so a bot that crashed after sending one can send it again. A different decision on a request already decided fails (exit 1): the first decision stands and the new one is not applied. A decision also fails when its run stopped or failed before anyone decided.
 
 After a decision the run continues; go back to step 2.
 
@@ -83,7 +85,7 @@ compare: https://github.com/acme/web/compare/3f2a…...claude/agt_…
 ## 6. Follow up
 
 ```
-sky agent follow-up agt_… --prompt "Also cover the logout path"
+sky agent follow-up agt_… --prompt="Also cover the logout path"
 ```
 
 Starts the agent's next run in the same session and branch, once its last run has ended. Then go back to step 2.
@@ -99,16 +101,17 @@ Stops any active run and removes the agent's worktree; an archived agent takes n
 ## A whole loop
 
 ```sh
-agent=$(sky agent start web --prompt @task.md | cut -d' ' -f1)
+agent=$(sky agent start web --prompt=@task.md | cut -d' ' -f1)
 while true; do
-  sky wait "$agent" > inbox.txt; code=$?
+  sky wait "$agent" --timeout=1800 > inbox.txt; code=$?
   case $code in
     3) handle_request "$agent" inbox.txt ;;   # calls sky answer / approve / deny
-    0) sky status "$agent"; break ;;
-    *) sky status "$agent"; exit 1 ;;
+    *) break ;;                               # 0 finished, 4 timed out, 5 failed, 6 stopped, 1 or 2 errors
   esac
 done
+sky status "$agent"
 sky agent archive "$agent"
+exit $code
 ```
 
 The [MCP server](../README.md#mcp) offers the same steps as tools (`launch`, `wait_for_events`, `status`, `answer`, `approve`, `followup`, `archive`) for a bot that speaks MCP.

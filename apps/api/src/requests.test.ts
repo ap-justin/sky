@@ -259,18 +259,76 @@ test("an answer for an approval gets 409 wrong_kind", async () => {
 });
 
 test.each([
+  ["an answer", question, ["answers", { answer: "main" }]],
+  ["an approve", approval, ["approvals", { decision: "approve" }]],
   [
-    "a second answer",
+    "an approve with a reason",
+    approval,
+    ["approvals", { decision: "approve", reason: "scoped" }],
+  ],
+  [
+    "a deny",
+    approval,
+    ["approvals", { decision: "deny", reason: "too broad" }],
+  ],
+] as const)(
+  "%s sent again gets 200 with the run, and resumes and wakes nothing more",
+  async (_, request, [verb, decision]) => {
+    const { requestId } = await waitingOn(request());
+    wire.sprites.add("sky-env_test");
+    expect((await decide(verb, { requestId, ...decision })).status).toBe(200);
+    const wakes = wire.calls.length;
+    const res = await decide(verb, { requestId, ...decision });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toMatchObject({
+      run: { id: runId, status: "running" },
+    });
+    expect(wire.calls).toHaveLength(wakes);
+    expect(resumed()).toHaveLength(1);
+  },
+);
+
+test("an exact retry after the run moved on still gets 200 with its current state", async () => {
+  const { requestId } = await waitingOn(question());
+  expect((await decide("answers", { requestId, answer: "main" })).status).toBe(
+    200,
+  );
+  db.update(runs).set({ status: "finished" }).run();
+  const res = await decide("answers", { requestId, answer: "main" });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({
+    run: { id: runId, status: "finished" },
+  });
+  expect(resumed()).toHaveLength(1);
+});
+
+test.each([
+  [
+    "a different answer",
     question,
     ["answers", { answer: "secret a" }],
     ["answers", { answer: "b" }],
     "answered",
   ],
   [
-    "a second approve",
+    "an approve with another reason",
+    approval,
+    ["approvals", { decision: "approve", reason: "secret a" }],
+    ["approvals", { decision: "approve", reason: "b" }],
+    "approved",
+  ],
+  [
+    "an approve with a reason after one without",
     approval,
     ["approvals", { decision: "approve" }],
+    ["approvals", { decision: "approve", reason: "b" }],
+    "approved",
+  ],
+  [
+    "a deny after an approve",
+    approval,
     ["approvals", { decision: "approve" }],
+    ["approvals", { decision: "deny" }],
     "approved",
   ],
   [
@@ -278,6 +336,13 @@ test.each([
     approval,
     ["approvals", { decision: "deny", reason: "secret why" }],
     ["approvals", { decision: "approve" }],
+    "denied",
+  ],
+  [
+    "a deny with another reason",
+    approval,
+    ["approvals", { decision: "deny", reason: "secret why" }],
+    ["approvals", { decision: "deny", reason: "b" }],
     "denied",
   ],
 ] as const)(
@@ -291,7 +356,8 @@ test.each([
     expect(await res.json()).toEqual({
       error: {
         code: "already_decided",
-        message: "the request is already decided",
+        message:
+          "an earlier decision on this request stands; this one was not applied",
         decision: recorded,
       },
     });

@@ -204,41 +204,64 @@ async function pollUntilSettled(
   io: Io,
   out: Output,
 ): Promise<number> {
-  const startedAt = io.now();
-  let newest = await newestRun(api, agentId, out);
+  const deadline =
+    timeoutS === undefined
+      ? Number.POSITIVE_INFINITY
+      : io.now() + timeoutS * 1000;
+  let newest: Newest | undefined;
   let failures = 0;
-  while (newest !== undefined && isActive(newest.run.status)) {
-    const remaining =
-      timeoutS === undefined
-        ? Number.POSITIVE_INFINITY
-        : timeoutS * 1000 - (io.now() - startedAt);
-    if (remaining <= 0) {
-      io.stderr(`sky: still ${newest.run.status} after ${timeoutS}s\n`);
-      printInbox(newest, io, out);
-      return runExitCodes.running;
+  let delay = 0;
+  for (;;) {
+    if (delay > 0) {
+      const remaining = deadline - io.now();
+      if (remaining <= 0)
+        return timedOut(newest, failures > 0, timeoutS, io, out);
+      await io.sleep(Math.min(delay, remaining));
     }
-    const backoff = Math.min(pollIntervalMs * 2 ** failures, maxBackoffMs);
-    await io.sleep(Math.min(backoff, remaining));
     try {
-      newest = await newestRun(api, agentId, out);
+      const fetched = await newestRun(api, agentId, out);
+      if (fetched === undefined) return 1;
+      if (!isActive(fetched.run.status)) return printInbox(fetched, io, out);
+      newest = fetched;
+      failures = 0;
     } catch (err) {
       if (!(err instanceof ApiError && isTransient(err))) throw err;
       if (failures === 0) {
         out.progress(`lost contact with the API (${err.message}); retrying`);
       }
       failures++;
-      continue;
     }
-    failures = 0;
+    delay = Math.min(pollIntervalMs * 2 ** failures, maxBackoffMs);
   }
-  return newest === undefined ? 1 : printInbox(newest, io, out);
 }
 
-type Decided = "approved" | "denied" | "answered";
+/** Prints the last run fetched, never an older one: `newest` changes only on a successful poll. */
+function timedOut(
+  newest: Newest | undefined,
+  outOfContact: boolean,
+  timeoutS: number | undefined,
+  io: Io,
+  out: Output,
+): number {
+  if (newest === undefined) {
+    io.stderr(`sky: the API did not answer within ${timeoutS}s\n`);
+    return runExitCodes.running;
+  }
+  const asOf = outOfContact ? " as of the last answer from the API" : "";
+  io.stderr(`sky: still ${newest.run.status} after ${timeoutS}s${asOf}\n`);
+  printInbox(newest, io, out);
+  return runExitCodes.running;
+}
 
-/** A retry of a decision that already landed converges to success; one that went the other way fails. */
+const decisionVerbs = {
+  approve: "approved",
+  deny: "denied",
+  answer: "answered",
+} as const;
+
+/** The API answers an exact repeat with 200 like the first; `already_decided` means a different decision stands. */
 function decisionCommand(
-  past: Decided,
+  verb: keyof typeof decisionVerbs,
   options: AgentCommand["options"],
   usage: string,
   build: (
@@ -258,23 +281,19 @@ function decisionCommand(
         try {
           out.result(
             await send(api, agentId, requestId),
-            `${past} ${requestId}`,
+            `${decisionVerbs[verb]} ${requestId}`,
           );
           return 0;
         } catch (err) {
-          if (!(err instanceof ApiError && err.code === "already_decided")) {
-            throw err;
-          }
-          const recorded = err.details.decision;
+          const recorded =
+            err instanceof ApiError && err.code === "already_decided"
+              ? err.details.decision
+              : undefined;
           if (typeof recorded !== "string") throw err;
-          if (recorded !== past) {
-            return out.fail(err.code, `${requestId} was already ${recorded}`);
-          }
-          out.result(
-            { requestId, alreadyResolved: true, decision: recorded },
-            `${requestId} already resolved (${recorded})`,
+          return out.fail(
+            "already_decided",
+            `${requestId} was already ${recorded} earlier; this ${verb} was not applied`,
           );
-          return 0;
         }
       };
     },
@@ -287,7 +306,7 @@ const noExtra = (rest: string[], usage: string) => {
 
 const approveUsage = "approve takes <agent> <requestId> [--reason=<text>]";
 const approve = decisionCommand(
-  "approved",
+  "approve",
   { reason: { type: "string" } },
   approveUsage,
   (rest, { reason }) => {
@@ -306,7 +325,7 @@ const approve = decisionCommand(
 
 const denyUsage = "deny takes <agent> <requestId> --reason=<text>";
 const deny = decisionCommand(
-  "denied",
+  "deny",
   { reason: { type: "string" } },
   denyUsage,
   (rest, { reason }) => {
@@ -319,8 +338,8 @@ const deny = decisionCommand(
   },
 );
 
-const answerUsage = "answer takes <agent> <requestId> <text>";
-const answer = decisionCommand("answered", {}, answerUsage, (rest) => {
+const answerUsage = "answer takes <agent> <requestId> -- <text>";
+const answer = decisionCommand("answer", {}, answerUsage, (rest) => {
   const [text, ...extra] = rest;
   if (text === undefined || extra.length > 0) {
     throw new UsageError(`${answerUsage}; quote a text with spaces`, true);

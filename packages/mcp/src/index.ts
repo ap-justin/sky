@@ -51,7 +51,6 @@ const AlreadyDecided = z.looseObject({
   code: z.literal("already_decided"),
   decision: z.enum(["approved", "denied", "answered"]),
 });
-type Decision = z.infer<typeof AlreadyDecided>["decision"];
 
 const failure = (status: number, code: string, message: string) =>
   text({ status, error: { code, message } }, true);
@@ -175,18 +174,14 @@ function buildServer(call: Call) {
     return outcome.ok ? text(outcome.value) : outcome.result;
   };
 
-  /** Posts a decision; a retry that finds the request already decided the same way succeeds. */
-  const decide = async (
-    path: string,
-    body: { requestId: RequestId },
-    decision: Decision,
-  ) => {
+  /** Posts a decision; an `already_decided` 409 means a different, earlier decision stands, so the error says so. */
+  const decide = async (path: string, body: { requestId: RequestId }) => {
     const outcome = await call("POST", path, body);
     if (outcome.ok) return text(outcome.value);
     const already = AlreadyDecided.safeParse(outcome.error);
-    return already.success && already.data.decision === decision
-      ? text({ requestId: body.requestId, alreadyResolved: true, decision })
-      : outcome.result;
+    if (!already.success) return outcome.result;
+    const message = `${body.requestId} was already ${already.data.decision}; that decision stands and this one was not applied`;
+    return text({ status: 409, error: { ...already.data, message } }, true);
   };
 
   /** The id of the agent's newest run, which the list returns first. */
@@ -268,17 +263,16 @@ function buildServer(call: Call) {
     "answer",
     {
       description:
-        "Answer the question a waiting run asked; requestId is the pending request status returns. If it was already answered, returns alreadyResolved.",
+        "Answer the question a waiting run asked; requestId is the pending request status returns. Repeating the same answer is safe; a different answer to a request already answered is an error and is not applied.",
       inputSchema: { agentId: AgentId, requestId: RequestId, answer: nonEmpty },
     },
-    ({ agentId, ...body }) =>
-      decide(`/v1/agents/${agentId}/answers`, body, "answered"),
+    ({ agentId, ...body }) => decide(`/v1/agents/${agentId}/answers`, body),
   );
   server.registerTool(
     "approve",
     {
       description:
-        "Approve or deny the tool call a waiting run asked to make, optionally with a reason; requestId is the pending request status returns. If it was already decided the same way, returns alreadyResolved.",
+        "Approve or deny the tool call a waiting run asked to make, optionally with a reason; requestId is the pending request status returns. Repeating the same decision is safe; a different decision on a request already decided is an error and is not applied.",
       inputSchema: {
         agentId: AgentId,
         requestId: RequestId,
@@ -288,12 +282,7 @@ function buildServer(call: Call) {
           .describe("Why the call is approved or denied."),
       },
     },
-    ({ agentId, ...body }) =>
-      decide(
-        `/v1/agents/${agentId}/approvals`,
-        body,
-        body.decision === "approve" ? "approved" : "denied",
-      ),
+    ({ agentId, ...body }) => decide(`/v1/agents/${agentId}/approvals`, body),
   );
   server.registerTool(
     "stop",
@@ -308,7 +297,7 @@ function buildServer(call: Call) {
     "archive",
     {
       description:
-        "Archive the agent, stopping any active run; it takes no more runs.",
+        "Archive the agent: stops any active run, deletes its git worktree (uncommitted work is lost) and takes no more runs. To halt a run but keep the worktree, call stop.",
       inputSchema: { agentId: AgentId },
       annotations: { destructiveHint: true },
     },

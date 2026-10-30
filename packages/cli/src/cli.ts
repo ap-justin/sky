@@ -47,14 +47,18 @@ const help = (io: Io) => `Usage:
       stderr.
   sky wait <agent> [--timeout=<seconds>] [options]
       Wait until the newest run needs input or ends, then print what inbox
-      prints. With no --timeout it waits as long as the run takes.
+      prints. An unreachable API or a 5xx is retried with backoff (at most
+      30s apart); a 4xx ends the wait. With no --timeout it waits as long as
+      the run and any outage take; --timeout bounds both.
   sky status <agent> [options]
       Print "<runId> <status>", then its summary, error and compare link.
   sky approve <agent> <requestId> [--reason=<text>] [options]
   sky deny <agent> <requestId> --reason=<text> [options]
-  sky answer <agent> <requestId> <text> [options]
-      Decide a pending request. Repeating a decision that already landed
-      exits 0 and says "already resolved".
+  sky answer <agent> <requestId> -- <text>
+      Decide a pending request. Options go before --, and everything after
+      it is the answer, even text starting with '-'. Repeating the same
+      decision exits 0; a request already decided differently exits 1 and
+      the earlier decision stands.
 
 Options:
   --url=<url>            API URL
@@ -118,11 +122,19 @@ export async function run(io: Io): Promise<number> {
 
 function parse<
   O extends Record<string, { type: "string" | "boolean"; short?: string }>,
->(args: string[], options: O) {
+>(args: string[], options: O, unknownOptionHint?: string) {
   try {
     return parseArgs({ args, options, allowPositionals: true, strict: true });
   } catch (err) {
-    if ((err as { code?: string }).code?.startsWith("ERR_PARSE_ARGS_")) {
+    const code = (err as { code?: string }).code;
+    if (code === "ERR_PARSE_ARGS_UNKNOWN_OPTION" && unknownOptionHint) {
+      throw new UsageError(
+        // drop parseArgs' own hint: it quotes only the first character of "- staging"
+        `${(err as Error).message.replace(/ To specify a positional .*$/s, "")} ${unknownOptionHint}`,
+        true,
+      );
+    }
+    if (code?.startsWith("ERR_PARSE_ARGS_")) {
       throw new UsageError((err as Error).message, true);
     }
     throw err;
@@ -200,10 +212,13 @@ async function runAgent(
   io: Io,
 ): Promise<number> {
   const spec = agentCommands[command] as (typeof agentCommands)[string];
-  const { values, positionals } = parse(args, {
-    ...commonOptions,
-    ...spec.options,
-  });
+  const { values, positionals } = parse(
+    args,
+    { ...commonOptions, ...spec.options },
+    command === "answer"
+      ? "An answer starting with '-' goes after --: sky answer <agent> <requestId> -- <text>"
+      : undefined,
+  );
   if (values.help) {
     io.stdout(help(io));
     return 0;

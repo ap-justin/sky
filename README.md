@@ -47,10 +47,10 @@ sky secret set web NPM_TOKEN < token.txt
 Stores a secret on an environment; on a terminal it prompts without echo. `sky --help` lists the options, the config file location, and exit codes.
 
 ```
-sky agent start web --prompt @task.md
+sky agent start web --prompt=@task.md
 sky wait <agent>      # until it needs an answer or approval, or ends
 sky inbox <agent>     # the pending question or approval
-sky approve <agent> <requestId>   # or deny --reason=…, or answer <text>
+sky approve <agent> <requestId>   # or deny --reason=…, or answer -- <text>
 sky status <agent>    # status, summary, error and compare link
 ```
 
@@ -101,6 +101,7 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 | `env_not_ready`   | the environment isn't ready to launch agents yet                             |
 | `provisioning`    | the environment is still provisioning; wait for it to finish                 |
 | `agents_exist`    | repo or setup can't change while unarchived agents exist                     |
+| `already_decided` | the request was already decided differently; that decision stands            |
 
 ## MCP
 

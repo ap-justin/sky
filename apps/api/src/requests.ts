@@ -48,17 +48,16 @@ const resumedAs = {
   deny: "denied",
 } as const;
 
-const alreadyDecided = (recorded: Decision | null | undefined) => {
-  if (!recorded) throw new Error("a decided request has no decision");
-  return {
-    kind: "already_decided",
-    decision: resumedAs[recorded.decision],
-  } as const;
-};
+const sameDecision = (a: Decision, b: Decision) =>
+  a.decision === "answer"
+    ? b.decision === "answer" && a.answer === b.answer
+    : a.decision === b.decision && a.reason === b.reason;
 
 /**
  * Records `decision` on its request, if it is open on the agent's waiting run, and moves the run and
- * agent back to `running`. Publish the request's decision once `tx` commits.
+ * agent back to `running`. Publish the request's decision once `tx` commits. The same decision sent
+ * again is `repeated`, with the run as it is now, whatever its status; a different one is
+ * `already_decided`.
  */
 export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
   const found = tx
@@ -74,27 +73,21 @@ export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
   if (found.request.kind !== wanted) {
     return { kind: "wrong_kind", requestKind: found.request.kind } as const;
   }
-  if (found.request.decidedAt) return alreadyDecided(found.request.decision);
-  if (found.run.status !== "waiting") return { kind: "closed" } as const;
-  // the decided_at guard makes a concurrent second decision a no-op
-  const { changes } = tx
-    .update(runRequests)
-    .set({ decision, decidedAt: new Date().toISOString() })
-    .where(
-      and(
-        eq(runRequests.id, decision.requestId),
-        isNull(runRequests.decidedAt),
-      ),
-    )
-    .run();
-  if (changes === 0) {
-    const recorded = tx
-      .select({ decision: runRequests.decision })
-      .from(runRequests)
-      .where(eq(runRequests.id, decision.requestId))
-      .get();
-    return alreadyDecided(recorded?.decision);
+  const recorded = found.request.decision;
+  if (recorded) {
+    if (sameDecision(recorded, decision)) {
+      return { kind: "repeated", run: found.run } as const;
+    }
+    return {
+      kind: "already_decided",
+      decision: resumedAs[recorded.decision],
+    } as const;
   }
+  if (found.run.status !== "waiting") return { kind: "closed" } as const;
+  tx.update(runRequests)
+    .set({ decision, decidedAt: new Date().toISOString() })
+    .where(eq(runRequests.id, decision.requestId))
+    .run();
   const run = tx
     .update(runs)
     .set({ status: "running" })

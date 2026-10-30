@@ -212,7 +212,8 @@ async function decide(
         {
           error: {
             code: "already_decided",
-            message: "the request is already decided",
+            message:
+              "an earlier decision on this request stands; this one was not applied",
             decision: outcome.decision,
           },
         },
@@ -224,6 +225,11 @@ async function decide(
         409,
         "request_closed",
         "the request's run is no longer waiting",
+      );
+    case "repeated":
+      return c.json(
+        { run: presentRun(outcome.run, runError(c.var.db, outcome.run.id)) },
+        200,
       );
   }
   if (outcome.enqueued > 0) c.var.nudgeDeliveries();

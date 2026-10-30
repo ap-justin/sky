@@ -342,6 +342,29 @@ test("wait retries a 5xx with backoff", async () => {
   expect(r.stderr).toMatch(/lost contact with the API \(boom\); retrying/);
 });
 
+test("wait retries its first request after a dropped connection or a 503", async () => {
+  let i = 0;
+  server.use(
+    http.get(`${apiUrl}/v1/agents/:id/runs`, () => {
+      i++;
+      if (i === 1) return HttpResponse.error();
+      if (i === 2) {
+        return HttpResponse.json(
+          { error: { code: "internal", message: "boom" } },
+          { status: 503 },
+        );
+      }
+      return HttpResponse.json({ data: [run({ status: "finished" })] });
+    }),
+  );
+  const r = await runCli(["wait", agentId]);
+  expect(r.code).toBe(0);
+  expect(r.sleeps).toEqual([6000, 12000]);
+  expect(r.stderr).toMatch(/^lost contact with the API \(.+\); retrying\n/);
+  expect(r.stderr).toMatch(/run_1 finished\n$/);
+  expect(r.armedAtExit).toBe(0);
+});
+
 test("wait --timeout gives up with exit 4 and the inbox output", async () => {
   server.use(runs(run({ status: "running" })));
   const r = await runCli(["wait", agentId, "--timeout=10"]);
@@ -350,6 +373,56 @@ test("wait --timeout gives up with exit 4 and the inbox output", async () => {
   expect(r.stdout).toBe("");
   expect(r.stderr).toBe("sky: still running after 10s\nrun_1 running\n");
   expect(r.armedAtExit).toBe(0);
+});
+
+const failingRuns = (status: number, code: string) =>
+  http.get(`${apiUrl}/v1/agents/:id/runs`, () =>
+    HttpResponse.json({ error: { code, message: code } }, { status }),
+  );
+
+test("wait ends at once on an error a retry can't fix", async () => {
+  for (const [status, code, exit] of [
+    [404, "not_found", 1],
+    [401, "unauthorized", 2],
+  ] as const) {
+    server.use(failingRuns(status, code));
+    const r = await runCli(["wait", agentId]);
+    expect(r.code, code).toBe(exit);
+    expect(r.sleeps).toEqual([]);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(new RegExp(`\\(${code}\\)`));
+    expect(r.armedAtExit).toBe(0);
+  }
+});
+
+test("wait --timeout bounds the retries of a first request that never succeeds", async () => {
+  server.use(failingRuns(503, "internal"));
+  const r = await runCli(["wait", agentId, "--timeout=60"]);
+  expect(r.code).toBe(4);
+  expect(r.sleeps).toEqual([6000, 12000, 24000, 18000]);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe(
+    "lost contact with the API (internal); retrying\nsky: the API did not answer within 60s\n",
+  );
+  expect(r.armedAtExit).toBe(0);
+});
+
+test("wait --timeout while out of contact prints the last run fetched, marked as such", async () => {
+  let i = 0;
+  server.use(
+    http.get(`${apiUrl}/v1/agents/:id/runs`, () =>
+      i++ === 0
+        ? HttpResponse.json({ data: [run({ status: "running" })] })
+        : HttpResponse.error(),
+    ),
+  );
+  const r = await runCli(["wait", agentId, "--timeout=120", "--json"]);
+  expect(r.code).toBe(4);
+  expect(r.sleeps).toEqual([3000, 6000, 12000, 24000, 30000, 30000, 15000]);
+  expect(JSON.parse(r.stdout)).toEqual(run({ status: "running" }));
+  expect(r.stderr).toMatch(
+    /sky: still running after 120s as of the last answer from the API\nrun_1 running\n$/,
+  );
 });
 
 test("run-state command argv mistakes are usage errors", async () => {
@@ -422,42 +495,45 @@ test("a decision --json prints the API's object", async () => {
   expect(JSON.parse(r.stdout)).toEqual(decided);
 });
 
-test("repeating a decision that already landed exits 0", async () => {
+test("an exact repeat the API accepts again exits 0 like the first", async () => {
+  server.use(post("/v1/agents/:id/answers", 200, decided));
+  for (let i = 0; i < 2; i++) {
+    const r = await runCli(["answer", agentId, "req_q", "main"]);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("answered req_q\n");
+  }
+});
+
+test("already_decided exits 1: the earlier decision stands and this one was not applied", async () => {
   for (const [argv, decision] of [
-    [["approve", agentId, "req_a"], "approved"],
+    [["approve", agentId, "req_a"], "denied"],
     [["deny", agentId, "req_a", "--reason=no"], "denied"],
-    [["answer", agentId, "req_q", "main"], "answered"],
+    [["answer", agentId, "req_q", "dev"], "answered"],
   ] as const) {
     server.use(alreadyDecided(decision));
-    const requestId = argv[2];
+    const message = `${argv[2]} was already ${decision} earlier; this ${argv[0]} was not applied`;
     const r = await runCli([...argv]);
-    expect(r.code, argv[0]).toBe(0);
-    expect(r.stdout).toBe(`${requestId} already resolved (${decision})\n`);
+    expect(r.code, argv[0]).toBe(1);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toBe(`sky: ${message}\n`);
     const j = await runCli([...argv, "--json"]);
-    expect(j.code, argv[0]).toBe(0);
-    expect(JSON.parse(j.stdout)).toEqual({
-      requestId,
-      alreadyResolved: true,
-      decision,
+    expect(j.code).toBe(1);
+    expect(j.stdout).toBe("");
+    expect(JSON.parse(j.stderr)).toEqual({
+      error: { code: "already_decided", message },
     });
   }
 });
 
-test("a request already decided the other way exits 1", async () => {
-  for (const [argv, decision] of [
-    [["approve", agentId, "req_a"], "denied"],
-    [["deny", agentId, "req_a", "--reason=no"], "approved"],
-    [["answer", agentId, "req_a", "main"], "approved"],
-  ] as const) {
-    server.use(alreadyDecided(decision));
-    const r = await runCli([...argv]);
-    expect(r.code, argv[0]).toBe(1);
-    expect(r.stdout).toBe("");
-    expect(r.stderr).toBe(`sky: ${argv[2]} was already ${decision}\n`);
-    const j = await runCli([...argv, "--json"]);
-    expect(j.code).toBe(1);
-    expect(JSON.parse(j.stderr).error.code).toBe("already_decided");
-  }
+test("already_decided with no recorded decision reports the API's own error", async () => {
+  server.use(
+    post("/v1/agents/:id/approvals", 409, {
+      error: { code: "already_decided", message: "the request is decided" },
+    }),
+  );
+  const r = await runCli(["approve", agentId, "req_a"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toBe("sky: the request is decided (already_decided)\n");
 });
 
 test("a request whose run ended exits 1 with request_closed", async () => {
@@ -492,6 +568,33 @@ test("decision argv mistakes are usage errors with no request", async () => {
     expect(r.code, argv.join(" ")).toBe(2);
   }
   expect(writes).toEqual([]);
+});
+
+test("an answer after -- is sent verbatim, even one starting with a dash", async () => {
+  server.use(post("/v1/agents/:id/answers", 200, decided));
+  for (const text of ["- staging", "-1", "--force"]) {
+    const r = await runCli(["answer", agentId, "req_q", "--json", "--", text]);
+    expect(r.code, text).toBe(0);
+  }
+  expect(writes.map((w) => w.body)).toEqual([
+    { requestId: "req_q", answer: "- staging" },
+    { requestId: "req_q", answer: "-1" },
+    { requestId: "req_q", answer: "--force" },
+  ]);
+});
+
+test("a dash-leading answer without -- points at the -- form", async () => {
+  for (const text of ["- staging", "-1"]) {
+    const r = await runCli(["answer", agentId, "req_q", text]);
+    expect(r.code, text).toBe(2);
+    expect(r.stderr, text).toMatch(/sky answer <agent> <requestId> -- <text>/);
+  }
+  expect(writes).toEqual([]);
+});
+
+test("--help shows the -- form for answer", async () => {
+  const r = await runCli(["answer", "--help"]);
+  expect(r.stdout).toContain("sky answer <agent> <requestId> -- <text>");
 });
 
 test("--help documents the run-state exit codes", async () => {

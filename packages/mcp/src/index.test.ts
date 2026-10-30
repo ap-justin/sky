@@ -234,15 +234,7 @@ test("approve sends its reason with an approve too", async () => {
   ]);
 });
 
-const alreadyDecided = (decision: string) => ({
-  error: {
-    code: "already_decided",
-    message: "req_1 was already decided",
-    decision,
-  },
-});
-
-test.each([
+const decisions = [
   {
     tool: "answer",
     path: "/answers",
@@ -261,10 +253,13 @@ test.each([
     args: { decision: "deny" },
     decision: "denied",
   },
-])(
-  "$tool on a request already $decision that way is resolved, not an error",
-  async ({ tool, path, args, decision }) => {
-    route("post", `/v1/agents/agt_1${path}`, 409, alreadyDecided(decision));
+];
+
+test.each(decisions)(
+  "$tool repeating the decision already $decision returns the run like a first success",
+  async ({ tool, path, args }) => {
+    const ok = { run: { id: "run_1", status: "running" } };
+    route("post", `/v1/agents/agt_1${path}`, 200, ok);
     const client = await connect();
 
     const result = await client.callTool({
@@ -273,37 +268,45 @@ test.each([
     });
 
     expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toEqual(ok);
+  },
+);
+
+test.each(decisions)(
+  "$tool on a request already $decision differently is an error saying the earlier decision stands",
+  async ({ tool, path, args, decision }) => {
+    route("post", `/v1/agents/agt_1${path}`, 409, {
+      error: {
+        code: "already_decided",
+        message: "req_1 was already decided",
+        decision,
+      },
+    });
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: tool,
+      arguments: { agentId: "agt_1", requestId: "req_1", ...args },
+    });
+
+    expect(result.isError).toBe(true);
     expect(textOf(result)).toEqual({
-      requestId: "req_1",
-      alreadyResolved: true,
-      decision,
+      status: 409,
+      error: {
+        code: "already_decided",
+        message: `req_1 was already ${decision}; that decision stands and this one was not applied`,
+        decision,
+      },
     });
   },
 );
 
-test.each([
-  {
-    tool: "answer",
-    path: "/answers",
-    args: { answer: "use pnpm" },
-    decision: "denied",
-  },
-  {
-    tool: "approve",
-    path: "/approvals",
-    args: { decision: "approve" },
-    decision: "denied",
-  },
-  {
-    tool: "approve",
-    path: "/approvals",
-    args: { decision: "deny" },
-    decision: "approved",
-  },
-])(
-  "$tool on a request already $decision otherwise stays an error",
-  async ({ tool, path, args, decision }) => {
-    const envelope = alreadyDecided(decision);
+test.each(decisions)(
+  "$tool on a closed request is an error",
+  async ({ tool, path, args }) => {
+    const envelope = {
+      error: { code: "request_closed", message: "req_1's run has ended" },
+    };
     route("post", `/v1/agents/agt_1${path}`, 409, envelope);
     const client = await connect();
 
@@ -316,6 +319,17 @@ test.each([
     expect(textOf(result)).toEqual({ status: 409, ...envelope });
   },
 );
+
+test("archive tells the model the worktree is deleted and stop keeps it", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const description = tools.find((t) => t.name === "archive")?.description;
+
+  expect(description).toMatch(/worktree/);
+  expect(description).toMatch(/uncommitted/);
+  expect(description).toMatch(/stop/);
+});
 
 test("archive posts to the agent's archive route and is listed destructive", async () => {
   const archived = { id: "agt_1", archivedAt: "2026-10-30T00:00:00Z" };
