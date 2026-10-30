@@ -370,3 +370,108 @@ test.each(["GET", "DELETE"])(
     expect(res.headers.get("content-type")).not.toMatch(/event-stream/);
   },
 );
+
+test("wait_for_events forwards after, types, agentId and wait as the query and returns events and cursor", async () => {
+  const page = {
+    data: [{ id: "evt_8", type: "run.waiting", agentId: "agt_1", data: {} }],
+    cursor: "evt_8",
+  };
+  const queries: string[] = [];
+  server.use(
+    http.get(`${API}/v1/events`, ({ request }) => {
+      queries.push(new URL(request.url).search);
+      return HttpResponse.json(page);
+    }),
+  );
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "wait_for_events",
+    arguments: {
+      after: "evt_7",
+      types: ["run.waiting", "claude.PreToolUse"],
+      agentId: "agt_1",
+      wait: 5,
+    },
+  });
+
+  expect(result.isError).toBeFalsy();
+  expect(textOf(result)).toEqual({ events: page.data, cursor: "evt_8" });
+  expect(queries).toEqual([
+    "?after=evt_7&types=run.waiting%2Cclaude.PreToolUse&agentId=agt_1&wait=5",
+  ]);
+});
+
+test("wait_for_events with no arguments asks for new events, waiting 30 s", async () => {
+  const queries: string[] = [];
+  server.use(
+    http.get(`${API}/v1/events`, ({ request }) => {
+      queries.push(new URL(request.url).search);
+      return HttpResponse.json({ data: [], cursor: "evt_12" });
+    }),
+  );
+  const client = await connect();
+
+  const result = await client.callTool({ name: "wait_for_events" });
+
+  expect(textOf(result)).toEqual({ events: [], cursor: "evt_12" });
+  expect(queries).toEqual(["?wait=30"]);
+});
+
+test.each([
+  [400, "invalid_cursor", "the cursor is not an event id"],
+  [404, "not_found", "no such agent"],
+])(
+  "wait_for_events surfaces an API %i as a tool error",
+  async (status, code, message) => {
+    route("get", "/v1/events", status, { error: { code, message } });
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: "wait_for_events",
+      arguments: { after: "evt_1", agentId: "agt_9" },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toEqual({ status, error: { code, message } });
+  },
+);
+
+test.each([
+  [{ after: "evt_1&agentId=agt_2" }, /after/],
+  [{ types: ["run.progress"] }, /types/],
+  [{ wait: 31 }, /wait/],
+  [{ agentId: "agt_1/../x" }, /agentId/],
+])("wait_for_events rejects %j before any API call", async (args, message) => {
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "wait_for_events",
+    arguments: args,
+  });
+
+  expect(result.isError).toBe(true);
+  expect(rawText(result)).toMatch(message);
+});
+
+test("wait_for_events is listed read-only with its filters", async () => {
+  const client = await connect();
+
+  const { tools } = await client.listTools();
+  const tool = tools.find((t) => t.name === "wait_for_events");
+
+  expect(tool?.annotations?.readOnlyHint).toBe(true);
+  expect(tool?.description).toMatch(/cursor/);
+  expect(tool?.inputSchema.properties).toMatchObject({
+    after: { type: "string" },
+    types: {
+      type: "array",
+      items: {
+        enum: expect.arrayContaining(["run.waiting", "claude.PostToolUse"]),
+      },
+    },
+    agentId: { type: "string" },
+    wait: { type: "integer", minimum: 0, maximum: 30, default: 30 },
+  });
+  expect(tool?.inputSchema.required ?? []).toEqual([]);
+});

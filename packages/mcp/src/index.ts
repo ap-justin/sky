@@ -5,6 +5,7 @@ import {
   AgentId,
   Environment,
   EnvironmentId,
+  EventType,
   RequestId,
   RunId,
 } from "@sky/shared";
@@ -130,6 +131,31 @@ const clip = (diff?: string | null, compareUrl?: string | null) =>
   !diff || diff.length <= DIFF_LIMIT
     ? diff
     : `${diff.slice(0, DIFF_LIMIT)}\n[diff truncated: ${DIFF_LIMIT} of ${diff.length} chars shown; full diff at ${compareUrl ?? "the agent's branch"}]`;
+
+const WaitForEventsInput = {
+  after: z
+    .string()
+    .regex(/^(?:evt_)?\d{1,15}$/)
+    .optional()
+    .describe(
+      "The cursor the previous call returned. Omit on the first call to get only events from now on.",
+    ),
+  types: z
+    .array(EventType)
+    .min(1)
+    .optional()
+    .describe("Only these event types."),
+  agentId: AgentId.optional().describe("Only this agent's events."),
+  wait: z
+    .number()
+    .int()
+    .min(0)
+    .max(30)
+    .default(30)
+    .describe("Seconds to wait for an event before returning empty."),
+};
+
+const EventPage = z.object({ data: z.array(z.unknown()), cursor: z.string() });
 
 function buildServer(call: Call) {
   const api = async (...args: Parameters<Call>) => {
@@ -263,6 +289,29 @@ function buildServer(call: Call) {
       agentId
         ? runOf(agentId, runId, includeDiff)
         : api("GET", `/v1/environments/${envId}`),
+  );
+  server.registerTool(
+    "wait_for_events",
+    {
+      description:
+        "Wait for new events across your agents: tool calls and results, subagents, todos, messages and run lifecycle. Call it in a loop, passing the returned cursor back as after; without after it returns only events from now on. It returns as soon as something happens, or empty after wait seconds, up to 100 events oldest first. Filter with types or agentId. run.waiting means the agent needs answer or approve.",
+      inputSchema: WaitForEventsInput,
+      annotations: { readOnlyHint: true },
+    },
+    async ({ after, types, agentId, wait }) => {
+      const query = new URLSearchParams({
+        ...(after !== undefined && { after }),
+        ...(types && { types: types.join(",") }),
+        ...(agentId && { agentId }),
+        wait: String(wait),
+      });
+      const outcome = await call("GET", `/v1/events?${query}`);
+      if (!outcome.ok) return outcome.result;
+      const page = EventPage.safeParse(outcome.value);
+      if (!page.success)
+        return failure(200, "unexpected_response", z.prettifyError(page.error));
+      return text({ events: page.data.data, cursor: page.data.cursor });
+    },
   );
   return server;
 }
