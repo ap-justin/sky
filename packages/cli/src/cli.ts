@@ -28,9 +28,10 @@ const help = (io: Io) => `Usage:
   sky apply <env.yaml> [options]
       Create or update the environment env.yaml describes, wait until it's
       provisioned, and write sky-lock.json beside env.yaml.
-  sky secret set <env> <NAME> [--connector=<name>] [options]
+  sky secret set <env> <NAME> [--connector=<connection id>] [options]
       Store a secret on an environment (<env> is its id or name). The value
-      is read from stdin, or prompted for without echo on a terminal.
+      is read from stdin, or prompted for without echo on a terminal. With
+      --connector, agents get the Sprites connection id as $NAME instead.
 
 Options:
   --url=<url>            API URL

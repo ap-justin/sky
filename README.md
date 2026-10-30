@@ -46,6 +46,19 @@ sky secret set web NPM_TOKEN < token.txt
 
 Stores a secret on an environment; on a terminal it prompts without echo. `sky --help` lists the options, the config file location, and exit codes.
 
+## Pull requests
+
+An agent's sandbox holds no GitHub token, so `git push` and `gh` don't work there. Agents publish through a Sprites connector to GitHub instead:
+
+1. In the Sprites org whose token Sky runs with (`SPRITES_TOKEN`), connect GitHub and give the connector a policy with `name_prefix: sky-`, so every Sky sandbox can use it.
+2. Hand its connection id to an environment:
+
+   ```
+   sky secret set web GITHUB_CONNECTOR --connector=<connection id>
+   ```
+
+Agents in that environment then get `GITHUB_CONNECTOR` and are told to publish with Sky's own command, which sends the branch's commits to GitHub and opens a pull request into the default branch, or updates the one already open. The connector must belong to the same Sprites org as `SPRITES_TOKEN`; another org's connector doesn't recognize Sky's sandboxes.
+
 ## REST API
 
 All routes live under `/v1`. Ids are prefixed: `env_…`, `agent_…`, `run_…`.

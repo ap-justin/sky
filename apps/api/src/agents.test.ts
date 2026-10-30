@@ -232,7 +232,7 @@ const putSecret = (envId: string, name: string, body: unknown) =>
     body: JSON.stringify(body),
   });
 
-test("the env's value secrets reach the runner through the env file, quotes intact; a connector injects nothing", async () => {
+test("the env's secrets reach the runner through the env file, quotes intact; a connector as its connection id", async () => {
   const envId = readyEnv();
   const tricky = `it's "quoted" $HOME \`x\`\nline two`;
   expect((await putSecret(envId, "TRICKY", { value: tricky })).status).toBe(
@@ -241,15 +241,17 @@ test("the env's value secrets reach the runner through the env file, quotes inta
   expect(
     (await putSecret(envId, "DB_URL", { value: "postgres://u:p@db/x" })).status,
   ).toBe(200);
-  expect((await putSecret(envId, "GH", { connector: "github" })).status).toBe(
-    200,
-  );
+  expect(
+    (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
+      .status,
+  ).toBe(200);
   const { agent, run } = await launched(envId);
   await sessionOpened();
   const session = wire.sessions[0];
   expect(envFileOf(wire, session)).toEqual({
     TRICKY: tricky,
     DB_URL: "postgres://u:p@db/x",
+    GITHUB_CONNECTOR: "VPpb7x",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
   });
@@ -260,6 +262,7 @@ test("the env's value secrets reach the runner through the env file, quotes inta
   await vi.waitFor(async () =>
     expect((await getRun(agent.id, run.id)).body.secretNames).toEqual([
       "DB_URL",
+      "GITHUB_CONNECTOR",
       "TRICKY",
     ]),
   );

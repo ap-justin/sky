@@ -46,7 +46,7 @@ export const deliveryStatuses = ["pending", "delivered", "failed"] as const;
 // what a run waits on; the CHECK on `kind` spells the same list
 export const requestKinds = ["question", "approval"] as const;
 
-// a stored env value, or a Sprites connector injected by name; the CHECK on `kind` spells the same list
+// a stored env value, or a Sprites connector whose connection id the runner gets under the name; the CHECK on `kind` spells the same list
 export const secretKinds = ["value", "connector"] as const;
 
 // an env-var name, the rule `^[A-Za-z_][A-Za-z0-9_]*$` in glob form
