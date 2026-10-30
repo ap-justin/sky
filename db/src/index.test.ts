@@ -793,3 +793,24 @@ test("migrating a populated 0006 file keeps every event and delivery, and never 
   expect(count("webhook_deliveries")).toBe(1);
   expect(insertEvent()).toBeGreaterThan(tail);
 });
+
+test("migrating a 0006 file drops run.progress events and their deliveries, keeps the rest, and never reuses the dropped id", () => {
+  migrateThrough("0006_sweet_madame_hydra");
+  seedDelivery();
+  insertDelivery();
+  const progress = insertEvent("run.progress");
+  run(
+    "insert into webhook_deliveries (webhook_id, event_id, status, next_attempt_at) values ('wh_1', ?, 'pending', '2026-10-29T12:00:00.000Z')",
+    progress,
+  );
+
+  migrate(db);
+
+  expect(db.$client.prepare("select id, type from events").all()).toEqual([
+    { id: 1, type: "run.started" },
+  ]);
+  expect(
+    db.$client.prepare("select event_id from webhook_deliveries").all(),
+  ).toEqual([{ event_id: 1 }]);
+  expect(insertEvent()).toBeGreaterThan(progress);
+});

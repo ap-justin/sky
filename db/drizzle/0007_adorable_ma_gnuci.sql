@@ -13,6 +13,9 @@ CREATE TABLE `__new_events` (
 	CONSTRAINT "events_payload" CHECK(json_type("payload") = 'object')
 ) STRICT;
 --> statement-breakpoint
+-- hand-added: run.progress fails the new events_type CHECK; deliveries go first since foreign_keys=OFF is a no-op inside the migrator's transaction
+DELETE FROM `webhook_deliveries` WHERE `event_id` IN (SELECT `id` FROM `events` WHERE `type` = 'run.progress');--> statement-breakpoint
+DELETE FROM `events` WHERE `type` = 'run.progress';--> statement-breakpoint
 INSERT INTO `__new_events`("id", "run_id", "ts", "type", "payload") SELECT "id", "run_id", "ts", "type", "payload" FROM `events`;--> statement-breakpoint
 -- hand-added: the copy resets AUTOINCREMENT to max(id), which would reuse ids deleted from the tail (they are SSE Last-Event-IDs)
 DELETE FROM sqlite_sequence WHERE name = '__new_events';--> statement-breakpoint
