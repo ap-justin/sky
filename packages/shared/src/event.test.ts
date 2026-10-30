@@ -1,11 +1,14 @@
 import { expect, test } from "vitest";
 import {
   Decision,
+  EVENT_TEXT_MAX,
   Event,
   EventType,
   PendingRequest,
   Rollup,
+  RUNNER_TEXT_MAX,
   RunnerEventPost,
+  truncationMarker,
 } from "./event.js";
 
 const usage = {
@@ -234,4 +237,142 @@ test("a stored event names its agent, so a run.waiting can be answered from the 
   expect(Event.parse(waiting)).toEqual(waiting);
   const { agentId: _, ...anonymous } = waiting;
   expect(Event.safeParse(anonymous).success).toBe(false);
+});
+
+const claudeTypes = [
+  "claude.PreToolUse",
+  "claude.PostToolUse",
+  "claude.PostToolUseFailure",
+  "claude.SubagentStart",
+  "claude.SubagentStop",
+  "claude.TaskCreated",
+  "claude.TaskCompleted",
+  "claude.Notification",
+  "claude.PreCompact",
+  "claude.FileChanged",
+  "claude.Message",
+];
+
+test("event types include Claude Code's hook events and its messages as claude.*", () => {
+  expect(EventType.options).toEqual(expect.arrayContaining(claudeTypes));
+});
+
+const claudePosts = [
+  {
+    type: "claude.PreToolUse",
+    payload: {
+      toolName: "Bash",
+      toolUseId: "toolu_01",
+      input: '{"command":"pnpm test"}',
+    },
+  },
+  {
+    type: "claude.PostToolUse",
+    payload: {
+      toolName: "Read",
+      toolUseId: "toolu_02",
+      input: '{"file_path":"src/a.ts"}',
+      output: "export const a = 1;",
+      durationMs: 12,
+      subagentId: "sub_1",
+    },
+  },
+  {
+    type: "claude.PostToolUseFailure",
+    payload: {
+      toolName: "Bash",
+      toolUseId: "toolu_03",
+      input: '{"command":"false"}',
+      error: "exit 1",
+      isInterrupt: false,
+    },
+  },
+  {
+    type: "claude.SubagentStart",
+    payload: { subagentId: "sub_1", agentType: "Explore" },
+  },
+  {
+    type: "claude.SubagentStop",
+    payload: {
+      subagentId: "sub_1",
+      agentType: "Explore",
+      lastAssistantMessage: "found it in src/a.ts",
+    },
+  },
+  {
+    type: "claude.TaskCreated",
+    payload: { taskId: "1", taskSubject: "add tests" },
+  },
+  {
+    type: "claude.TaskCompleted",
+    payload: {
+      taskId: "1",
+      taskSubject: "add tests",
+      taskDescription: "cover the parser",
+    },
+  },
+  {
+    type: "claude.Notification",
+    payload: {
+      message: "Claude needs your permission to use Bash",
+      notificationType: "permission_prompt",
+    },
+  },
+  {
+    type: "claude.PreCompact",
+    payload: { trigger: "auto", customInstructions: null },
+  },
+  {
+    type: "claude.FileChanged",
+    payload: { filePath: "src/a.ts", event: "change" },
+  },
+  { type: "claude.Message", payload: { text: "Running the tests now." } },
+];
+
+test("every claude.* type has a realistic payload the runner can post and the API can store", () => {
+  expect(claudePosts.map((p) => p.type).sort()).toEqual(
+    [...claudeTypes].sort(),
+  );
+  for (const post of claudePosts) {
+    const body = { runId: "run_1", ...post };
+    expect(RunnerEventPost.parse(body)).toEqual(body);
+    expect(Event.parse({ ...meta, ...post })).toEqual({ ...meta, ...post });
+  }
+});
+
+test("a subagent is named by subagentId, never agentId, which is the sky agent", () => {
+  const post = {
+    runId: "run_1",
+    type: "claude.SubagentStart",
+    payload: { agentId: "sub_1", agentType: "Explore" },
+  };
+  expect(RunnerEventPost.safeParse(post).success).toBe(false);
+});
+
+test("a runner text field over RUNNER_TEXT_MAX is rejected", () => {
+  const post = (output: string) => ({
+    runId: "run_1",
+    type: "claude.PostToolUse",
+    payload: { toolName: "Bash", toolUseId: "toolu_1", input: "{}", output },
+  });
+  expect(
+    RunnerEventPost.safeParse(post("x".repeat(RUNNER_TEXT_MAX))).success,
+  ).toBe(true);
+  expect(
+    RunnerEventPost.safeParse(post("x".repeat(RUNNER_TEXT_MAX + 1))).success,
+  ).toBe(false);
+});
+
+test("a stored text field admits EVENT_TEXT_MAX plus the truncation marker, and no more", () => {
+  const event = (text: string) => ({
+    ...meta,
+    type: "claude.Message",
+    payload: { text },
+  });
+  const trimmed = "x".repeat(EVENT_TEXT_MAX) + truncationMarker(60_000);
+  expect(truncationMarker(60_000)).toBe("\n…[truncated 60000 chars]");
+  expect(Event.safeParse(event(trimmed)).success).toBe(true);
+  expect(Event.safeParse(event("x".repeat(EVENT_TEXT_MAX + 65))).success).toBe(
+    false,
+  );
 });
