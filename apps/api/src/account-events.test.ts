@@ -1,7 +1,14 @@
 import { SpritesClient } from "@fly/sprites";
 import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
 import type { AgentId, RunId } from "@sky/shared";
-import { afterEach, beforeEach, expect, test, vi } from "vitest";
+import {
+  afterEach,
+  beforeEach,
+  expect,
+  type MockInstance,
+  test,
+  vi,
+} from "vitest";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
 import { anyRun, runEvents } from "./run-events.js";
@@ -19,7 +26,18 @@ let db: Db;
 let app: ReturnType<typeof createApp>;
 let wire: SpritesWire;
 
+const subscriptions: (() => void)[] = [];
+let subscribeSpy: MockInstance<typeof runEvents.subscribe>;
+
 beforeEach(() => {
+  const subscribe = runEvents.subscribe;
+  subscribeSpy = vi
+    .spyOn(runEvents, "subscribe")
+    .mockImplementation((channel, listener) => {
+      const unsubscribe = subscribe(channel, listener);
+      subscriptions.push(unsubscribe);
+      return unsubscribe;
+    });
   db = openDb(":memory:");
   migrate(db);
   wire = stubSprites();
@@ -34,6 +52,9 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+  // a failed test's leaked subscription must not fail the next test's listener count
+  for (const unsubscribe of subscriptions.splice(0)) unsubscribe();
+  subscribeSpy.mockRestore();
   if (db.$client.open) db.$client.close();
 });
 
@@ -171,6 +192,18 @@ test("?types= and ?agentId= filter the stream", async () => {
   const failed = await post(a.runId, "run.failed", { error: "boom" });
   expect((await s.event())?.id).toBe(String(failed));
   await s.cancel();
+});
+
+test("a reconnect more than one page behind gets every missed event, in order", async () => {
+  const a = runningRun();
+  const seen = await say(a.runId, "seen");
+  const missed: number[] = [];
+  for (let i = 0; i < 250; i++) missed.push(await say(a.runId, `m${i}`));
+  const s = sseReader(await stream("", { "Last-Event-ID": String(seen) }));
+  const got: (string | undefined)[] = [];
+  for (let i = 0; i < missed.length; i++) got.push((await s.event())?.id);
+  await s.cancel();
+  expect(got).toEqual(missed.map(String));
 });
 
 test("a quiet stream pings, and a disconnect releases its listener", async () => {
@@ -420,4 +453,15 @@ test("reading events makes no sprite call", async () => {
   await s.cancel();
   await (await poll(`?after=evt_${start}`)).json();
   expect(wire.calls).toEqual([]);
+});
+
+test("the sprite call log sees a sprite lookup and a file read", async () => {
+  const client = new SpritesClient(spritesToken);
+  await client.getSprite("sky-x").catch(() => {});
+  await client
+    .sprite("sky-x")
+    .filesystem("/")
+    .readFile("/f", "utf8")
+    .catch(() => {});
+  expect(wire.calls).toEqual(["get sky-x", "read sky-x /f"]);
 });

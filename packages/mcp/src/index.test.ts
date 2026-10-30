@@ -440,10 +440,11 @@ test.each([
 test.each([
   [{ after: "evt_1&agentId=agt_2" }, /after/],
   [{ types: ["run.progress"] }, /types/],
-  [{ wait: 31 }, /wait/],
+  [{ wait: 31 }, /Too big: expected number to be <=30 at wait/],
   [{ agentId: "agt_1/../x" }, /agentId/],
   [{ cursor: "evt_1" }, /cursor/],
 ])("wait_for_events rejects %j before any API call", async (args, message) => {
+  const seen = route("get", "/v1/events", 200, { data: [], cursor: "evt_0" });
   const client = await connect();
 
   const result = await client.callTool({
@@ -453,6 +454,7 @@ test.each([
 
   expect(result.isError).toBe(true);
   expect(rawText(result)).toMatch(message);
+  expect(seen).toEqual([]);
 });
 
 test("wait_for_events is listed read-only with its filters", async () => {

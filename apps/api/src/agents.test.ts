@@ -573,20 +573,34 @@ test("a 10 KB tool output is stored trimmed to EVENT_TEXT_MAX with the truncatio
   );
 });
 
-test("a registered secret straddling the trim point is redacted whole, never stored in part", async () => {
-  const { run, token } = await startedRun();
-  const secret = config.webhookSigningKey;
-  const at = EVENT_TEXT_MAX - 16;
-  const output = `${"a".repeat(at)}${secret}`.padEnd(10_240, "b");
-  await postEvent(token, {
-    runId: run.id,
-    type: "claude.PostToolUse",
-    payload: { ...tool, output },
-  });
-  const stored = storedOutput();
-  expect(stored).not.toContain(secret.slice(0, 8));
-  expect(stored.slice(at, at + "[redacted]".length)).toBe("[redacted]");
-});
+test.each([
+  ["claude.PostToolUse", "output", { ...tool, output: "" }],
+  ["claude.PreToolUse", "input", { ...tool, input: "" }],
+  ["claude.PostToolUseFailure", "error", { ...tool, error: "" }],
+  ["claude.Message", "text", { text: "" }],
+])(
+  "a registered secret straddling the trim point of %s.%s is redacted whole, never stored in part",
+  async (type, field, base) => {
+    const { run, token } = await startedRun();
+    const secret = config.webhookSigningKey;
+    const at = EVENT_TEXT_MAX - 16;
+    const text = `${"a".repeat(at)}${secret}`.padEnd(10_240, "b");
+    const res = await postEvent(token, {
+      runId: run.id,
+      type,
+      payload: { ...base, [field]: text },
+    });
+    expect(res.status).toBe(201);
+    const row = db.$client
+      .prepare("select payload from events where type = ?")
+      .get(type) as { payload: string };
+    const stored =
+      (JSON.parse(row.payload) as Record<string, string>)[field] ?? "";
+    expect(stored).not.toContain(secret.slice(0, 8));
+    expect(stored.slice(at, at + "[redacted]".length)).toBe("[redacted]");
+    expect(stored).toMatch(/…\[truncated \d+ chars\]$/);
+  },
+);
 
 test("a secret with a quote and a newline is redacted from a tool's JSON-text input", async () => {
   const envId = readyEnv();

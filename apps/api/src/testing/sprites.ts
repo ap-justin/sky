@@ -77,7 +77,8 @@ export function stubSprites() {
     /**
      * One line per call, in order: `create <name>`, `exec <name> <dir> <argv…>` (`… &> <log>` for an
      * `execLogged` wrapper, its inner argv shown), `write <name> <path>`,
-     * `session <name> <dir> <argv…>`, `checkpoint <name>`, `delete <name>`.
+     * `session <name> <dir> <argv…>`, `checkpoint <name>`, `get <name>`, `read <name> <path>`,
+     * `delete <name>`.
      */
     calls: [] as string[],
     sessions: [] as Session[],
@@ -218,6 +219,7 @@ export function stubSprites() {
     http.get(`${SPRITES}/:name/fs/read`, ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const path = new URL(request.url).searchParams.get("path") ?? "";
+      wire.calls.push(`read ${String(params.name)} ${path}`);
       const bytes = wire.files.get(path);
       if (!wire.sprites.has(String(params.name)) || !bytes) {
         return HttpResponse.json(
@@ -287,6 +289,7 @@ export function stubSprites() {
     http.get(`${SPRITES}/:name`, ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });
       const name = String(params.name);
+      wire.calls.push(`get ${name}`);
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
