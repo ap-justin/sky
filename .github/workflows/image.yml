@@ -1,0 +1,32 @@
+name: Image
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+      - name: Log in to Fly registry
+        run: flyctl auth docker
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+      - name: Build and push
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          docker build --platform linux/amd64 \
+            -t registry.fly.io/sky-justin:main \
+            -t "registry.fly.io/sky-justin:sha-${SHORT_SHA}" .
+          docker push registry.fly.io/sky-justin:main
+          docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"

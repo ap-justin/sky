@@ -5,8 +5,8 @@
 #   SPRITES_TOKEN            Sprites API token, from the user's Sprites org
 #   CLAUDE_CODE_OAUTH_TOKEN  runner auth for Claude Code, from the user's `claude setup-token`
 
-app = "REPLACE_ME"            # placeholder: app name chosen at deploy
-primary_region = "REPLACE_ME" # placeholder: region code chosen at deploy, e.g. "iad"
+app = "sky-justin"            # placeholder: app name chosen at deploy
+primary_region = "sin" # placeholder: region code chosen at deploy, e.g. "iad"
 
 # Fly's default is SIGINT; the API drains only on SIGTERM, and as PID 1 it ignores unhandled signals
 kill_signal = "SIGTERM"
@@ -16,7 +16,7 @@ kill_timeout = 30
 [env]
   DATA_DIR = "/data"
   # how a sprite reaches this API; host must match `app` above
-  PUBLIC_BASE_URL = "https://REPLACE_ME.fly.dev"
+  PUBLIC_BASE_URL = "https://sky-justin.fly.dev"
 
 # single machine + single volume: the SQLite file is one unreplicated copy, so the volume needs snapshots
 [mounts]
