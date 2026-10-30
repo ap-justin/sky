@@ -1,6 +1,6 @@
 import { zValidator } from "@hono/zod-validator";
 import { agents, type Db, events, runs } from "@sky/db";
-import { type AgentId, type Event, EventType } from "@sky/shared";
+import { type AgentId, type Event, EventCursor, EventType } from "@sky/shared";
 import { and, asc, eq, gt, inArray, max } from "drizzle-orm";
 import { z } from "zod";
 import { apiError } from "./errors.js";
@@ -51,11 +51,7 @@ function readEvents(
   };
 }
 
-// `evt_<n>` as events carry it, or the bare row id SSE frames carry
-const Cursor = z
-  .string()
-  .regex(/^(?:evt_)?\d{1,15}$/)
-  .transform((s) => Number(s.replace("evt_", "")));
+const Cursor = EventCursor.transform((s) => Number(s.replace("evt_", "")));
 
 const filterQuery = {
   types: z
@@ -188,6 +184,7 @@ export function accountEventRoutes(
         },
         heartbeatMs,
         (err) => log(`streaming account events failed: ${err}`),
+        () => cursor,
       );
     });
 }

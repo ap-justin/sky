@@ -588,6 +588,59 @@ test("a registered secret straddling the trim point is redacted whole, never sto
   expect(stored.slice(at, at + "[redacted]".length)).toBe("[redacted]");
 });
 
+test("a secret with a quote and a newline is redacted from a tool's JSON-text input", async () => {
+  const envId = readyEnv();
+  const secret = 'pa"ss\\word\nline-two-0042';
+  expect((await putSecret(envId, "TRICKY", { value: secret })).status).toBe(
+    200,
+  );
+  const { run, token } = await runningRun(envId);
+  await postEvent(token, {
+    runId: run.id,
+    type: "run.started",
+    payload: { sessionId: "s" },
+  });
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "claude.PreToolUse",
+    payload: { ...tool, input: JSON.stringify({ content: `x ${secret} y` }) },
+  });
+  expect(res.status).toBe(201);
+  const row = db.$client
+    .prepare("select payload from events where type = 'claude.PreToolUse'")
+    .get() as { payload: string };
+  expect(JSON.parse(row.payload).input).toBe('{"content":"x [redacted] y"}');
+});
+
+test("a 5000-char approval summary is redacted whole, then stored trimmed to 2000 with the marker", async () => {
+  const { run, token } = await startedRun();
+  const secret = config.webhookSigningKey;
+  const at = 2000 - 8;
+  const toolSummary = `${"a".repeat(at)}${secret}`.padEnd(5000, "b");
+  const res = await postEvent(token, {
+    runId: run.id,
+    type: "run.waiting",
+    payload: {
+      request: {
+        kind: "approval",
+        requestId: "req_1",
+        toolName: "Bash",
+        toolSummary,
+      },
+    },
+  });
+  expect(res.status).toBe(201);
+  const row = db.$client
+    .prepare("select payload from events where type = 'run.waiting'")
+    .get() as { payload: string };
+  const stored: string = JSON.parse(row.payload).request.toolSummary;
+  const redacted = toolSummary.replace(secret, "[redacted]");
+  expect(stored).not.toContain(secret.slice(0, 8));
+  expect(stored).toBe(
+    redacted.slice(0, 2000) + truncationMarker(redacted.length - 2000),
+  );
+});
+
 test("a run.progress post is rejected 400 and stores nothing", async () => {
   const { run, token } = await startedRun();
   const res = await postEvent(token, {

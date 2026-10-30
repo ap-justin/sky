@@ -30,11 +30,11 @@ export function sseReader(res: Response) {
         buffer += decoder.decode(value, { stream: true });
       }
     },
-    /** The next frame that isn't a heartbeat. */
+    /** The next frame that dispatches an event: no heartbeat, no id-only cursor frame. */
     async event(): Promise<Frame | null> {
       for (;;) {
         const frame = await this.next();
-        if (!frame?.comment) return frame;
+        if (!frame || frame.data !== undefined) return frame;
       }
     },
     cancel: () => reader.cancel(),

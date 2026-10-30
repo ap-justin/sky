@@ -12,7 +12,9 @@ export type Batch = { frames: SSEMessage[]; done?: boolean; more?: boolean };
 
 /**
  * Streams `read()`'s frames as SSE, reading again after each publish on `channel`, with a `: ping`
- * comment after each `heartbeatMs` of quiet. `read` runs after an await, never inside the publish.
+ * comment once `heartbeatMs` passes with nothing written. `read` runs after an await, never inside the
+ * publish. With `cursor`, the stream opens with a bare `id:` field and every ping carries one, so a
+ * client that reconnects before any matching event still resumes where the server read to.
  */
 export function tailSSE(
   c: Context<AppEnv>,
@@ -20,11 +22,19 @@ export function tailSSE(
   read: () => Batch,
   heartbeatMs: number,
   onFail: (err: unknown) => void,
+  cursor?: () => number,
 ) {
   return streamSSE(c, async (stream) => {
     // set by every publish, so one landing mid-read is never missed
     let dirty = true;
     let wake = () => {};
+    let lastWrite = Date.now();
+    // id-only: EventSource takes it as its Last-Event-ID without dispatching; writeSSE would add `data:`
+    const idField = () => (cursor ? `id: ${cursor()}\n` : "");
+    const tracked = async (written: Promise<unknown>) => {
+      await written;
+      lastWrite = Date.now();
+    };
     const unsubscribe = runEvents.subscribe(channel, () => {
       dirty = true;
       wake();
@@ -34,20 +44,26 @@ export function tailSSE(
       wake();
     });
     try {
+      if (cursor) await tracked(stream.write(`${idField()}\n`));
       while (!stream.aborted) {
         if (!dirty) {
+          // publishes that yield no frames (a filtered stream) don't count as traffic
+          const quiet = Date.now() - lastWrite;
+          if (quiet >= heartbeatMs) {
+            await tracked(stream.write(`: ping\n${idField()}\n`));
+            continue;
+          }
           let timer: NodeJS.Timeout | undefined;
-          const woken = await new Promise<boolean>((resolve) => {
-            wake = () => resolve(true);
-            timer = setTimeout(() => resolve(false), heartbeatMs);
+          await new Promise<void>((resolve) => {
+            wake = resolve;
+            timer = setTimeout(resolve, heartbeatMs - quiet);
           });
           clearTimeout(timer);
-          if (!woken && !dirty) await stream.write(": ping\n\n");
           continue;
         }
         dirty = false;
         const batch = read();
-        for (const frame of batch.frames) await stream.writeSSE(frame);
+        for (const frame of batch.frames) await tracked(stream.writeSSE(frame));
         if (batch.done) return;
         if (batch.more) dirty = true;
       }
@@ -61,7 +77,7 @@ export function tailSSE(
 
 /**
  * Streams the run's events after row id `after` as SSE, then live-tails until its terminal event,
- * with a `: ping` comment after each `heartbeatMs` of quiet.
+ * with a `: ping` comment after each `heartbeatMs` with nothing written.
  */
 export function streamRunEvents(
   c: Context<AppEnv>,

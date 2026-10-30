@@ -175,10 +175,78 @@ test("?types= and ?agentId= filter the stream", async () => {
 
 test("a quiet stream pings, and a disconnect releases its listener", async () => {
   const s = sseReader(await stream());
-  expect(await s.next()).toEqual({ comment: "ping" });
+  expect(await s.next()).toEqual({ id: "0" });
+  expect(await s.next()).toEqual({ comment: "ping", id: "0" });
   expect(runEvents.listenerCount(anyRun)).toBe(1);
   await s.cancel();
   await until(() => runEvents.listenerCount(anyRun) === 0);
+});
+
+const waiting = (runId: RunId) =>
+  post(runId, "run.waiting", {
+    request: { kind: "question", requestId: "req_1", prompt: "which?" },
+  });
+
+/** Resolves true once `count` pings arrive within `ms`, false if the stream ends or time runs out first. */
+const pings = (s: ReturnType<typeof sseReader>, count: number, ms: number) =>
+  Promise.race([
+    (async () => {
+      for (let seen = 0; seen < count; ) {
+        const frame = await s.next();
+        if (!frame) return false;
+        if (frame.comment === "ping") seen++;
+      }
+      return true;
+    })(),
+    new Promise<boolean>((r) => setTimeout(() => r(false), ms)),
+  ]);
+
+test("a stream filtered to run.waiting keeps pinging every heartbeat while unrelated events flow", async () => {
+  const a = runningRun();
+  const s = sseReader(await stream("?types=run.waiting"));
+  let flowing = true;
+  const flow = (async () => {
+    while (flowing) {
+      await say(a.runId, "busy");
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  })();
+  try {
+    // heartbeatMs is 50, so three pings fit in 150 ms plus slack
+    expect(await pings(s, 3, 400)).toBe(true);
+  } finally {
+    flowing = false;
+    await flow;
+    await s.cancel();
+  }
+});
+
+test("a stream opened with no cursor sends its id before any event and with each ping, past filtered-out rows", async () => {
+  const a = runningRun();
+  const before = await say(a.runId, "before");
+  const s = sseReader(await stream("?types=run.waiting"));
+  expect(await s.next()).toEqual({ id: String(before) });
+  const skipped = await say(a.runId, "filtered out");
+  let ping = await s.next();
+  // a ping already due when `skipped` landed may still carry the open cursor
+  if (ping?.id === String(before)) ping = await s.next();
+  expect(ping).toEqual({ comment: "ping", id: String(skipped) });
+  await s.cancel();
+});
+
+test("a reconnect with the id from a stream's open gets the events published in between", async () => {
+  const a = runningRun();
+  await say(a.runId, "before");
+  const first = sseReader(await stream("?types=run.waiting"));
+  const opened = await first.next();
+  await first.cancel();
+  await say(a.runId, "while away");
+  const missed = await waiting(a.runId);
+  const again = sseReader(
+    await stream("?types=run.waiting", { "Last-Event-ID": opened?.id ?? "" }),
+  );
+  expect((await again.event())?.id).toBe(String(missed));
+  await again.cancel();
 });
 
 const poll = (query = "", signal?: AbortSignal) =>
@@ -292,6 +360,7 @@ test("?wait=0 answers at once", async () => {
 test.each([
   ["an after that isn't an event id", "?after=run_1", "invalid_cursor"],
   ["a Last-Event-ID-style negative", "?after=-1", "invalid_cursor"],
+  ["a cursor with trailing junk", "?after=evt_1%26x%3D2", "invalid_cursor"],
   ["an unknown type", "?types=claude.Message,run.progress", "invalid_query"],
   ["an empty types", "?types=", "invalid_query"],
 ])("%s gets 400 on both routes", async (_, query, code) => {
