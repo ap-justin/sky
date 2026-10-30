@@ -64,9 +64,10 @@ function sessionOptions(
   hooks: Options["hooks"],
   canUseTool: CanUseTool,
 ): Options {
-  // the session's tools can read their env; the event token stays with the runner, and an API key
-  // never reaches a nested `claude`, which must bill the subscription
-  const { AGENT_TOKEN: _, ANTHROPIC_API_KEY: __, ...env } = process.env;
+  // `env` replaces the subprocess env rather than adding to it, so it carries the project's own
+  // secrets (an ANTHROPIC_API_KEY among them) to the session's commands; the event token stays with
+  // the runner
+  const { AGENT_TOKEN: _, ...env } = process.env;
   return {
     cwd,
     resume: config.sessionId,
