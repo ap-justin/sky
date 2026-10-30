@@ -633,13 +633,59 @@ test("with a GitHub connector in its env, the session is told to publish through
   };
   try {
     vi.stubEnv("GITHUB_CONNECTOR", undefined);
-    expect(await start()).toEqual({ type: "preset", preset: "claude_code" });
+    const bare = (await start()) as { append?: string };
+    expect(bare.append).not.toContain("publish --title");
     vi.stubEnv("GITHUB_CONNECTOR", "conn_123");
     const prompt = await start();
     expect(prompt).toMatchObject({ type: "preset", preset: "claude_code" });
     const append = (prompt as { append?: string }).append ?? "";
     expect(append).toContain(" publish --title <title>");
     expect(append).toContain("instead of `git push` or `gh pr create`");
+    expect(append).toContain(
+      'env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"',
+    );
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("without a GitHub connector, the session is still told how to run the Kru checks", async () => {
+  vi.stubEnv("GITHUB_CONNECTOR", undefined);
+  try {
+    const query = scripted([init, success]);
+    await runSession(config, {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    });
+    const append =
+      (query.calls[0]?.options.systemPrompt as { append?: string } | undefined)
+        ?.append ?? "";
+    expect(append).not.toContain("publish --title");
+    expect(append).toContain(
+      'env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"',
+    );
+    expect(append).toContain('claude -p "/kru:text-fix"');
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("a project's ANTHROPIC_API_KEY reaches the session's commands; AGENT_TOKEN never does", async () => {
+  vi.stubEnv("ANTHROPIC_API_KEY", "sk-ant-api-secret");
+  vi.stubEnv("AGENT_TOKEN", "agent-secret");
+  try {
+    const query = scripted([init, success]);
+    await runSession(config, {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    });
+    const env = query.calls[0]?.options.env;
+    expect(env).toHaveProperty("ANTHROPIC_API_KEY", "sk-ant-api-secret");
+    expect(env).not.toHaveProperty("AGENT_TOKEN");
   } finally {
     vi.unstubAllEnvs();
   }
