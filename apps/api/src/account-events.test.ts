@@ -295,7 +295,7 @@ const parked = async () => {
   expect(runEvents.listenerCount(anyRun)).toBe(1);
 };
 
-// only the poll's own timers are faked, so a wake-up is the only way out before the wait runs out
+// whether `p` has settled, read without awaiting it; with setTimeout faked, only a wake-up settles a poll early
 const settled = (p: unknown) => {
   let done = false;
   void Promise.resolve(p).then(() => {

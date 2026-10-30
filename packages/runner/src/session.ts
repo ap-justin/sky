@@ -432,7 +432,7 @@ export async function runSession(
         });
       } else if (message.type === "assistant") {
         const parent = message.parent_tool_use_id;
-        // queued, not awaited: a slow API must not hold the loop while hooks queue ahead of the text
+        // queued, not awaited: the post waits behind every hook event already queued, and a slow API must not hold the loop
         for (const text of textOf(message.message.content))
           void post({
             type: "claude.Message",

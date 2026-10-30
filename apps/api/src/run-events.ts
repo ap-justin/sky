@@ -26,7 +26,7 @@ export const runEvents = {
   listenerCount: (runId: RunId | typeof anyRun) => emitter.listenerCount(runId),
 };
 
-/** The shared Event shape webhooks and the run stream send for a stored row of `agentId`'s run. */
+/** The shared Event shape webhooks, the event streams and the long poll send for a stored row of `agentId`'s run. */
 export const presentEvent = (
   row: typeof events.$inferSelect,
   agentId: AgentId,
