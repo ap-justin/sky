@@ -83,7 +83,7 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 
 `POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
 
-`wait_for_events` waits up to 30 seconds and returns as soon as something happens, with a `cursor` to pass back as `after` on the next call. Call it in a loop to follow every agent live without a public URL.
+`wait_for_events` waits up to 30 seconds and returns as soon as something happens, with a `cursor` to pass back as `after` on the next call. Call it in a loop to follow every agent live without a public URL. On a first call, use `status` for agents already waiting.
 
 ## Events
 
@@ -94,13 +94,13 @@ What an agent does arrives as events, each with `agentId` and `runId`:
 | `run.started` · `run.finished` · `run.failed` · `run.stopped`            | the run's lifecycle                                                   |
 | `run.waiting`                                                            | the agent needs an `answer` or an approval                            |
 | `run.resumed`                                                            | a question was answered or a tool call approved or denied             |
-| `claude.Message`                                                         | Claude wrote a message                                                |
+| `claude.Message`                                                         | Claude, or a subagent (with `parentToolUseId`), wrote a message       |
 | `claude.PreToolUse` · `claude.PostToolUse` · `claude.PostToolUseFailure` | a tool call starts, finishes or fails, with its input and output      |
 | `claude.SubagentStart` · `claude.SubagentStop`                           | a subagent starts or finishes                                         |
 | `claude.TaskCreated` · `claude.TaskCompleted`                            | a todo item is added or finished                                      |
 | `claude.Notification` · `claude.PreCompact` · `claude.FileChanged`       | Claude Code's notifications, context compaction, watched-file changes |
 
-The `claude.*` names are Claude Code's own hook names. Text fields are redacted (registered secrets and tokens) and then cut to 4 KB. `claude.*` events are kept for 7 days; `run.*` events are kept.
+The `claude.*` names are Claude Code's own hook names. Each text field is redacted (registered secrets and tokens) and then cut to 4,096 characters. `claude.*` events are kept for 7 days; `run.*` events are kept.
 
 Three ways to receive them:
 
