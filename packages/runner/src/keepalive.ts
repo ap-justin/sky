@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { request } from "node:http";
 
 /** The sprite's management socket; the Tasks API answers on it under virtual host `sprite`. */
@@ -10,19 +11,26 @@ const REQUEST_TIMEOUT_MS = 5_000;
 export type SpriteHold = { release: () => Promise<void> };
 
 /**
+ * The run's task name, hashed into the lowercase letters, digits and hyphens the Sprites API takes
+ * for a sprite's name: a run id's capitals and underscore fall outside them.
+ */
+const taskNameFor = (runId: string) =>
+  `sky-run-${createHash("sha256").update(runId).digest("hex").slice(0, 24)}`;
+
+/**
  * Keeps the sprite from pausing while the runner lives: a sprite pauses once idle and drops
  * open connections even on a warm pause, so the runner holds a Tasks API task, refreshed on an
  * interval (a task lives an hour at most), and deletes it on `release`. Never throws: with no
  * socket (tests, local runs) it says so once on `warn`; a failed call is one line on `warn`.
  */
 export function holdSprite(options: {
-  name: string;
+  runId: string;
   warn: (message: string) => void;
   socketPath?: string;
   refreshMs?: number;
 }): SpriteHold {
   const socketPath = options.socketPath ?? SPRITE_API_SOCKET;
-  const path = `/v1/tasks/${encodeURIComponent(options.name)}`;
+  const path = `/v1/tasks/${taskNameFor(options.runId)}`;
   let timer: NodeJS.Timeout | undefined;
   let stopped = false;
 
@@ -33,10 +41,8 @@ export function holdSprite(options: {
       return true;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
-      if (
-        socketFound === undefined &&
-        (code === "ENOENT" || code === "ECONNREFUSED")
-      ) {
+      // only a missing socket means no sprite; a refused one may be an API not up yet, so keep trying
+      if (socketFound === undefined && code === "ENOENT") {
         options.warn(
           `runner: no sprite API at ${socketPath}; the sprite may pause while the run is idle`,
         );

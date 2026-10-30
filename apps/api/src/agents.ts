@@ -168,10 +168,29 @@ const agentRow = (tx: Tx, id: AgentId) => {
 const archived = (c: Context) =>
   apiError(c, 409, "agent_archived", "the agent is archived");
 
-/** Decides one of the agent's requests and wakes the runner long-polling for it. */
-function decide(c: Context<AppEnv>, agentId: AgentId, decision: Decision) {
+// a wake still running past this is abandoned: the runner asks again once its sprite is up
+const WAKE_TIMEOUT_MS = 15_000;
+
+/**
+ * Decides one of the agent's requests, wakes the runner long-polling for it, then execs a no-op in
+ * its sprite: a paused sprite's runner never sees the decision until something resumes the
+ * sprite, and any exec does.
+ */
+async function decide(
+  c: Context<AppEnv>,
+  sprites: SpritesClient,
+  log: (line: string) => void,
+  agentId: AgentId,
+  decision: Decision,
+) {
   const outcome = c.var.db.transaction(
-    (tx) => decideRequest(tx, agentId, decision),
+    (tx) => {
+      const decided = decideRequest(tx, agentId, decision);
+      if (decided.kind !== "decided") return decided;
+      const found = agentWithSprite(tx, agentId);
+      if (!found) throw new Error(`agent ${agentId} vanished mid-transaction`);
+      return { ...decided, spriteName: found.spriteName };
+    },
     { behavior: "immediate" },
   );
   switch (outcome.kind) {
@@ -194,6 +213,14 @@ function decide(c: Context<AppEnv>, agentId: AgentId, decision: Decision) {
   }
   if (outcome.enqueued > 0) c.var.nudgeDeliveries();
   requestDecisions.publish(decision.requestId);
+  // a failed wake is only logged: the decision is already recorded
+  try {
+    await execInSprite(sprites, outcome.spriteName, ["true"], {
+      timeout: WAKE_TIMEOUT_MS,
+    });
+  } catch (err) {
+    log(`waking ${outcome.spriteName} for ${outcome.run.id} failed: ${err}`);
+  }
   return c.json({ run: presentRun(outcome.run, null) }, 200);
 }
 
@@ -507,10 +534,14 @@ export function agentRoutes(
     .post("/:id/answers", agentParam, jsonBody, body(AnswerInput), (c) => {
       const { id } = c.req.valid("param");
       const { requestId, answer } = c.req.valid("json");
-      return decide(c, id, { requestId, decision: "answer", answer });
+      return decide(c, sprites, log, id, {
+        requestId,
+        decision: "answer",
+        answer,
+      });
     })
     .post("/:id/approvals", agentParam, jsonBody, body(ApprovalInput), (c) =>
-      decide(c, c.req.valid("param").id, c.req.valid("json")),
+      decide(c, sprites, log, c.req.valid("param").id, c.req.valid("json")),
     )
     .get("/:id", agentParam, (c) => {
       const { id } = c.req.valid("param");

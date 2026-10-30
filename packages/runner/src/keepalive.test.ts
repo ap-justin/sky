@@ -1,5 +1,5 @@
 import { once } from "node:events";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -27,6 +27,8 @@ type Call = { method?: string; url?: string; host?: string; body: string };
 async function spriteApi(status = 200) {
   const calls: Call[] = [];
   api = createServer((req, res) => {
+    // a 400 for a task name outside lowercase letters, digits and hyphens, as the Sprites API does for a sprite name
+    const named = /^\/v1\/tasks\/[a-z0-9-]+$/.test(req.url ?? "");
     let body = "";
     req.on("data", (d) => (body += d));
     req.on("end", () => {
@@ -36,7 +38,7 @@ async function spriteApi(status = 200) {
         host: req.headers.host,
         body,
       });
-      res.writeHead(status).end();
+      res.writeHead(named ? status : 400).end();
     });
   });
   const socketPath = join(dir, "api.sock");
@@ -49,7 +51,7 @@ test("holds a task named for the run, refreshes it, and deletes it on release", 
   const { calls, socketPath } = await spriteApi();
   const warnings: string[] = [];
   const hold = holdSprite({
-    name: "run_1",
+    runId: "run_1",
     socketPath,
     refreshMs: 20,
     warn: (m) => warnings.push(m),
@@ -59,16 +61,17 @@ test("holds a task named for the run, refreshes it, and deletes it on release", 
   const settled = calls.length;
   await sleep(50);
 
+  const url = "/v1/tasks/sky-run-37ddff8ee13f1e57937fd048";
   const put = {
     method: "PUT",
-    url: "/v1/tasks/run_1",
+    url,
     host: "sprite",
     body: JSON.stringify({ expire: "5m" }),
   };
   expect(calls.length).toBe(settled);
   expect(calls.at(-1)).toEqual({
     method: "DELETE",
-    url: "/v1/tasks/run_1",
+    url,
     host: "sprite",
     body: "",
   });
@@ -78,10 +81,45 @@ test("holds a task named for the run, refreshes it, and deletes it on release", 
   expect(warnings).toEqual([]);
 });
 
+test("two runs in one sprite hold tasks under distinct valid names", async () => {
+  const { calls, socketPath } = await spriteApi();
+  const warnings: string[] = [];
+  for (const runId of [
+    "run_4kQ9zXbT2mN7pLw1Rv8sYc",
+    "run_4kQ9zXbT2mN7pLw1Rv8sYd",
+  ]) {
+    await holdSprite({
+      runId,
+      socketPath,
+      warn: (m) => warnings.push(m),
+    }).release();
+  }
+  expect(warnings).toEqual([]);
+  const urls = new Set(calls.map((c) => c.url));
+  expect(urls.size).toBe(2);
+});
+
+test("a socket that refuses the first call is warned about and tried again", async () => {
+  // connecting to a file that isn't a listening socket is refused, as a sprite API not yet up would be
+  const socketPath = join(dir, "api.sock");
+  writeFileSync(socketPath, "");
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 10,
+    warn: (m) => warnings.push(m),
+  });
+  await sleep(50);
+  await hold.release();
+  expect(warnings.length).toBeGreaterThanOrEqual(2);
+  expect(warnings[0]).toMatch(/ECONNREFUSED/);
+});
+
 test("with no sprite socket it says so once on warn and carries on", async () => {
   const warnings: string[] = [];
   const hold = holdSprite({
-    name: "run_1",
+    runId: "run_1",
     socketPath: join(dir, "absent.sock"),
     refreshMs: 10,
     warn: (m) => warnings.push(m),
@@ -96,7 +134,7 @@ test("a refused refresh is one warning per failure, and the hold keeps trying", 
   const { calls, socketPath } = await spriteApi(500);
   const warnings: string[] = [];
   const hold = holdSprite({
-    name: "run_1",
+    runId: "run_1",
     socketPath,
     refreshMs: 20,
     warn: (m) => warnings.push(m),

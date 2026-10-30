@@ -30,7 +30,7 @@ async function main(): Promise<void> {
   // a hangup from the exec session that started the runner is a stop, not a death
   process.once("SIGHUP", onSignal);
   // held through waits for a decision too: a paused sprite drops the long-poll and the event posts
-  const hold = holdSprite({ name: config.runId, warn });
+  const hold = holdSprite({ runId: config.runId, warn });
 
   try {
     process.exitCode = await runSession(config, {

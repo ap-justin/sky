@@ -9,15 +9,23 @@ import { createApp } from "./app.js";
 import { createDispatcher, type Dispatcher } from "./deliveries.js";
 import { mintId } from "./ids.js";
 import { failAbandonedWaits, failStaleRuns } from "./runs.js";
-import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
+import {
+  type SpritesWire,
+  spritesToken,
+  stubSprites,
+  testConfig,
+} from "./testing/sprites.js";
 
 const config = testConfig();
 const subscriberUrl = "https://hooks.example.com/sky";
 let db: Db;
 let app: ReturnType<typeof createApp>;
 let dispatcher: Dispatcher;
+let wire: SpritesWire;
+let logged: string[];
 
 beforeEach(() => {
+  logged = [];
   db = openDb(":memory:");
   migrate(db);
   // ahead of the real time ingestion stamps next_attempt_at with, so a fresh delivery is due
@@ -28,12 +36,12 @@ beforeEach(() => {
     log: () => {},
     now: () => clock,
   });
-  stubSprites();
+  wire = stubSprites();
   app = createApp({
     db,
     config,
     sprites: new SpritesClient(spritesToken),
-    log: () => {},
+    log: (line) => logged.push(line),
     nudgeDeliveries: dispatcher.nudge,
     longPollMs: 200,
   });
@@ -203,6 +211,32 @@ test.each([
   },
 );
 
+test.each([
+  ["an answer", question, { answer: "main" }, "answers"],
+  ["an approval", approval, { decision: "approve" }, "approvals"],
+] as const)(
+  "%s wakes the run's sprite, so a runner paused mid-wait gets it",
+  async (_, request, extra, verb) => {
+    const { requestId } = await waitingOn(request());
+    wire.sprites.add("sky-env_test");
+    const res = await decide(verb, { requestId, ...extra });
+    expect(res.status).toBe(200);
+    expect(wire.calls).toContain("exec sky-env_test - true");
+  },
+);
+
+test("a decision whose sprite can't be woken is still recorded", async () => {
+  const { requestId } = await waitingOn(question());
+  // the stub holds no such sprite, so the wake's exec gets a 404
+  const res = await decide("answers", { requestId, answer: "main" });
+  expect(res.status).toBe(200);
+  expect(wire.calls).toContain("exec sky-env_test - true");
+  expect(resumed()).toEqual([{ requestId, decision: "answered" }]);
+  expect(logged).toContainEqual(
+    expect.stringMatching(/^waking sky-env_test for run_test failed: /),
+  );
+});
+
 const errorCode = async (res: Response) =>
   ((await res.json()) as { error: { code: string } }).error.code;
 
@@ -221,6 +255,7 @@ test("an answer for an approval gets 409 wrong_kind", async () => {
   const { requestId } = await waitingOn(approval());
   const res = await decide("answers", { requestId, answer: "x" });
   expect([res.status, await errorCode(res)]).toEqual([409, "wrong_kind"]);
+  expect(wire.calls).not.toContain("exec sky-env_test - true");
 });
 
 test("a second decision gets 409 request_closed", async () => {
@@ -228,8 +263,10 @@ test("a second decision gets 409 request_closed", async () => {
   expect((await decide("answers", { requestId, answer: "a" })).status).toBe(
     200,
   );
+  const wakes = wire.calls.length;
   const res = await decide("answers", { requestId, answer: "b" });
   expect([res.status, await errorCode(res)]).toEqual([409, "request_closed"]);
+  expect(wire.calls).toHaveLength(wakes);
 });
 
 test("a request unknown to the agent gets 404", async () => {
