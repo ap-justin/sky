@@ -9,17 +9,20 @@ permissions:
   contents: read
 
 concurrency:
-  group: image-${{ github.ref }}
+  # the group binds before the job's `if:`, so a skipped branch run would still displace a pending main deploy
+  group: ${{ github.ref == 'refs/heads/main' && 'deploy-sky' || github.run_id }}
   cancel-in-progress: false
 
 jobs:
   image:
+    # deploys prod and pushes the hardcoded :main tag, so a manual run from another branch must not get this far
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: superfly/flyctl-actions/setup-flyctl@master
       - name: Log in to Fly registry
-        run: flyctl auth docker
+        run: echo "$FLY_API_TOKEN" | docker login registry.fly.io -u x --password-stdin
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
       - name: Build and push
@@ -30,3 +33,7 @@ jobs:
             -t "registry.fly.io/sky-justin:sha-${SHORT_SHA}" .
           docker push registry.fly.io/sky-justin:main
           docker push "registry.fly.io/sky-justin:sha-${SHORT_SHA}"
+      - name: Deploy to Fly
+        run: flyctl deploy -a sky-justin --image "registry.fly.io/sky-justin:sha-${GITHUB_SHA::7}" --ha=false
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
