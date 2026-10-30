@@ -175,11 +175,12 @@ async function waitForProvisioned(
 ): Promise<Waited> {
   const { id, name } = start.env;
   const startedAt = io.now();
-  out.progress(`provisioning ${name} (${id})…`);
+  // arm before the progress line: until a SIGINT listener exists, a Ctrl-C the line prompts takes node's default death with no note
   const disarm = io.onInterrupt(
     `interrupted; ${name} (${id}) keeps provisioning on the server. Re-run sky apply to pick it up`,
   );
   try {
+    out.progress(`provisioning ${name} (${id})…`);
     return await poll();
   } finally {
     disarm();
