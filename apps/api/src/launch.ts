@@ -6,7 +6,12 @@ import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";
-import { REPO_DIR, RUNNER_DIR, WORKTREES_DIR } from "./provision.js";
+import {
+  REPO_DIR,
+  RUNNER_DIR,
+  WITH_PACKAGE_MANAGERS,
+  WORKTREES_DIR,
+} from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import { failRun, isActive } from "./runs.js";
 import { openEnvSecrets, openRunEnvVars } from "./secrets.js";
@@ -16,7 +21,7 @@ const RUNNER = `${RUNNER_DIR}/runner.mjs`;
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
 // then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
 // the run id in argv is what `runnerPattern` matches; the runner itself ignores it
-const RUNNER_COMMAND = `set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
+const RUNNER_COMMAND = `${WITH_PACKAGE_MANAGERS} && set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
 
 const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
 
