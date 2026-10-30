@@ -64,7 +64,7 @@ export function envFileOf(
 const sha256 = (bytes: Uint8Array) =>
   createHash("sha256").update(bytes).digest("hex");
 
-// the live API's answer to a name outside [a-z0-9-], which the SDK raises as a 400 APIError
+// the live API's answer to a name outside its alphabet, which the SDK raises as a 400 APIError
 const VALID_NAME = /^[a-z0-9-]+$/;
 const invalidName = () =>
   HttpResponse.json(

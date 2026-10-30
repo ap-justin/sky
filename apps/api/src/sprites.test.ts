@@ -3,7 +3,7 @@ import { expect, test } from "vitest";
 import { spriteNameFor } from "./sprites.js";
 import { spritesToken, stubSprites } from "./testing/sprites.js";
 
-test("names a sprite in the API's lowercase-and-hyphen alphabet, deterministically and per env", () => {
+test("names a sprite in the API's lowercase, digit and hyphen alphabet, deterministically and per env", () => {
   const ids = ["env_q9shK0hzD63HUeS9mmcuHz", "env_Q9shK0hzD63HUeS9mmcuHz", "x"];
   const names = ids.map(spriteNameFor);
   for (const name of names) expect(name).toMatch(/^sky-[0-9a-f]{24}$/);
