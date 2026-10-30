@@ -1,13 +1,6 @@
 import { SpritesClient } from "@fly/sprites";
-import {
-  agents,
-  type Db,
-  environments,
-  migrate,
-  openDb,
-  runs,
-} from "@harness/db";
-import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
+import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
@@ -48,7 +41,7 @@ function env(id = "env_secrets"): EnvironmentId {
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `harness-${id}`,
+      spriteName: `sky-${id}`,
       checkpointId: "v1",
     })
     .run();

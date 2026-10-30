@@ -11,7 +11,7 @@ import type {
   RunRollup,
   RunStatus,
   WebhookId,
-} from "@harness/shared";
+} from "@sky/shared";
 import { type AnyColumn, sql } from "drizzle-orm";
 import {
   blob,

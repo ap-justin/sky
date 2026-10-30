@@ -19,7 +19,7 @@ const env = (over: Record<string, unknown> = {}) => ({
   id: "env_1",
   ...spec,
   status: "ready",
-  spriteName: "harness-env-1",
+  spriteName: "sky-env-1",
   checkpointId: "ckpt_1",
   failure: null,
   createdAt: "2026-10-30T00:00:00.000Z",
@@ -32,9 +32,9 @@ let lockFile: string;
 const writes: { method: string; body: unknown }[] = [];
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "harness-apply-"));
+  dir = mkdtempSync(join(tmpdir(), "sky-apply-"));
   file = join(dir, "env.yaml");
-  lockFile = join(dir, "harness-lock.json");
+  lockFile = join(dir, "sky-lock.json");
   writeFileSync(file, yaml);
   writes.length = 0;
 });
@@ -89,7 +89,7 @@ test("creates an absent env, waits for ready and writes the lock", async () => {
   expect(r.stdout).toBe("ready web env_1\n");
   expect(lock()).toEqual({
     envId: "env_1",
-    spriteName: "harness-env-1",
+    spriteName: "sky-env-1",
     checkpointId: "ckpt_1",
     specHash: specHash(spec),
   });
@@ -354,7 +354,7 @@ test("a missing file exits 2", async () => {
 
 test("missing config exits 2 before reading the API", async () => {
   const r = await runCli(["apply", file], {
-    env: { HARNESS_URL: undefined, HARNESS_API_KEY: undefined },
+    env: { SKY_URL: undefined, SKY_API_KEY: undefined },
   });
   expect(r.code).toBe(2);
   expect(r.stderr).toMatch(/no API URL/);
@@ -369,7 +369,7 @@ test("usage errors exit 2 with a pointer to --help", async () => {
   ]) {
     const r = await runCli(argv);
     expect(r.code, argv.join(" ")).toBe(2);
-    expect(r.stderr).toMatch(/Run 'harness --help' for usage\.\n$/);
+    expect(r.stderr).toMatch(/Run 'sky --help' for usage\.\n$/);
     expect(r.stdout).toBe("");
   }
 });
@@ -484,18 +484,18 @@ test("Ctrl-C during a wait says the env keeps provisioning and how to pick it up
   const r = await runCli(["apply", file]);
   expect(r.code).toBe(0);
   expect(r.interruptNotes).toEqual([
-    "interrupted; web (env_1) keeps provisioning on the server — re-run harness apply to pick it up",
+    "interrupted; web (env_1) keeps provisioning on the server — re-run sky apply to pick it up",
   ]);
   expect(r.armedAtExit).toBe(0);
 });
 
-test("a HARNESS_URL without a scheme exits 2 showing the expected form, with no request", async () => {
+test("a SKY_URL without a scheme exits 2 showing the expected form, with no request", async () => {
   const r = await runCli(["apply", file], {
-    env: { HARNESS_URL: "harness-api.fly.dev" },
+    env: { SKY_URL: "sky-api.fly.dev" },
   });
   expect(r.code).toBe(2);
   expect(r.stderr).toBe(
-    'harness: HARNESS_URL "harness-api.fly.dev" is not a URL; expected https://<host>, e.g. https://harness-api.fly.dev\n',
+    'sky: SKY_URL "sky-api.fly.dev" is not a URL; expected https://<host>, e.g. https://sky-api.fly.dev\n',
   );
 });
 
@@ -511,14 +511,14 @@ test("a rejected API key exits 2 naming where the key came from", async () => {
   const r = await runCli(["apply", file]);
   expect(r.code).toBe(2);
   expect(r.stderr).toBe(
-    "harness: invalid API key (unauthorized); check the key from HARNESS_API_KEY\n",
+    "sky: invalid API key (unauthorized); check the key from SKY_API_KEY\n",
   );
   const json = await runCli(["apply", "--json", file]);
   expect(json.code).toBe(2);
   expect(JSON.parse(json.stderr)).toEqual({
     error: {
       code: "unauthorized",
-      message: "invalid API key; check the key from HARNESS_API_KEY",
+      message: "invalid API key; check the key from SKY_API_KEY",
     },
   });
 });

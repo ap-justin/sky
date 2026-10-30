@@ -7,8 +7,8 @@ import {
   openDb,
   runs,
   webhookDeliveries,
-} from "@harness/db";
-import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+} from "@sky/db";
+import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -79,7 +79,7 @@ test.each([
 );
 
 const config = testConfig();
-const subscriberUrl = "https://hooks.example.com/harness";
+const subscriberUrl = "https://hooks.example.com/sky";
 let db: Db;
 let app: ReturnType<typeof createApp>;
 let dispatcher: Dispatcher;
@@ -140,7 +140,7 @@ function runningRun() {
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: "harness-env_test",
+      spriteName: "sky-env_test",
       checkpointId: "v1",
     })
     .run();
@@ -245,9 +245,9 @@ test("a subscriber answering 500, 500, 200 gets three signed attempts of one eve
   ]);
   for (const { headers, body } of received) {
     expect(headers.get("content-type")).toBe("application/json");
-    expect(headers.get("harness-event-id")).toBe(`evt_${eventId}`);
-    expect(headers.get("harness-event-type")).toBe("run.finished");
-    const signature = headers.get("harness-signature") ?? "";
+    expect(headers.get("sky-event-id")).toBe(`evt_${eventId}`);
+    expect(headers.get("sky-event-type")).toBe("run.finished");
+    const signature = headers.get("sky-signature") ?? "";
     expect(await verify(signature, body, lastSentAt)).toBe(true);
     expect(JSON.parse(body)).toEqual({
       id: `evt_${eventId}`,
@@ -290,7 +290,7 @@ test("each attempt is signed with its own clock second, so a retry after 300 s s
   expect(received).toHaveLength(6);
   expect(sentAt.at(-1)).toBeGreaterThan((sentAt[0] ?? 0) + 300);
   for (const [i, { headers, body }] of received.entries()) {
-    const signature = headers.get("harness-signature") ?? "";
+    const signature = headers.get("sky-signature") ?? "";
     expect(signature.split(",")[0]).toBe(`t=${sentAt[i]}`);
     expect(await verify(signature, body, sentAt[i] ?? 0)).toBe(true);
   }

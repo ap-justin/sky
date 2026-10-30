@@ -7,7 +7,7 @@ const env = {
   repo: "ap-justin/kru",
   setup: "pnpm install",
   status: "ready",
-  spriteName: "harness-kru",
+  spriteName: "sky-kru",
   checkpointId: "cp_abc",
 };
 

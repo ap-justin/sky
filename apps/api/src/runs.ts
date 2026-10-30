@@ -1,4 +1,4 @@
-import { agents, type Db, events, runRequests, runs } from "@harness/db";
+import { agents, type Db, events, runRequests, runs } from "@sky/db";
 import {
   type AgentId,
   type AgentStatus,
@@ -7,7 +7,7 @@ import {
   RunStatus,
   runTransitions,
   type Usage,
-} from "@harness/shared";
+} from "@sky/shared";
 import { and, count, eq, inArray, isNull, lt, sql } from "drizzle-orm";
 import type { SQLiteColumn } from "drizzle-orm/sqlite-core";
 import { enqueueDeliveries } from "./deliveries.js";

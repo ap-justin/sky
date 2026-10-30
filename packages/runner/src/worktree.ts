@@ -7,7 +7,7 @@ import {
   agentBranch,
   type Rollup,
   type RunRollup,
-} from "@harness/shared";
+} from "@sky/shared";
 
 const run = promisify(execFile);
 
@@ -64,9 +64,9 @@ export async function commitAll(options: {
   await git(
     options.cwd,
     "-c",
-    "user.name=harness-agent",
+    "user.name=sky-agent",
     "-c",
-    "user.email=agent@harness.local",
+    "user.email=agent@sky.local",
     "-c",
     "commit.gpgsign=false",
     "commit",

@@ -8,7 +8,7 @@ import { afterAll, beforeAll, expect, test } from "vitest";
 
 // the built binary in a child process: exit codes, streams and real stdin, which an in-process run can't show
 const pkg = join(import.meta.dirname, "..");
-const bin = join(pkg, "dist", "bundle", "harness.mjs");
+const bin = join(pkg, "dist", "bundle", "sky.mjs");
 
 const provisioningEnv = {
   id: "env_slow",
@@ -18,7 +18,7 @@ const provisioningEnv = {
   concurrency: 3,
   approvalPolicy: [],
   status: "provisioning",
-  spriteName: "harness-env-slow",
+  spriteName: "sky-env-slow",
   checkpointId: null,
   failure: null,
   createdAt: "2026-10-30T00:00:00.000Z",
@@ -56,7 +56,7 @@ beforeAll(async () => {
 
 afterAll(() => new Promise<void>((resolve) => api.close(() => resolve())));
 
-function harness(
+function sky(
   args: string[],
   opts: { env?: Record<string, string>; stdin?: string } = {},
 ) {
@@ -66,7 +66,7 @@ function harness(
         // a fresh HOME so no real config file is read
         env: {
           PATH: process.env.PATH ?? "",
-          HOME: mkdtempSync(join(tmpdir(), "harness-bin-")),
+          HOME: mkdtempSync(join(tmpdir(), "sky-bin-")),
           ...opts.env,
         },
         stdio: ["pipe", "pipe", "pipe"],
@@ -86,21 +86,21 @@ function harness(
 }
 
 test("--help goes to stdout and exits 0", async () => {
-  const r = await harness(["--help"]);
+  const r = await sky(["--help"]);
   expect(r.code).toBe(0);
   expect(r.stdout).toMatch(/^Usage:/);
   expect(r.stderr).toBe("");
 });
 
 test("a usage error exits 2 with nothing on stdout", async () => {
-  const r = await harness(["apply"]);
+  const r = await sky(["apply"]);
   expect(r.code).toBe(2);
   expect(r.stdout).toBe("");
-  expect(r.stderr).toMatch(/Run 'harness --help' for usage/);
+  expect(r.stderr).toMatch(/Run 'sky --help' for usage/);
 });
 
 test("no configuration exits 2", async () => {
-  const r = await harness(["secret", "set", "env_1", "TOKEN"], { stdin: "v" });
+  const r = await sky(["secret", "set", "env_1", "TOKEN"], { stdin: "v" });
   expect(r.code).toBe(2);
   expect(r.stderr).toMatch(/no API URL/);
 });
@@ -110,18 +110,18 @@ test("an unreachable API exits 1", async () => {
   await new Promise<void>((resolve) => closed.listen(0, "127.0.0.1", resolve));
   const url = `http://127.0.0.1:${(closed.address() as AddressInfo).port}`;
   await new Promise((resolve) => closed.close(resolve));
-  const r = await harness(["secret", "set", "env_1", "TOKEN"], {
-    env: { HARNESS_URL: url, HARNESS_API_KEY: "k" },
+  const r = await sky(["secret", "set", "env_1", "TOKEN"], {
+    env: { SKY_URL: url, SKY_API_KEY: "k" },
     stdin: "v",
   });
   expect(r.code).toBe(1);
-  expect(r.stderr).toBe(`harness: cannot reach ${url}: ECONNREFUSED\n`);
+  expect(r.stderr).toBe(`sky: cannot reach ${url}: ECONNREFUSED\n`);
 });
 
 test("a piped secret reaches the API and neither output stream", async () => {
   const value = "piped-secret-value-xyz";
-  const r = await harness(["secret", "set", "env_1", "TOKEN"], {
-    env: { HARNESS_URL: apiUrl, HARNESS_API_KEY: "test-key" },
+  const r = await sky(["secret", "set", "env_1", "TOKEN"], {
+    env: { SKY_URL: apiUrl, SKY_API_KEY: "test-key" },
     stdin: `${value}\n`,
   });
   expect(r.code).toBe(0);
@@ -135,19 +135,19 @@ test("a piped secret reaches the API and neither output stream", async () => {
 });
 
 test("Ctrl-C while waiting says the env keeps provisioning, then dies by SIGINT", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "harness-bin-apply-"));
+  const dir = mkdtempSync(join(tmpdir(), "sky-bin-apply-"));
   const file = join(dir, "env.yaml");
   writeFileSync(file, "name: web\nrepo: acme/web\nsetup: pnpm install\n");
   writeFileSync(
-    join(dir, "harness-lock.json"),
+    join(dir, "sky-lock.json"),
     JSON.stringify({ envId: "env_slow" }),
   );
   const child = spawn(process.execPath, [bin, "apply", file], {
     env: {
       PATH: process.env.PATH ?? "",
       HOME: dir,
-      HARNESS_URL: apiUrl,
-      HARNESS_API_KEY: "k",
+      SKY_URL: apiUrl,
+      SKY_API_KEY: "k",
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -166,6 +166,6 @@ test("Ctrl-C while waiting says the env keeps provisioning, then dies by SIGINT"
   expect({ code, signal }).toEqual({ code: null, signal: "SIGINT" });
   expect(stdout).toBe("");
   expect(stderr).toContain(
-    "harness: interrupted; web (env_slow) keeps provisioning on the server — re-run harness apply to pick it up\n",
+    "sky: interrupted; web (env_slow) keeps provisioning on the server — re-run sky apply to pick it up\n",
   );
 });

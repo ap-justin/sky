@@ -1,10 +1,6 @@
 import type { SpritesClient } from "@fly/sprites";
-import {
-  type Db,
-  type environmentFailureSteps,
-  environments,
-} from "@harness/db";
-import type { EnvironmentId } from "@harness/shared";
+import { type Db, type environmentFailureSteps, environments } from "@sky/db";
+import type { EnvironmentId } from "@sky/shared";
 import { eq, sql } from "drizzle-orm";
 import { type KnownSecrets, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
@@ -19,7 +15,7 @@ import {
 export const REPO_DIR = "/workspace/repo";
 // the runner's worktrees point at the clone, so they go when it does
 export const WORKTREES_DIR = "/workspace/worktrees";
-export const RUNNER_DIR = "/opt/harness";
+export const RUNNER_DIR = "/opt/sky";
 // = the version in packages/runner/package.json; the runner bundle leaves the SDK external
 const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
 // no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep
@@ -85,21 +81,17 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
       await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR]);
       await execNoisy(
         ["git", "clone", cloneUrl(env.repo), REPO_DIR],
-        "/tmp/harness-clone.log",
+        "/tmp/sky-clone.log",
       );
       begin("setup");
-      await execNoisy(["sh", "-c", installRunnerSdk], "/tmp/harness-sdk.log");
+      await execNoisy(["sh", "-c", installRunnerSdk], "/tmp/sky-sdk.log");
       await execNoisy(
         ["bash", "-c", env.setup],
-        "/tmp/harness-setup.log",
+        "/tmp/sky-setup.log",
         REPO_DIR,
       );
       begin("checkpoint");
-      const checkpointId = await checkpointSprite(
-        sprites,
-        name,
-        "harness setup",
-      );
+      const checkpointId = await checkpointSprite(sprites, name, "sky setup");
       db.update(environments)
         .set({ status: "ready", checkpointId, failureStep: null })
         .where(eq(environments.id, env.id))

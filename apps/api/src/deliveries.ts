@@ -1,12 +1,6 @@
 import { createHmac } from "node:crypto";
-import {
-  type Db,
-  events,
-  runs,
-  webhookDeliveries,
-  webhooks,
-} from "@harness/db";
-import type { AgentId, EventType } from "@harness/shared";
+import { type Db, events, runs, webhookDeliveries, webhooks } from "@sky/db";
+import type { AgentId, EventType } from "@sky/shared";
 import { and, asc, eq, lte } from "drizzle-orm";
 import { presentEvent } from "./run-events.js";
 import type { Tx } from "./runs.js";
@@ -21,7 +15,7 @@ const MAX_RETRY_MS = 3_600_000;
 const MAX_ERROR_LENGTH = 1000;
 
 /**
- * The `Harness-Signature` header for one delivery: `t=<unix seconds>,v1=<hex>`, where hex is
+ * The `Sky-Signature` header for one delivery: `t=<unix seconds>,v1=<hex>`, where hex is
  * HMAC-SHA256 keyed with the UTF-8 bytes of `key` over `<t>.<raw body>`. A receiver recomputes it
  * over the exact bytes it received and rejects a `t` too far from its own clock.
  */
@@ -121,9 +115,9 @@ export function createDispatcher({
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          "Harness-Event-Id": id,
-          "Harness-Event-Type": event.type,
-          "Harness-Signature": signatureHeader(signingKey, body, t),
+          "Sky-Event-Id": id,
+          "Sky-Event-Type": event.type,
+          "Sky-Signature": signatureHeader(signingKey, body, t),
         },
         body,
         redirect: "manual",

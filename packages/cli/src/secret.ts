@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@harness/shared";
+import { EnvironmentId } from "@sky/shared";
 import type { Api } from "./api.js";
 import type { Io } from "./cli.js";
 import { type Output, UsageError } from "./output.js";

@@ -1,6 +1,6 @@
-import { type Db, environments, runEnvVars, secrets } from "@harness/db";
-import { EnvironmentId, type RunId } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
+import { type Db, environments, runEnvVars, secrets } from "@sky/db";
+import { EnvironmentId, type RunId } from "@sky/shared";
 import { and, asc, eq, isNotNull, lte } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
@@ -44,7 +44,7 @@ const reservedNames = new Set([
 export const isReservedName = (name: string) => reservedNames.has(name);
 
 export const reservedName = (c: Context, name: string) =>
-  apiError(c, 400, "reserved_name", `${name} is reserved for the harness`);
+  apiError(c, 400, "reserved_name", `${name} is reserved for the sky`);
 
 // a value is registered under its own nonce, so one replaced or deleted mid-run stays scrubbed
 // from the events of a runner that still holds it

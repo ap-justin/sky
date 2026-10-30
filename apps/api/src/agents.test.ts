@@ -2,8 +2,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, environments, migrate, openDb, runs } from "@harness/db";
-import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { type Db, environments, migrate, openDb, runs } from "@sky/db";
+import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -27,7 +27,7 @@ let app: ReturnType<typeof createApp>;
 let wire: SpritesWire;
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "harness-agents-"));
+  dir = mkdtempSync(join(tmpdir(), "sky-agents-"));
   writeFileSync(join(dir, "runner.mjs"), bundle);
   db = openDb(":memory:");
   migrate(db);
@@ -63,12 +63,12 @@ function readyEnv(
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `harness-${id}`,
+      spriteName: `sky-${id}`,
       checkpointId: "v1",
       ...overrides,
     })
     .run();
-  wire.sprites.add(`harness-${id}`);
+  wire.sprites.add(`sky-${id}`);
   return id;
 }
 
@@ -130,19 +130,19 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   const envId = readyEnv();
   const { agent, run } = await launched(envId);
   await sessionOpened();
-  const sprite = `harness-${envId}`;
+  const sprite = `sky-${envId}`;
   expect(wire.calls).toEqual([
-    `exec ${sprite} - sha256sum /opt/harness/runner.mjs`,
+    `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
     // written beside it, then renamed over it: a node starting on the bundle never reads it half-written
-    `write ${sprite} /opt/harness/runner.mjs.${run.id}`,
-    `exec ${sprite} - mv -f /opt/harness/runner.mjs.${run.id} /opt/harness/runner.mjs`,
+    `write ${sprite} /opt/sky/runner.mjs.${run.id}`,
+    `exec ${sprite} - mv -f /opt/sky/runner.mjs.${run.id} /opt/sky/runner.mjs`,
     `write ${sprite} /workspace/runs/${run.id}.prompt`,
     `write ${sprite} /workspace/runs/${run.id}.env`,
     expect.stringMatching(`^session ${sprite} /workspace/repo bash -c `),
   ]);
-  expect(
-    new TextDecoder().decode(wire.files.get("/opt/harness/runner.mjs")),
-  ).toBe(bundle);
+  expect(new TextDecoder().decode(wire.files.get("/opt/sky/runner.mjs"))).toBe(
+    bundle,
+  );
   expect(
     new TextDecoder().decode(
       wire.files.get(`/workspace/runs/${run.id}.prompt`),
@@ -153,9 +153,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
   // detachable: the process outlives the socket, which the API closes once the launch window passes
   expect(session).toMatchObject({ detachable: true, tty: true });
   await vi.waitFor(() => expect(wire.openSockets).toBe(0));
-  expect(session?.argv.join(" ")).toContain(
-    "exec node /opt/harness/runner.mjs",
-  );
+  expect(session?.argv.join(" ")).toContain("exec node /opt/sky/runner.mjs");
   expect(session?.env).toEqual({
     AGENT_ID: agent.id,
     RUN_ID: run.id,
@@ -240,7 +238,7 @@ test("a runner session that fails to open fails the run and deletes the env file
     expect((await getRun(agent.id, run.id)).body.status).toBe("failed"),
   );
   expect(wire.calls).toContain(
-    `exec harness-${envId} - rm -f /workspace/runs/${run.id}.env`,
+    `exec sky-${envId} - rm -f /workspace/runs/${run.id}.env`,
   );
 });
 
@@ -268,7 +266,7 @@ test("secrets travel in the env file only: never an exec URL, argv, the run row,
 });
 
 test("a sprite already holding the current bundle gets no upload", async () => {
-  wire.files.set("/opt/harness/runner.mjs", new TextEncoder().encode(bundle));
+  wire.files.set("/opt/sky/runner.mjs", new TextEncoder().encode(bundle));
   const envId = readyEnv();
   await launched(envId);
   await sessionOpened();
@@ -679,7 +677,7 @@ test("GET of an ended run returns its branch and its diff against the env's base
     secretNames: [],
   });
   expect(wire.calls.at(-1)).toBe(
-    `exec harness-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
+    `exec sky-${envId} /workspace/repo git diff origin/HEAD...claude/${agent.id}`,
   );
 });
 
@@ -860,7 +858,7 @@ test("GET of an ended run whose branch never existed has a null diff", async () 
 
 test("GET while the sprite is unreachable gets 502", async () => {
   const { agent, run, envId } = await finishedRun();
-  wire.sprites.delete(`harness-${envId}`);
+  wire.sprites.delete(`sky-${envId}`);
   const { status, body } = await getRun(agent.id, run.id);
   expect(status).toBe(502);
   expect(body).toMatchObject({ error: { code: "sprite_unreachable" } });
@@ -1114,7 +1112,7 @@ const action = (agentId: string, verb: "stop" | "archive") =>
     headers: auth,
   });
 
-const runnerPattern = (runId: string) => `/opt/harness/runner\\.mjs ${runId}$`;
+const runnerPattern = (runId: string) => `/opt/sky/runner\\.mjs ${runId}$`;
 
 test("stop SIGTERMs the run's runner, marks the run stopped and frees its cap slot", async () => {
   const envId = readyEnv({ concurrency: 1 });
@@ -1132,10 +1130,10 @@ test("stop SIGTERMs the run's runner, marks the run stopped and frees its cap sl
   });
   // the runner's argv carries its run id, so the match signals this run's runner only
   expect(wire.sessions[0]?.argv.join(" ")).toContain(
-    'exec node /opt/harness/runner.mjs "$RUN_ID"',
+    'exec node /opt/sky/runner.mjs "$RUN_ID"',
   );
   expect(wire.calls.at(-1)).toBe(
-    `exec harness-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+    `exec sky-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
   );
   expect(
     db.$client.prepare("select type from events order by id").all(),
@@ -1180,7 +1178,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   ).toEqual({ status: "idle" });
   // the wait is bounded on the sprite, past the 30 s archive allows
   const wait = wire.calls.at(-1) ?? "";
-  expect(wait.startsWith(`exec harness-${envId} - bash -c `)).toBe(true);
+  expect(wait.startsWith(`exec sky-${envId} - bash -c `)).toBe(true);
   expect(wait).toContain("seq 30");
 
   alive = false;
@@ -1192,7 +1190,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
 
 test("a follow-up whose wait for the previous runner can't reach the sprite gets 502 and starts nothing", async () => {
   const { agent, envId } = await finishedRun();
-  wire.sprites.delete(`harness-${envId}`);
+  wire.sprites.delete(`sky-${envId}`);
   const res = await followUp(agent.id, { prompt: "again" });
   expect(res.status).toBe(502);
   expect(await res.json()).toMatchObject({
@@ -1219,7 +1217,7 @@ test("stopping an agent with no active run is a 200 no-op that never wakes the s
 
 test("a stop whose signal can't reach the sprite still stops the run, and logs it", async () => {
   const { agent, run, envId } = await runningRun();
-  wire.sprites.delete(`harness-${envId}`);
+  wire.sprites.delete(`sky-${envId}`);
   const res = await action(agent.id, "stop");
   expect(res.status).toBe(200);
   expect(await res.json()).toMatchObject({ run: { status: "stopped" } });
@@ -1260,7 +1258,7 @@ test("stop or archive without a bearer gets 401 and touches nothing", async () =
 
 const worktreeRemoval = (envId: string, agentId: string) =>
   new RegExp(
-    `^exec harness-${envId} /workspace/repo bash -c .*git worktree remove --force "\\$1".* _ /workspace/worktrees/${agentId}`,
+    `^exec sky-${envId} /workspace/repo bash -c .*git worktree remove --force "\\$1".* _ /workspace/worktrees/${agentId}`,
   );
 
 test("archive stops the active run, waits for its runner, then removes the worktree and keeps the branch", async () => {
@@ -1276,7 +1274,7 @@ test("archive stops the active run, waits for its runner, then removes the workt
   });
   const [signal, removal] = wire.calls.slice(-2);
   expect(signal).toBe(
-    `exec harness-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
+    `exec sky-${envId} - pkill -TERM -f ${runnerPattern(run.id)}`,
   );
   expect(removal).toMatch(worktreeRemoval(envId, agent.id));
   // the runner commits after SIGTERM, so removal waits until no process matches it
@@ -1340,7 +1338,7 @@ test.each([
   [
     "the sprite is unreachable",
     (w: SpritesWire, envId: string) => {
-      w.sprites.delete(`harness-${envId}`);
+      w.sprites.delete(`sky-${envId}`);
     },
   ],
 ])("an archive where %s gets 502 and stays archived", async (_, breakIt) => {
@@ -1554,7 +1552,7 @@ test("an envVar a runner echoes is redacted from the stored event while it is he
 
 test.each([
   ["a reserved name", { envVars: { PATH: "/evil" } }, "reserved_name"],
-  ["a harness name", { envVars: { AGENT_TOKEN: "x" } }, "reserved_name"],
+  ["a sky name", { envVars: { AGENT_TOKEN: "x" } }, "reserved_name"],
   ["an invalid name", { envVars: { "1X": "y" } }, "invalid_body"],
   [
     "a TTL over a day",

@@ -92,7 +92,7 @@ test("a branch whose worktree directory is gone is checked out again, keeping it
   expect(git(path, "rev-parse", "HEAD")).toBe(head);
 });
 
-test("commits every change on the agent branch as harness-agent, and never pushes", async () => {
+test("commits every change on the agent branch as sky-agent, and never pushes", async () => {
   const path = await ensureWorktree({
     repoDir,
     worktreesDir,
@@ -105,7 +105,7 @@ test("commits every change on the agent branch as harness-agent, and never pushe
   );
   expect(git(path, "status", "--porcelain")).toBe("");
   expect(git(path, "log", "-1", "--format=%an <%ae>|%s")).toBe(
-    "harness-agent <agent@harness.local>|agent agt_1 run run_7",
+    "sky-agent <agent@sky.local>|agent agt_1 run run_7",
   );
   expect(git(origin, "branch", "--list", "claude/*")).toBe("");
 });

@@ -1,6 +1,6 @@
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, migrate, openDb } from "@harness/db";
+import { type Db, migrate, openDb } from "@sky/db";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
 import { createDispatcher } from "./deliveries.js";
@@ -18,7 +18,7 @@ const SWEEP_EVERY_MS = 60_000;
  * run envVars past their TTL. Webhook deliveries left pending resume at once.
  */
 export function boot(config: Config, log: (line: string) => void) {
-  const db = openDb(join(config.dataDir, "harness.db"));
+  const db = openDb(join(config.dataDir, "sky.db"));
   migrate(db);
   failInterruptedProvisioning(db);
   const dispatcher = createDispatcher({

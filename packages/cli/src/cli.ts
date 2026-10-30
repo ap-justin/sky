@@ -20,15 +20,15 @@ export interface Io {
   };
   sleep(ms: number): Promise<void>;
   now(): number;
-  /** Until the returned disarm runs, Ctrl-C prints `harness: <note>` on stderr before the process dies by SIGINT. */
+  /** Until the returned disarm runs, Ctrl-C prints `sky: <note>` on stderr before the process dies by SIGINT. */
   onInterrupt(note: string): () => void;
 }
 
 const help = (io: Io) => `Usage:
-  harness apply <env.yaml> [options]
+  sky apply <env.yaml> [options]
       Create or update the environment env.yaml describes, wait until it's
-      provisioned, and write harness-lock.json beside env.yaml.
-  harness secret set <env> <NAME> [--connector=<name>] [options]
+      provisioned, and write sky-lock.json beside env.yaml.
+  sky secret set <env> <NAME> [--connector=<name>] [options]
       Store a secret on an environment (<env> is its id or name). The value
       is read from stdin, or prompted for without echo on a terminal.
 
@@ -39,8 +39,8 @@ Options:
   -h, --help             show this help
 
 Configuration, first found wins:
-  url:     --url, HARNESS_URL, "url" in the config file
-  API key: --api-key-env, HARNESS_API_KEY, "apiKey" in the config file
+  url:     --url, SKY_URL, "url" in the config file
+  API key: --api-key-env, SKY_API_KEY, "apiKey" in the config file
   config file: ${configPath(io.env, io.home)}
 
 Exit status: 0 done · 1 failed (API error, provisioning failed) · 2 usage or
@@ -77,8 +77,8 @@ export async function run(io: Io): Promise<number> {
     }
   } catch (err) {
     if (err instanceof UsageError) {
-      io.stderr(`harness: ${err.message}\n`);
-      if (err.showHelpPointer) io.stderr("Run 'harness --help' for usage.\n");
+      io.stderr(`sky: ${err.message}\n`);
+      if (err.showHelpPointer) io.stderr("Run 'sky --help' for usage.\n");
       return 2;
     }
     throw err;

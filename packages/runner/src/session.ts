@@ -20,7 +20,7 @@ import type {
   RunnerEventPost,
   RunRollup,
   Usage,
-} from "@harness/shared";
+} from "@sky/shared";
 import type { Config } from "./config.js";
 import type { PostEvent } from "./events.js";
 import { matchesPolicy } from "./policy.js";

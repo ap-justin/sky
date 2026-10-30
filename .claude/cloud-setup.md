@@ -39,7 +39,7 @@ try claude plugin enable cc-plugin-you-should-know@builtin --scope user
 try claude plugin install typescript-lsp@claude-plugins-official --scope user
 try npm install -g typescript-language-server typescript@6
 
-# harness: node 24 (engines; @fly/sprites requires it, the image ships 20-22) into /usr/local/bin
+# sky: node 24 (engines; @fly/sprites requires it, the image ships 20-22) into /usr/local/bin
 node24() {
   arch=$(uname -m | sed 's/x86_64/x64/;s/aarch64/arm64/')
   tar=$(curl -fsSL https://nodejs.org/dist/latest-v24.x/SHASUMS256.txt | grep -o "node-v24[0-9.]*-linux-$arch.tar.xz" | head -1)
@@ -49,7 +49,7 @@ node24() {
 }
 try node24
 
-# harness: pnpm at package.json's packageManager; .claude/cloud-install.sh puts it on PATH
+# sky: pnpm at package.json's packageManager; .claude/cloud-install.sh puts it on PATH
 try env SHELL=/bin/bash PNPM_VERSION=10.19.0 sh -c 'curl -fsSL https://get.pnpm.io/install.sh | sh -'
 
 node --version; "$HOME/.local/share/pnpm/.tools/pnpm-exe/10.19.0/pnpm" --version; claude plugin list

@@ -9,7 +9,7 @@ import type {
   Options,
   SDKMessage,
 } from "@anthropic-ai/claude-agent-sdk";
-import type { RunnerEventPost } from "@harness/shared";
+import type { RunnerEventPost } from "@sky/shared";
 import { delay, HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -601,7 +601,7 @@ async function liveResources() {
   return process.getActiveResourcesInfo().filter((r) => r !== "TTYWrap");
 }
 
-/** What `after` holds beyond `before`; a harness timer that fired meanwhile is not a leak. */
+/** What `after` holds beyond `before`; a sky timer that fired meanwhile is not a leak. */
 function added(before: string[], after: string[]) {
   const unmatched = [...before];
   return after.filter((r) => {

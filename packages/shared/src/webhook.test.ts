@@ -3,7 +3,7 @@ import { Webhook } from "./webhook.js";
 
 const hook = {
   id: "whk_1",
-  url: "https://grok.example/hooks/harness",
+  url: "https://grok.example/hooks/sky",
   eventTypes: ["run.waiting", "run.finished"],
 };
 

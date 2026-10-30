@@ -43,7 +43,7 @@ function refuseNewerFile(sqlite: Database.Database): void {
   );
   if (last.at !== null && Number(last.at) > known) {
     throw new Error(
-      "database was migrated by a newer version of harness; refusing to open it with this one",
+      "database was migrated by a newer version of sky; refusing to open it with this one",
     );
   }
 }

@@ -1,6 +1,6 @@
-import { webhooks } from "@harness/db";
-import { EventType, Webhook, WebhookId } from "@harness/shared";
 import { zValidator } from "@hono/zod-validator";
+import { webhooks } from "@sky/db";
+import { EventType, Webhook, WebhookId } from "@sky/shared";
 import { asc, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 import { apiError } from "./errors.js";

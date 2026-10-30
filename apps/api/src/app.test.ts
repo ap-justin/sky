@@ -1,5 +1,5 @@
 import { SpritesClient } from "@fly/sprites";
-import { type Db, migrate, openDb } from "@harness/db";
+import { type Db, migrate, openDb } from "@sky/db";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { createApp } from "./app.js";
 import { testConfig } from "./testing/sprites.js";
@@ -64,7 +64,7 @@ test("the right key passes the guard to an enveloped 404", async () => {
 
 test("an unhandled throw in a route is a 500 envelope that hides the cause", async () => {
   app.get("/v1/boom", () => {
-    throw new Error("sqlite path /data/harness.db");
+    throw new Error("sqlite path /data/sky.db");
   });
   const res = await app.request("/v1/boom", {
     headers: { Authorization: `Bearer ${apiKey}` },

@@ -6,7 +6,7 @@ afterEach(() => {
 });
 
 test("a config failure exits non-zero naming the variable, not its value, before opening anything", async () => {
-  vi.stubEnv("HARNESS_API_KEY", undefined);
+  vi.stubEnv("SKY_API_KEY", undefined);
   vi.stubEnv("DATA_DIR", "/data");
   vi.stubEnv("PORT", "secret-ish-port");
   const exit = vi.spyOn(process, "exit").mockImplementation((code) => {
@@ -18,7 +18,7 @@ test("a config failure exits non-zero naming the variable, not its value, before
 
   expect(exit).toHaveBeenCalledWith(1);
   const message = stderr.mock.calls.flat().join(" ");
-  expect(message).toContain("HARNESS_API_KEY is missing");
+  expect(message).toContain("SKY_API_KEY is missing");
   expect(message).toContain("PORT");
   expect(message).not.toContain("secret-ish-port");
 });

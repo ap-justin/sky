@@ -4,11 +4,11 @@ import { join } from "node:path";
 import { expect, test } from "vitest";
 import { resolveConfig } from "./config.js";
 
-const home = () => mkdtempSync(join(tmpdir(), "harness-cli-"));
+const home = () => mkdtempSync(join(tmpdir(), "sky-cli-"));
 const withConfigFile = (contents: string) => {
   const dir = home();
-  mkdirSync(join(dir, ".config", "harness"), { recursive: true });
-  writeFileSync(join(dir, ".config", "harness", "config.json"), contents);
+  mkdirSync(join(dir, ".config", "sky"), { recursive: true });
+  writeFileSync(join(dir, ".config", "sky", "config.json"), contents);
   return dir;
 };
 
@@ -21,12 +21,12 @@ test("flags beat env beat the config file", () => {
     config: {
       url: "https://file.example",
       apiKey: "file-key",
-      apiKeySource: `apiKey in ${join(dir, ".config", "harness", "config.json")}`,
+      apiKeySource: `apiKey in ${join(dir, ".config", "sky", "config.json")}`,
     },
   });
   const env = {
-    HARNESS_URL: "https://env.example",
-    HARNESS_API_KEY: "env-key",
+    SKY_URL: "https://env.example",
+    SKY_API_KEY: "env-key",
     OTHER_KEY: "other-key",
   };
   expect(resolveConfig({}, env, dir)).toEqual({
@@ -34,7 +34,7 @@ test("flags beat env beat the config file", () => {
     config: {
       url: "https://env.example",
       apiKey: "env-key",
-      apiKeySource: "HARNESS_API_KEY",
+      apiKeySource: "SKY_API_KEY",
     },
   });
   expect(
@@ -57,23 +57,21 @@ test("an empty env var doesn't count as set", () => {
   const dir = withConfigFile(
     JSON.stringify({ url: "https://file.example", apiKey: "file-key" }),
   );
-  expect(
-    resolveConfig({}, { HARNESS_URL: "", HARNESS_API_KEY: "" }, dir),
-  ).toEqual({
+  expect(resolveConfig({}, { SKY_URL: "", SKY_API_KEY: "" }, dir)).toEqual({
     ok: true,
     config: {
       url: "https://file.example",
       apiKey: "file-key",
-      apiKeySource: `apiKey in ${join(dir, ".config", "harness", "config.json")}`,
+      apiKeySource: `apiKey in ${join(dir, ".config", "sky", "config.json")}`,
     },
   });
 });
 
 test("honors XDG_CONFIG_HOME", () => {
   const xdg = home();
-  mkdirSync(join(xdg, "harness"));
+  mkdirSync(join(xdg, "sky"));
   writeFileSync(
-    join(xdg, "harness", "config.json"),
+    join(xdg, "sky", "config.json"),
     JSON.stringify({ url: "https://xdg.example", apiKey: "k" }),
   );
   expect(resolveConfig({}, { XDG_CONFIG_HOME: xdg }, home())).toMatchObject({
@@ -85,7 +83,7 @@ test("honors XDG_CONFIG_HOME", () => {
 test("--api-key-env naming an unset variable is an error, not a fallback", () => {
   const result = resolveConfig(
     { apiKeyEnv: "MISSING" },
-    { HARNESS_URL: "https://env.example", HARNESS_API_KEY: "env-key" },
+    { SKY_URL: "https://env.example", SKY_API_KEY: "env-key" },
     home(),
   );
   expect(result).toEqual({
@@ -99,7 +97,7 @@ test("nothing configured names where to put it", () => {
   expect(result.ok).toBe(false);
   if (result.ok) return;
   expect(result.error).toMatch(/no API URL/);
-  expect(result.error).toMatch(/HARNESS_URL/);
+  expect(result.error).toMatch(/SKY_URL/);
 });
 
 test("a malformed config file is an error naming the file", () => {
@@ -107,33 +105,29 @@ test("a malformed config file is an error naming the file", () => {
   const result = resolveConfig({}, {}, dir);
   expect(result.ok).toBe(false);
   if (result.ok) return;
-  expect(result.error).toContain(
-    join(dir, ".config", "harness", "config.json"),
-  );
+  expect(result.error).toContain(join(dir, ".config", "sky", "config.json"));
 });
 
 test("a trailing slash on the URL is dropped", () => {
   expect(
     resolveConfig(
       {},
-      { HARNESS_URL: "https://env.example/", HARNESS_API_KEY: "k" },
+      { SKY_URL: "https://env.example/", SKY_API_KEY: "k" },
       home(),
     ),
   ).toMatchObject({ config: { url: "https://env.example" } });
 });
 
 test("the URL must be https, except on localhost", () => {
-  const env = { HARNESS_API_KEY: "k" };
+  const env = { SKY_API_KEY: "k" };
   for (const url of ["http://localhost:8080", "http://127.0.0.1:8080"]) {
     expect(resolveConfig({ url }, env, home()).ok, url).toBe(true);
   }
-  expect(resolveConfig({ url: "http://harness.example" }, env, home())).toEqual(
-    {
-      ok: false,
-      error:
-        '--url "http://harness.example" must use https (http only for localhost)',
-    },
-  );
+  expect(resolveConfig({ url: "http://sky.example" }, env, home())).toEqual({
+    ok: false,
+    error:
+      '--url "http://sky.example" must use https (http only for localhost)',
+  });
   const dir = withConfigFile(JSON.stringify({ url: "ftp://x" }));
   expect(resolveConfig({}, env, dir)).toMatchObject({
     ok: false,

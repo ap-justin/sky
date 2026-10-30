@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { Decision } from "@harness/shared";
+import { Decision } from "@sky/shared";
 import { z } from "zod";
 
 export type DecisionOutcome =

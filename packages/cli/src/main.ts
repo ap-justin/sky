@@ -64,7 +64,7 @@ try {
     onInterrupt: (note) => {
       const onSigint = () => {
         // `once` has already removed this listener, so the re-raise takes the default death
-        process.stderr.write(`harness: ${note}\n`, () =>
+        process.stderr.write(`sky: ${note}\n`, () =>
           process.kill(process.pid, "SIGINT"),
         );
       };
@@ -74,7 +74,7 @@ try {
   });
 } catch (err) {
   process.stderr.write(
-    `harness: unexpected error: ${err instanceof Error ? err.message : String(err)}\n`,
+    `sky: unexpected error: ${err instanceof Error ? err.message : String(err)}\n`,
   );
   process.exitCode = 1;
 }

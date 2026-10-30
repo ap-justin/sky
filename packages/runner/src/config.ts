@@ -1,4 +1,4 @@
-import { AgentId, RunId } from "@harness/shared";
+import { AgentId, RunId } from "@sky/shared";
 import { z } from "zod";
 import { PolicyPattern } from "./policy.js";
 

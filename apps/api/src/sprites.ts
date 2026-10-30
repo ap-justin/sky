@@ -1,7 +1,7 @@
 import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
 
 /** The one sprite an environment owns. */
-export const spriteNameFor = (envId: string) => `harness-${envId}`;
+export const spriteNameFor = (envId: string) => `sky-${envId}`;
 
 /** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
 export async function ensureSprite(

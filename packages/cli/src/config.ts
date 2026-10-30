@@ -25,17 +25,17 @@ const ConfigFile = z.object({
   apiKey: z.string().min(1).optional(),
 });
 
-/** `$XDG_CONFIG_HOME/harness/config.json`, else `~/.config/harness/config.json` — on macOS too. */
+/** `$XDG_CONFIG_HOME/sky/config.json`, else `~/.config/sky/config.json` — on macOS too. */
 export function configPath(env: Env, home: string): string {
   const xdg = env.XDG_CONFIG_HOME;
   // the XDG spec ignores an empty or relative value
   const base = xdg && isAbsolute(xdg) ? xdg : join(home, ".config");
-  return join(base, "harness", "config.json");
+  return join(base, "sky", "config.json");
 }
 
 const nonEmpty = (v: string | undefined) => (v ? v : undefined);
 
-/** flags > env (`HARNESS_URL`, `HARNESS_API_KEY`) > the user config file. */
+/** flags > env (`SKY_URL`, `SKY_API_KEY`) > the user config file. */
 export function resolveConfig(
   flags: ConfigFlags,
   env: Env,
@@ -54,11 +54,11 @@ export function resolveConfig(
   const path = configPath(env, home);
   let url =
     sourced(nonEmpty(flags.url), "--url") ??
-    sourced(nonEmpty(env.HARNESS_URL), "HARNESS_URL");
+    sourced(nonEmpty(env.SKY_URL), "SKY_URL");
   let apiKey =
     flags.apiKeyEnv !== undefined
       ? sourced(flagKey, `${flags.apiKeyEnv} (--api-key-env)`)
-      : sourced(nonEmpty(env.HARNESS_API_KEY), "HARNESS_API_KEY");
+      : sourced(nonEmpty(env.SKY_API_KEY), "SKY_API_KEY");
   if (url === undefined || apiKey === undefined) {
     const file = readConfigFile(path);
     if (!file.ok) return file;
@@ -68,13 +68,13 @@ export function resolveConfig(
   if (url === undefined) {
     return {
       ok: false,
-      error: `no API URL: pass --url, set HARNESS_URL, or add "url" to ${path}`,
+      error: `no API URL: pass --url, set SKY_URL, or add "url" to ${path}`,
     };
   }
   if (apiKey === undefined) {
     return {
       ok: false,
-      error: `no API key: set HARNESS_API_KEY, pass --api-key-env=<VAR>, or add "apiKey" to ${path}`,
+      error: `no API key: set SKY_API_KEY, pass --api-key-env=<VAR>, or add "apiKey" to ${path}`,
     };
   }
   const urlError = checkUrl(url.value);
@@ -102,7 +102,7 @@ function checkUrl(value: string): string | undefined {
   try {
     url = new URL(value);
   } catch {
-    return "is not a URL; expected https://<host>, e.g. https://harness-api.fly.dev";
+    return "is not a URL; expected https://<host>, e.g. https://sky-api.fly.dev";
   }
   if (url.protocol === "https:") return undefined;
   if (url.protocol === "http:" && localHosts.has(url.hostname))

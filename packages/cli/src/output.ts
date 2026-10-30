@@ -33,7 +33,7 @@ export function createOutput(
       stderr(`${line}\n`);
     },
     warn(line) {
-      stderr(`harness: warning: ${line}\n`);
+      stderr(`sky: warning: ${line}\n`);
     },
     fail(code, message, detail) {
       if (json) {
@@ -43,7 +43,7 @@ export function createOutput(
       } else {
         const indented = detail?.replace(/^/gm, "  ");
         stderr(
-          `harness: ${message}\n${indented === undefined ? "" : `${indented}\n`}`,
+          `sky: ${message}\n${indented === undefined ? "" : `${indented}\n`}`,
         );
       }
       return 1;

@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { type Io, run } from "./cli.js";
 
-export const apiUrl = "https://harness.test";
+export const apiUrl = "https://sky.test";
 export const apiKey = "hk_test_secret_key";
 
 export interface Captured {
@@ -35,11 +35,11 @@ export async function runCli(
   const code = await run({
     argv,
     env: {
-      HARNESS_URL: apiUrl,
-      HARNESS_API_KEY: apiKey,
+      SKY_URL: apiUrl,
+      SKY_API_KEY: apiKey,
       ...opts.env,
     },
-    home: mkdtempSync(join(tmpdir(), "harness-home-")),
+    home: mkdtempSync(join(tmpdir(), "sky-home-")),
     stdout: (s) => {
       stdout += s;
     },

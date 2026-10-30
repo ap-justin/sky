@@ -1,5 +1,5 @@
 import { SpritesClient } from "@fly/sprites";
-import { type Db, migrate, openDb } from "@harness/db";
+import { type Db, migrate, openDb } from "@sky/db";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { createApp } from "./app.js";
 import { testConfig } from "./testing/sprites.js";
@@ -32,7 +32,7 @@ const subscribe = (body: unknown) =>
   });
 
 const hook = {
-  url: "https://hooks.example.com/harness",
+  url: "https://hooks.example.com/sky",
   eventTypes: ["run.finished", "run.failed"],
 };
 

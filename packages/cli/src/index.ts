@@ -1,1 +1,1 @@
-export const name = "@harness/cli";
+export const name = "@sky/cli";

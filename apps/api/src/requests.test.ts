@@ -1,13 +1,6 @@
 import { SpritesClient } from "@fly/sprites";
-import {
-  agents,
-  type Db,
-  environments,
-  migrate,
-  openDb,
-  runs,
-} from "@harness/db";
-import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
+import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -19,7 +12,7 @@ import { failAbandonedWaits, failStaleRuns } from "./runs.js";
 import { spritesToken, stubSprites, testConfig } from "./testing/sprites.js";
 
 const config = testConfig();
-const subscriberUrl = "https://hooks.example.com/harness";
+const subscriberUrl = "https://hooks.example.com/sky";
 let db: Db;
 let app: ReturnType<typeof createApp>;
 let dispatcher: Dispatcher;
@@ -65,7 +58,7 @@ function runningRun() {
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: "harness-env_test",
+      spriteName: "sky-env_test",
       checkpointId: "v1",
     })
     .run();

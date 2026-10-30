@@ -16,7 +16,7 @@ import {
   type RunRollup,
   RunStatus,
   type WebhookId,
-} from "@harness/shared";
+} from "@sky/shared";
 import { migrate as drizzleMigrate } from "drizzle-orm/better-sqlite3/migrator";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import {
@@ -37,8 +37,8 @@ let dir: string;
 let path: string;
 let db: Db;
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "harness-db-"));
-  path = join(dir, "harness.db");
+  dir = mkdtempSync(join(tmpdir(), "sky-db-"));
+  path = join(dir, "sky.db");
   db = openDb(path);
 });
 afterEach(() => {

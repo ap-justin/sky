@@ -1,5 +1,5 @@
 {
-  "name": "@harness/db",
+  "name": "@sky/db",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -10,7 +10,7 @@
     "db:generate": "drizzle-kit generate && node src/strict.ts"
   },
   "dependencies": {
-    "@harness/shared": "workspace:*",
+    "@sky/shared": "workspace:*",
     "better-sqlite3": "^12.11.1",
     "drizzle-orm": "0.45.4"
   },

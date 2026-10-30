@@ -13,7 +13,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   dataDir: "/unused",
   port: 8080,
   claudeOauthToken: "sk-ant-oat01-test-oauth-token",
-  publicBaseUrl: "https://harness.test",
+  publicBaseUrl: "https://sky.test",
   runnerBundlePath: "/unused/runner.mjs",
   runTimeoutMs: 30 * 60_000,
   waitTimeoutMs: 120 * 60_000,

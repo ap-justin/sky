@@ -1,5 +1,5 @@
 import { setTimeout as sleep } from "node:timers/promises";
-import { RunnerEventPost } from "@harness/shared";
+import { RunnerEventPost } from "@sky/shared";
 
 const TIMEOUT_MS = 10_000;
 /** The pause before each retry. Progress gives up fast; losing it costs one line on a timeline. */

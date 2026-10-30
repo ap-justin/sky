@@ -1,13 +1,13 @@
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import {
   AgentId,
   Environment,
   EnvironmentId,
   RequestId,
   RunId,
-} from "@harness/shared";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+} from "@sky/shared";
 import { z } from "zod";
 
 export type Fetch = (request: Request) => Response | Promise<Response>;
@@ -183,7 +183,7 @@ function buildServer(call: Call) {
     );
   };
 
-  const server = new McpServer({ name: "harness", version: "0.0.0" });
+  const server = new McpServer({ name: "sky", version: "0.0.0" });
   server.registerTool(
     "create_env",
     {

@@ -1,13 +1,6 @@
 import { SpritesClient } from "@fly/sprites";
-import {
-  agents,
-  type Db,
-  environments,
-  migrate,
-  openDb,
-  runs,
-} from "@harness/db";
-import type { AgentId, RunId } from "@harness/shared";
+import { agents, type Db, environments, migrate, openDb, runs } from "@sky/db";
+import type { AgentId, RunId } from "@sky/shared";
 import { afterEach, beforeEach, expect, test } from "vitest";
 import { mintAgentToken } from "./agent-token.js";
 import { createApp } from "./app.js";
@@ -56,11 +49,11 @@ function runningRun() {
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `harness-${envId}`,
+      spriteName: `sky-${envId}`,
       checkpointId: "v1",
     })
     .run();
-  wire.sprites.add(`harness-${envId}`);
+  wire.sprites.add(`sky-${envId}`);
   db.insert(agents)
     .values({
       id: agentId,

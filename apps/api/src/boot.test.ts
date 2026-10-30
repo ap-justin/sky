@@ -4,6 +4,7 @@ import type { Server } from "node:http";
 import { type AddressInfo, connect } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { serve } from "@hono/node-server";
 import {
   agents,
   type Db,
@@ -12,9 +13,8 @@ import {
   runs,
   webhookDeliveries,
   webhooks,
-} from "@harness/db";
-import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
-import { serve } from "@hono/node-server";
+} from "@sky/db";
+import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { HttpResponse, http } from "msw";
@@ -29,7 +29,7 @@ let dir: string;
 let db: Db | undefined;
 let stops: (() => unknown)[];
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "harness-api-"));
+  dir = mkdtempSync(join(tmpdir(), "sky-api-"));
   stops = [];
 });
 afterEach(async () => {
@@ -47,10 +47,10 @@ const booted = (log: (line: string) => void = () => {}) => {
   return b;
 };
 
-test("booting on an empty data dir creates harness.db with the schema migrated", async () => {
+test("booting on an empty data dir creates sky.db with the schema migrated", async () => {
   const b = booted();
   db = b.db;
-  expect(existsSync(join(dir, "harness.db"))).toBe(true);
+  expect(existsSync(join(dir, "sky.db"))).toBe(true);
   const table = db.$client
     .prepare("select name from sqlite_schema where name = 'environments'")
     .get();
@@ -104,8 +104,8 @@ test("an env a previous process left provisioning boots as failed; others keep t
   const insert = first.$client.prepare(
     "insert into environments (id, name, repo, setup, status, sprite_name) values (?, ?, 'acme/kru', '', ?, ?)",
   );
-  insert.run("env_stuck", "stuck", "provisioning", "harness-env_stuck");
-  insert.run("env_ok", "ok", "ready", "harness-env_ok");
+  insert.run("env_stuck", "stuck", "provisioning", "sky-env_stuck");
+  insert.run("env_ok", "ok", "ready", "sky-env_ok");
   first.$client.close();
 
   db = booted().db;
@@ -121,7 +121,7 @@ test("an env a previous process left provisioning boots as failed; others keep t
 test("boot fails runs a previous process left silent past the timeout; fresh ones stay", async () => {
   const first = booted().db;
   first.$client.exec(`
-    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'harness-env_a');
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
     insert into agents (id, env_id, branch, status) values ('agt_old', 'env_a', 'claude/agt_old', 'running'), ('agt_new', 'env_a', 'claude/agt_new', 'running');
     insert into runs (id, agent_id, status, created_at) values ('run_old', 'agt_old', 'running', '2026-01-01T00:00:00.000Z'), ('run_new', 'agt_new', 'starting', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
   `);
@@ -156,7 +156,7 @@ test("a webhook delivery a previous process left pending is sent after boot", as
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: "harness-env_boot",
+      spriteName: "sky-env_boot",
     })
     .run();
   first.db
@@ -196,7 +196,7 @@ test("a webhook delivery a previous process left pending is sent after boot", as
   const received: string[] = [];
   server.use(
     http.post("https://hooks.example.com/boot", ({ request }) => {
-      received.push(request.headers.get("harness-event-id") ?? "");
+      received.push(request.headers.get("sky-event-id") ?? "");
       return new HttpResponse(null, { status: 204 });
     }),
   );
@@ -213,7 +213,7 @@ test("the sweep deletes envVars once their TTL passes, and redacts them only whi
   vi.setSystemTime(new Date("2026-10-30T12:00:00.000Z"));
   const first = booted().db;
   first.$client.exec(`
-    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'harness-env_a');
+    insert into environments (id, name, repo, setup, status, sprite_name) values ('env_a', 'a', 'acme/kru', '', 'ready', 'sky-env_a');
     insert into agents (id, env_id, branch, status) values ('agt_a', 'env_a', 'claude/agt_a', 'running');
     insert into runs (id, agent_id, status, created_at) values ('run_a', 'agt_a', 'running', '2026-10-30T12:00:00.000Z');
   `);

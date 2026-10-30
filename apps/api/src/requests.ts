@@ -1,12 +1,12 @@
 import { EventEmitter } from "node:events";
-import { agents, type Db, runRequests, runs } from "@harness/db";
+import { agents, type Db, runRequests, runs } from "@sky/db";
 import type {
   AgentId,
   Decision,
   PendingRequest,
   RequestId,
   RunId,
-} from "@harness/shared";
+} from "@sky/shared";
 import { and, eq, isNull } from "drizzle-orm";
 import { recordEvent, type Tx } from "./runs.js";
 

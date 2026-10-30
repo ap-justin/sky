@@ -1,6 +1,6 @@
 import { EventEmitter } from "node:events";
-import type { events } from "@harness/db";
-import type { AgentId, Event, RunId } from "@harness/shared";
+import type { events } from "@sky/db";
+import type { AgentId, Event, RunId } from "@sky/shared";
 
 const emitter = new EventEmitter().setMaxListeners(0);
 

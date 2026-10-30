@@ -1,6 +1,6 @@
 import type { SpritesClient } from "@fly/sprites";
-import type { Db } from "@harness/db";
-import { createMcpHandler } from "@harness/mcp";
+import type { Db } from "@sky/db";
+import { createMcpHandler } from "@sky/mcp";
 import type { Context } from "hono";
 import { bearerAuth } from "hono/bearer-auth";
 import { HTTPException } from "hono/http-exception";
@@ -70,7 +70,7 @@ export function createApp({
   });
   // the MCP tools call /v1 in-process through the whole app, so its guard checks them too
   const mcp = createMcpHandler({
-    baseUrl: "http://harness.internal",
+    baseUrl: "http://sky.internal",
     fetch: (request) => app.fetch(request),
     apiKey: config.apiKey,
   });

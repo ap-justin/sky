@@ -5,7 +5,7 @@ const secrets = {
   apiKey: "k".repeat(40),
   spritesToken: "sprites-tok-123",
   claudeOauthToken: "claude-oauth-opaque-1",
-  publicBaseUrl: "https://harness.internal.example",
+  publicBaseUrl: "https://sky.internal.example",
   webhookSigningKey: "webhook-signing-key-0123456789abcdef",
   secretEncryptionKey: Buffer.alloc(32, 9),
 };

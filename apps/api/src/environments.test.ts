@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, migrate, openDb } from "@harness/db";
+import { type Db, migrate, openDb } from "@sky/db";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -69,7 +69,7 @@ const runnerSdk = JSON.parse(
     "utf8",
   ),
 ).dependencies["@anthropic-ai/claude-agent-sdk"];
-const installRunnerSdk = `[ -w /opt/harness ] || sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/harness; npm install --prefix /opt/harness --no-audit --no-fund @anthropic-ai/claude-agent-sdk@${runnerSdk}`;
+const installRunnerSdk = `[ -w /opt/sky ] || sudo install -d -o "$(id -u)" -g "$(id -g)" /opt/sky; npm install --prefix /opt/sky --no-audit --no-fund @anthropic-ai/claude-agent-sdk@${runnerSdk}`;
 
 test("POST returns 202 provisioning, then the sprite is created, cloned, set up and checkpointed", async () => {
   const res = await post(kru);
@@ -79,7 +79,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     id: expect.stringMatching(/^env_[0-9A-Za-z]+$/),
     ...kru,
     status: "provisioning",
-    spriteName: `harness-${created.id}`,
+    spriteName: `sky-${created.id}`,
     checkpointId: null,
     concurrency: 3,
     approvalPolicy: [],
@@ -95,13 +95,13 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     checkpointId: "v1",
     failure: null,
   });
-  const sprite = `harness-${created.id}`;
+  const sprite = `sky-${created.id}`;
   expect(wire.calls).toEqual([
     `create ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
-    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/harness-clone.log`,
-    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/harness-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/harness-setup.log`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
+    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/sky-setup.log`,
     `checkpoint ${sprite}`,
   ]);
 });
@@ -388,12 +388,12 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     status: "ready",
     checkpointId: "v2",
   });
-  const sprite = `harness-${id}`;
+  const sprite = `sky-${id}`;
   expect(wire.calls).toEqual([
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
-    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/harness-clone.log`,
-    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/harness-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install --frozen-lockfile &> /tmp/harness-setup.log`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
+    `exec ${sprite} /workspace/repo bash -c pnpm install --frozen-lockfile &> /tmp/sky-setup.log`,
     `checkpoint ${sprite}`,
   ]);
 });
@@ -406,7 +406,7 @@ test("PATCH that changes repo re-clones from the new remote", async () => {
     repo: "acme/kru-next",
   });
   expect(wire.calls).toContain(
-    `exec harness-${id} - git clone https://github.com/acme/kru-next.git /workspace/repo &> /tmp/harness-clone.log`,
+    `exec sky-${id} - git clone https://github.com/acme/kru-next.git /workspace/repo &> /tmp/sky-clone.log`,
   );
 });
 
@@ -498,7 +498,7 @@ test("DELETE destroys the sprite, then the row and its agents' history", async (
   seedRun(id, "finished");
   const res = await del(id);
   expect(res.status).toBe(204);
-  expect(wire.calls).toEqual([`delete harness-${id}`]);
+  expect(wire.calls).toEqual([`delete sky-${id}`]);
   expect(wire.sprites.size).toBe(0);
   expect((await get(id)).status).toBe(404);
   expect(db.$client.prepare("select count(*) as n from agents").get()).toEqual({
@@ -638,12 +638,12 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
     failure: null,
   });
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  const sprite = `harness-${id}`;
+  const sprite = `sky-${id}`;
   expect(wire.calls).toEqual([
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
-    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/harness-clone.log`,
-    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/harness-sdk.log`,
-    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/harness-setup.log`,
+    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
+    `exec ${sprite} /workspace/repo bash -c pnpm install &> /tmp/sky-setup.log`,
     `checkpoint ${sprite}`,
   ]);
 });
@@ -656,7 +656,7 @@ test("retry of a create failure recreates the sprite before cloning", async () =
   wire.calls.length = 0;
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls[0]).toBe(`create harness-${id}`);
+  expect(wire.calls[0]).toBe(`create sky-${id}`);
 });
 
 test("an env a restart interrupts mid-setup is failed at that step, its detail saying so", async () => {
@@ -714,10 +714,10 @@ const interruptedAtBoot = async () => {
 
 test("retry after a boot interruption creates the sprite it never got", async () => {
   const id = await interruptedAtBoot();
-  wire.sprites.delete(`harness-${id}`);
+  wire.sprites.delete(`sky-${id}`);
   expect((await retry(id)).status).toBe(202);
   expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls[0]).toBe(`create harness-${id}`);
+  expect(wire.calls[0]).toBe(`create sky-${id}`);
 });
 
 test("retry after a boot interruption keeps the sprite that exists", async () => {
@@ -758,12 +758,12 @@ const raceOnName = (raced: string) =>
     create temp trigger race before insert on environments when new.name = '${raced}'
     begin
       insert into environments (id, name, repo, setup, status, sprite_name)
-      values ('env_racer', '${raced}', 'acme/kru', '', 'ready', 'harness-env_racer');
+      values ('env_racer', '${raced}', 'acme/kru', '', 'ready', 'sky-env_racer');
     end;
     create temp trigger race_rename before update of name on environments when new.name = '${raced}'
     begin
       insert into environments (id, name, repo, setup, status, sprite_name)
-      values ('env_racer', '${raced}', 'acme/kru', '', 'ready', 'harness-env_racer');
+      values ('env_racer', '${raced}', 'acme/kru', '', 'ready', 'sky-env_racer');
     end;`);
 
 test("a name another writer took between check and insert is still 409 name_taken", async () => {

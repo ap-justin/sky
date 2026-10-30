@@ -1,5 +1,5 @@
 {
-  "name": "@harness/mcp",
+  "name": "@sky/mcp",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -7,7 +7,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@harness/shared": "workspace:*",
+    "@sky/shared": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "zod": "^4.6.7"
   }

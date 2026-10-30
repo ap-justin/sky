@@ -1,4 +1,4 @@
-import { Environment } from "@harness/shared";
+import { Environment } from "@sky/shared";
 import { z } from "zod";
 import type { Config } from "./config.js";
 

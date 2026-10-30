@@ -6,7 +6,7 @@ const bundledRunner = fileURLToPath(new URL("./runner.mjs", import.meta.url));
 
 // bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match
 const configSchema = z.object({
-  HARNESS_API_KEY: z
+  SKY_API_KEY: z
     .string()
     .min(32)
     .regex(/^[A-Za-z0-9._~+/-]+=*$/),
@@ -57,7 +57,7 @@ export function loadConfig(
     return {
       ok: true,
       config: {
-        apiKey: e.HARNESS_API_KEY,
+        apiKey: e.SKY_API_KEY,
         spritesToken: e.SPRITES_TOKEN,
         dataDir: e.DATA_DIR,
         port: e.PORT,

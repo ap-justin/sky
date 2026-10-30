@@ -1,4 +1,4 @@
-import type { Db } from "@harness/db";
+import type { Db } from "@sky/db";
 import { createFactory } from "hono/factory";
 import type { Config } from "./config.js";
 import type { KnownSecrets } from "./redact.js";

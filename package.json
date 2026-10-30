@@ -1,5 +1,5 @@
 {
-  "name": "harness",
+  "name": "sky",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -8,7 +8,7 @@
     "node": ">=24"
   },
   "scripts": {
-    "build": "pnpm --filter @harness/api --filter @harness/runner --filter @harness/cli build",
+    "build": "pnpm --filter @sky/api --filter @sky/runner --filter @sky/cli build",
     "typecheck": "tsc -b",
     "lint": "biome check && node lint/check-fixtures.mjs",
     "test": "vitest run"

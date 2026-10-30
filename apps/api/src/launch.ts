@@ -1,8 +1,8 @@
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { SpritesClient } from "@fly/sprites";
-import { type Db, runs } from "@harness/db";
-import type { AgentId, EnvironmentId, RunId } from "@harness/shared";
+import { type Db, runs } from "@sky/db";
+import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
 import { eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";

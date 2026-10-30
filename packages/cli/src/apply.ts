@@ -11,7 +11,7 @@ const provisionTimeoutMs = 30 * 60 * 1000;
 const progressEveryPolls = 10;
 const maxBackoffMs = 30_000;
 
-const lockName = "harness-lock.json";
+const lockName = "sky-lock.json";
 const Lock = z.object({ envId: z.string().min(1) });
 
 type Fetched = { raw: unknown; env: ApiEnvironment };
@@ -177,7 +177,7 @@ async function waitForProvisioned(
   const startedAt = io.now();
   out.progress(`provisioning ${name} (${id})…`);
   const disarm = io.onInterrupt(
-    `interrupted; ${name} (${id}) keeps provisioning on the server — re-run harness apply to pick it up`,
+    `interrupted; ${name} (${id}) keeps provisioning on the server — re-run sky apply to pick it up`,
   );
   try {
     return await poll();

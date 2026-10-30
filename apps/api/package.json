@@ -1,5 +1,5 @@
 {
-  "name": "@harness/api",
+  "name": "@sky/api",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -11,9 +11,9 @@
   },
   "dependencies": {
     "@fly/sprites": "^0.2.4",
-    "@harness/db": "workspace:*",
-    "@harness/mcp": "workspace:*",
-    "@harness/shared": "workspace:*",
+    "@sky/db": "workspace:*",
+    "@sky/mcp": "workspace:*",
+    "@sky/shared": "workspace:*",
     "@hono/node-server": "^2.1.5",
     "@hono/zod-validator": "^0.9.1",
     "better-sqlite3": "^12.11.1",
@@ -22,7 +22,7 @@
     "zod": "^4.6.7"
   },
   "devDependencies": {
-    "@harness/runner": "workspace:*",
+    "@sky/runner": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.32.2",
     "esbuild": "0.28.2"
   }

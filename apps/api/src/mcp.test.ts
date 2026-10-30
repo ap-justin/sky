@@ -2,9 +2,9 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, environments, migrate, openDb } from "@harness/db";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { type Db, environments, migrate, openDb } from "@sky/db";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { createApp } from "./app.js";
 import {
@@ -21,7 +21,7 @@ let wire: SpritesWire;
 const clients: Client[] = [];
 
 beforeEach(() => {
-  dir = mkdtempSync(join(tmpdir(), "harness-mcp-"));
+  dir = mkdtempSync(join(tmpdir(), "sky-mcp-"));
   writeFileSync(join(dir, "runner.mjs"), "// runner bundle v1\n");
   db = openDb(":memory:");
   migrate(db);
@@ -44,7 +44,7 @@ afterEach(async () => {
 async function connect() {
   const client = new Client({ name: "test", version: "0.0.0" });
   await client.connect(
-    new StreamableHTTPClientTransport(new URL("http://harness.test/mcp"), {
+    new StreamableHTTPClientTransport(new URL("http://sky.test/mcp"), {
       fetch: async (url, init) => app.request(new Request(url, init)),
       requestInit: {
         headers: { authorization: `Bearer ${testConfig().apiKey}` },
@@ -91,11 +91,11 @@ test("an MCP client launches an agent then reads its run status through /v1", as
       repo: "acme/kru",
       setup: "",
       status: "ready",
-      spriteName: `harness-${envId}`,
+      spriteName: `sky-${envId}`,
       checkpointId: "v1",
     })
     .run();
-  wire.sprites.add(`harness-${envId}`);
+  wire.sprites.add(`sky-${envId}`);
   const client = await connect();
 
   const launched = await client.callTool({

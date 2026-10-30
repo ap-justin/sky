@@ -29,7 +29,7 @@ export class KnownSecrets {
     >,
   ): KnownSecrets {
     const secrets = new KnownSecrets();
-    secrets.add("HARNESS_API_KEY", config.apiKey);
+    secrets.add("SKY_API_KEY", config.apiKey);
     secrets.add("SPRITES_TOKEN", config.spritesToken);
     secrets.add("CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken);
     secrets.add("WEBHOOK_SIGNING_KEY", config.webhookSigningKey);

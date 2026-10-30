@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { Environment } from "@harness/shared";
+import { Environment } from "@sky/shared";
 import {
   type Document,
   isMap,

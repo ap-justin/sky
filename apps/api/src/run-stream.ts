@@ -1,5 +1,5 @@
-import { events, runs } from "@harness/db";
-import type { RunId } from "@harness/shared";
+import { events, runs } from "@sky/db";
+import type { RunId } from "@sky/shared";
 import { and, asc, eq, gt } from "drizzle-orm";
 import type { Context } from "hono";
 import { streamSSE } from "hono/streaming";

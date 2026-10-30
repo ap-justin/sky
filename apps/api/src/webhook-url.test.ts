@@ -30,7 +30,7 @@ test.each([
 });
 
 test.each([
-  ["a public hostname", "https://hooks.example.com/harness"],
+  ["a public hostname", "https://hooks.example.com/sky"],
   ["a public IPv4", "https://8.8.8.8/hook"],
   ["an address just outside 172.16/12", "https://172.32.0.1/hook"],
   ["an address just outside 100.64/10", "https://100.128.0.1/hook"],
