@@ -621,6 +621,30 @@ test("the session commits as Claude through its env, so nothing writes the clone
   });
 });
 
+test("with a GitHub connector in its env, the session is told to publish through the runner instead of git push or gh", async () => {
+  const start = (env: Record<string, string>) => {
+    const query = scripted([init, success]);
+    Object.assign(process.env, env);
+    return runSession(config, {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    }).then(() => query.calls[0]?.options.systemPrompt);
+  };
+  try {
+    expect(await start({})).toEqual({ type: "preset", preset: "claude_code" });
+    const prompt = await start({ GITHUB_CONNECTOR: "conn_123" });
+    expect(prompt).toMatchObject({ type: "preset", preset: "claude_code" });
+    const append = (prompt as { append?: string }).append ?? "";
+    expect(append).toContain(`${process.argv[1]} publish --title`);
+    expect(append).toMatch(/instead of `git push`/);
+    expect(append).toMatch(/`gh`/);
+  } finally {
+    delete process.env.GITHUB_CONNECTOR;
+  }
+});
+
 test("the PreToolUse hook outlasts the longest wait, so a late approval still reaches the tool call", async () => {
   const query = scripted([init, success]);
   const waitTimeoutMs = 120 * 60_000;

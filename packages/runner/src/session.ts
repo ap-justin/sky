@@ -25,6 +25,7 @@ import {
 import type { Config } from "./config.js";
 import { type PostEvent, RunEndedError } from "./events.js";
 import { matchesPolicy } from "./policy.js";
+import { CONNECTOR_ENV, PUBLISH_USAGE } from "./publish.js";
 import type { AwaitDecision } from "./requests.js";
 import { commitAll, diffRollup, ensureWorktree, headSha } from "./worktree.js";
 
@@ -70,7 +71,11 @@ function sessionOptions(
     resume: config.sessionId,
     abortController,
     env: { ...env, ...SESSION_GIT_IDENTITY },
-    systemPrompt: { type: "preset", preset: "claude_code" },
+    systemPrompt: {
+      type: "preset",
+      preset: "claude_code",
+      ...(env[CONNECTOR_ENV] && { append: publishInstructions() }),
+    },
     // the approval policy holds calls in the PreToolUse hook; everything else runs unasked
     permissionMode: "bypassPermissions",
     allowDangerouslySkipPermissions: true,
@@ -79,6 +84,18 @@ function sessionOptions(
     canUseTool,
   };
 }
+
+/**
+ * The sprite holds no GitHub credential, so `git push` and `gh` fail there; the runner's own
+ * `publish` reaches GitHub through the Sprites connector instead.
+ */
+const publishInstructions = () =>
+  [
+    "This sandbox has no GitHub credential, so `git push` and `gh` fail here.",
+    "To publish your branch and open a pull request, commit your work, then run",
+    `\`${process.execPath} ${process.argv[1]} ${PUBLISH_USAGE}\``,
+    "instead of `git push` or `gh pr create`. It sends the branch's commits to GitHub, opens a pull request into the base branch (or finds the open one), and prints its URL. Run it again after more commits to update the same pull request.",
+  ].join("\n");
 
 /**
  * Hooks forward what Claude is doing without holding it up: the event is queued

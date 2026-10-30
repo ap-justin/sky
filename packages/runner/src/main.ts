@@ -2,6 +2,7 @@ import { query } from "@anthropic-ai/claude-agent-sdk";
 import { type Config, ConfigError, loadConfig } from "./config.js";
 import { createPoster } from "./events.js";
 import { holdSprite } from "./keepalive.js";
+import { publishMain } from "./publish.js";
 import { createDecisionWaiter } from "./requests.js";
 import { runSession } from "./session.js";
 
@@ -50,7 +51,19 @@ async function main(): Promise<void> {
   if (caught) process.kill(process.pid, caught);
 }
 
-main().catch((error: unknown) => {
+// `runner.mjs publish …` is the agent's own command, run from its worktree; anything else is a run
+const entry =
+  process.argv[2] === "publish"
+    ? publishMain(process.argv.slice(3), process.env, {
+        cwd: process.cwd(),
+        stdout: (s) => process.stdout.write(s),
+        stderr: (s) => process.stderr.write(s),
+      }).then((code) => {
+        process.exitCode = code;
+      })
+    : main();
+
+entry.catch((error: unknown) => {
   warn(`runner: ${error instanceof Error ? error.message : String(error)}`);
   process.exitCode = 1;
 });
