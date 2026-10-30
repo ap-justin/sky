@@ -80,7 +80,16 @@ afterEach(() => rmSync(root, { recursive: true, force: true }));
 type Pull = { number: number; html_url: string; head: string; base: string };
 
 /** GitHub's git data and pulls API behind the gateway, recording every request it answers. */
-function fakeGitHub(options: { ref?: string; pulls?: Pull[] } = {}) {
+function fakeGitHub(
+  options: {
+    ref?: string;
+    pulls?: Pull[];
+    /** Blob shas GitHub already holds. */
+    blobs?: string[];
+    /** Trees of commits GitHub holds that this clone doesn't, by commit sha. */
+    commitTrees?: Record<string, string>;
+  } = {},
+) {
   const state = {
     ref: options.ref,
     pulls: options.pulls ?? [],
@@ -100,6 +109,23 @@ function fakeGitHub(options: { ref?: string; pulls?: Pull[] } = {}) {
   const seen = (request: Request) =>
     state.authorization.push(request.headers.get("authorization"));
   server.use(
+    http.get(REPO, ({ request }) => {
+      seen(request);
+      return HttpResponse.json({ full_name: "acme/widgets" });
+    }),
+    http.get(`${REPO}/git/blobs/:sha`, ({ request, params }) => {
+      seen(request);
+      return options.blobs?.includes(String(params.sha))
+        ? HttpResponse.json({ sha: params.sha })
+        : HttpResponse.json({ message: "Not Found" }, { status: 404 });
+    }),
+    http.get(`${REPO}/git/commits/:sha`, ({ request, params }) => {
+      seen(request);
+      const tree = options.commitTrees?.[String(params.sha)];
+      return tree
+        ? HttpResponse.json({ sha: params.sha, tree: { sha: tree } })
+        : HttpResponse.json({ message: "Not Found" }, { status: 404 });
+    }),
     http.post(`${REPO}/git/blobs`, async ({ request }) => {
       seen(request);
       state.blobs.push((await request.json()) as never);
@@ -217,7 +243,7 @@ test("a new branch: each commit becomes blobs, a tree on the base tree and a com
   const author = {
     name: "Claude",
     email: "noreply@anthropic.com",
-    date: "2026-10-30T12:00:00+02:00",
+    date: "2026-10-30T10:00:00Z",
   };
   expect(gh.commits).toEqual([
     {
@@ -231,8 +257,8 @@ test("a new branch: each commit becomes blobs, a tree on the base tree and a com
       message: "Add a script and a link\n",
       tree: "tree2",
       parents: ["commit1"],
-      author: { ...author, date: "2026-10-30T13:00:00+00:00" },
-      committer: { ...author, date: "2026-10-30T13:00:00+00:00" },
+      author: { ...author, date: "2026-10-30T13:00:00Z" },
+      committer: { ...author, date: "2026-10-30T13:00:00Z" },
     },
   ]);
   expect(gh.refWrites).toEqual([
@@ -256,7 +282,14 @@ test("a new branch: each commit becomes blobs, a tree on the base tree and a com
     created: true,
     pullRequest: { number: 7, url: "https://github.com/acme/widgets/pull/7" },
   });
-  // the gateway injects the credential; the helper never sends one
+});
+
+test("no request carries a credential: the gateway injects it", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+  await run();
+  expect(gh.authorization.length).toBeGreaterThan(0);
   expect(new Set(gh.authorization)).toEqual(new Set([null]));
 });
 
@@ -365,4 +398,156 @@ test("the publish command prints the PR URL, and without a connector exits 2 nam
   const env = { GITHUB_CONNECTOR: CONNECTOR, GITHUB_GATEWAY_URL: GATEWAY };
   expect(await publishMain(["--title", "Add a"], env, io)).toBe(0);
   expect(out).toEqual(["https://github.com/acme/widgets/pull/7\n"]);
+});
+
+test("a re-publish whose earlier commits GitHub holds under other shas resumes from the one with the same tree", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add b");
+  const firstTree = git(work, "rev-parse", `${first}^{tree}`);
+  const gh = fakeGitHub({
+    ref: "gh_first",
+    commitTrees: { gh_first: firstTree },
+  });
+
+  await run();
+
+  expect(gh.trees).toEqual([
+    {
+      base_tree: firstTree,
+      tree: [{ path: "b.txt", mode: "100644", type: "blob", sha: "blob1" }],
+    },
+  ]);
+  expect(gh.commits.map((c) => c.parents)).toEqual([["gh_first"]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a blob GitHub already holds is not uploaded again", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add a and b");
+  const aSha = git(work, "rev-parse", "HEAD:a.txt");
+  const gh = fakeGitHub({ blobs: [aSha] });
+
+  await run();
+
+  expect(gh.blobs).toEqual([{ content: b64("second\n"), encoding: "base64" }]);
+  expect(gh.trees[0]?.tree).toEqual([
+    { path: "a.txt", mode: "100644", type: "blob", sha: aSha },
+    { path: "b.txt", mode: "100644", type: "blob", sha: "blob1" },
+  ]);
+});
+
+test("a branch already at HEAD on GitHub moves no ref and returns its open PR", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const head = commit("Add a");
+  const gh = fakeGitHub({
+    ref: head,
+    pulls: [
+      {
+        number: 3,
+        html_url: "https://github.com/acme/widgets/pull/3",
+        head: "claude/agt_1",
+        base: "main",
+      },
+    ],
+  });
+
+  const result = await run();
+
+  expect(gh.blobs).toEqual([]);
+  expect(gh.commits).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+  expect(result).toMatchObject({ sha: head, created: false });
+});
+
+test("a ref GitHub refuses to fast-forward says the history was rewritten", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  writeFileSync(join(work, "b.txt"), "second\n");
+  commit("Add b");
+  fakeGitHub({ ref: first });
+  server.use(
+    http.patch(`${REPO}/git/refs/heads/claude/agt_1`, () =>
+      HttpResponse.json(
+        { message: "Update is not a fast forward" },
+        { status: 422 },
+      ),
+    ),
+  );
+
+  await expect(run()).rejects.toThrow(
+    "claude/agt_1 on GitHub isn't an ancestor of this branch: published commits were amended or rebased here, or someone pushed there; it can't be fast-forwarded (GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 422: Update is not a fast forward)",
+  );
+});
+
+test("with no open PR and no title, nothing is written", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  await expect(run({ title: undefined })).rejects.toThrow(
+    "a title is needed to open the pull request",
+  );
+  expect(gh.blobs).toEqual([]);
+  expect(gh.refWrites).toEqual([]);
+});
+
+test("a failed ref lookup surfaces instead of reading as a new branch", async () => {
+  const gh = fakeGitHub();
+  server.use(
+    http.get(`${REPO}/git/ref/heads/claude/agt_1`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+    ),
+  );
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  await expect(run()).rejects.toThrow(
+    "GitHub gateway: GET /repos/acme/widgets/git/ref/heads/claude/agt_1 returned 500: Server Error",
+  );
+  expect(gh.refWrites).toEqual([]);
+});
+
+test("a repo the connector can't see names the connector, not the branch", async () => {
+  fakeGitHub();
+  server.use(
+    http.get(REPO, () =>
+      HttpResponse.json({ message: "Not Found" }, { status: 404 }),
+    ),
+  );
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  await expect(run()).rejects.toThrow(
+    "the connector in GITHUB_CONNECTOR can't see acme/widgets; check its connection id and the repos it grants (GitHub gateway: GET /repos/acme/widgets returned 404: Not Found)",
+  );
+});
+
+test("a rate-limit pause GitHub asks for is waited out, then the call goes on", async () => {
+  const gh = fakeGitHub();
+  let refused = 0;
+  server.use(
+    http.post(
+      `${REPO}/git/blobs`,
+      () => {
+        refused++;
+        return HttpResponse.json(
+          { message: "You have exceeded a secondary rate limit" },
+          { status: 403, headers: { "retry-after": "0" } },
+        );
+      },
+      { once: true },
+    ),
+  );
+  writeFileSync(join(work, "a.txt"), "first\n");
+  commit("Add a");
+
+  await run();
+
+  expect(refused).toBe(1);
+  expect(gh.blobs).toEqual([{ content: b64("first\n"), encoding: "base64" }]);
 });

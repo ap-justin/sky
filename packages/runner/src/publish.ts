@@ -52,6 +52,9 @@ async function gitBytes(cwd: string, ...args: string[]): Promise<Buffer> {
 
 const lines = (output: string) => output.split("\n").filter(Boolean);
 
+const messageOf = (error: unknown) =>
+  error instanceof Error ? error.message : String(error);
+
 /** `owner/repo` from an https or ssh GitHub remote URL. */
 function parseOrigin(url: string): { owner: string; repo: string } {
   const match = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url);
@@ -63,16 +66,16 @@ function parseOrigin(url: string): { owner: string; repo: string } {
 
 type Identity = { name: string; email: string; date: string };
 
-/** A git identity line's `Name <email> <unix seconds> <+hhmm>`, with the date as ISO 8601 in its own offset. */
+/**
+ * A git identity line's `Name <email> <unix seconds> <+hhmm>`, its date in UTC: the
+ * `YYYY-MM-DDTHH:MM:SSZ` form GitHub documents, though it drops the commit's own offset.
+ */
 function parseIdentity(line: string): Identity {
-  const match = /^(.*) <(.*)> (\d+) ([+-])(\d\d)(\d\d)$/.exec(line);
+  const match = /^(.*) <(.*)> (\d+) [+-]\d{4}$/.exec(line);
   if (!match) throw new PublishError(`unreadable commit identity: ${line}`);
-  const [, name = "", email = "", seconds, sign, hh, mm] = match;
-  const offset = (sign === "-" ? -1 : 1) * (Number(hh) * 60 + Number(mm));
-  const local = new Date((Number(seconds) + offset * 60) * 1000)
-    .toISOString()
-    .slice(0, 19);
-  return { name, email, date: `${local}${sign}${hh}:${mm}` };
+  const [, name = "", email = "", seconds] = match;
+  const date = `${new Date(Number(seconds) * 1000).toISOString().slice(0, 19)}Z`;
+  return { name, email, date };
 }
 
 /** A commit's message, author and committer, byte for byte as git stores them. */
@@ -123,6 +126,10 @@ async function changes(cwd: string, from: string, to: string) {
   return result;
 }
 
+// GitHub's secondary rate limit answers 403 or 429 with a `retry-after`; a pause this long is waited out
+const MAX_RETRY_AFTER_S = 60;
+const RETRIES = 3;
+
 /** GitHub's REST API for one repo, through the gateway, with no credential of its own. */
 function gateway(options: {
   gatewayUrl: string;
@@ -139,20 +146,36 @@ function gateway(options: {
   ): Promise<T> {
     const where = `${method} ${repoPath}${path}`;
     let response: Response;
-    try {
-      response = await fetch(`${root}${repoPath}${path}`, {
-        method,
-        headers: {
-          accept: "application/vnd.github+json",
-          "x-github-api-version": "2022-11-28",
-          ...(body !== undefined && { "content-type": "application/json" }),
-        },
-        ...(body !== undefined && { body: JSON.stringify(body) }),
-      });
-    } catch (error) {
-      throw new GatewayError(
-        `GitHub gateway: ${where} failed: ${error instanceof Error ? error.message : String(error)}`,
-      );
+    for (let attempt = 0; ; attempt++) {
+      try {
+        response = await fetch(`${root}${repoPath}${path}`, {
+          method,
+          headers: {
+            accept: "application/vnd.github+json",
+            "x-github-api-version": "2022-11-28",
+            ...(body !== undefined && { "content-type": "application/json" }),
+          },
+          ...(body !== undefined && { body: JSON.stringify(body) }),
+        });
+      } catch (error) {
+        // fetch's own message is just "fetch failed"; the reason is its cause
+        const cause = error instanceof Error ? error.cause : undefined;
+        throw new GatewayError(
+          `GitHub gateway: ${where} failed: ${messageOf(error)}${cause ? ` (${messageOf(cause)})` : ""}`,
+        );
+      }
+      const retryAfter = Number(response.headers.get("retry-after") ?? NaN);
+      if (
+        (response.status === 403 || response.status === 429) &&
+        retryAfter >= 0 &&
+        retryAfter <= MAX_RETRY_AFTER_S &&
+        attempt < RETRIES
+      ) {
+        await response.body?.cancel();
+        await new Promise((resolve) => setTimeout(resolve, retryAfter * 1000));
+        continue;
+      }
+      break;
     }
     if (response.ok) return (await response.json()) as T;
     const text = await response.text();
@@ -173,7 +196,8 @@ function gateway(options: {
  * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
  * the commit with its own message and identities), then the branch ref is created or fast-forwarded
  * and a pull request into the base opened, or the open one returned. Only first-parent history is
- * replayed, so a merge commit arrives as a plain commit with the same content.
+ * replayed, so a merge commit arrives as a plain commit with the same content, and a merge from the
+ * base shows the base's changes in the pull request's diff as the branch's own.
  */
 export async function publish(options: {
   cwd: string;
@@ -222,6 +246,23 @@ export async function publish(options: {
   }
 
   const call = gateway({ ...options, owner, repo });
+  // the ref lookup below reads a 404 as a new branch, which a repo the connector can't see also returns
+  await call("GET", "").catch((error: unknown) => {
+    if (error instanceof GatewayError && error.status === 404) {
+      throw new PublishError(
+        `the connector in ${CONNECTOR_ENV} can't see ${owner}/${repo}; check its connection id and the repos it grants (${error.message})`,
+      );
+    }
+    throw error;
+  });
+  // before anything is written, so a missing title costs no upload
+  const [existing] = await call<{ number: number; html_url: string }[]>(
+    "GET",
+    `/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`,
+  );
+  if (!existing && !options.title) {
+    throw new PublishError("a title is needed to open the pull request");
+  }
   const refPath = `heads/${branch.split("/").map(encodeURIComponent).join("/")}`;
   const treeOf = async (sha: string) =>
     (await git(cwd, "rev-parse", `${sha}^{tree}`)).trim();
@@ -238,7 +279,7 @@ export async function publish(options: {
   );
 
   // replay from the last local commit GitHub already holds: the same sha, or else the same tree
-  // (a recreated commit's sha differs when GitHub stores its dates differently; its tree can't)
+  // (a recreated commit's sha differs once its date's offset is dropped; its tree can't)
   const known = [mergeBase, ...commits];
   let start = 0;
   let parent = mergeBase;
@@ -258,6 +299,26 @@ export async function publish(options: {
     }
   }
 
+  // a blob's sha is the hash of its content, on GitHub as here, so one an earlier or failed publish
+  // uploaded is found rather than sent again; a lookup costs less of the rate limit than a create
+  const uploadBlob = async (sha: string) => {
+    const found = await call<{ sha: string }>("GET", `/git/blobs/${sha}`).then(
+      (blob) => blob.sha,
+      (error: unknown) => {
+        if (error instanceof GatewayError && error.status === 404) return null;
+        throw error;
+      },
+    );
+    if (found) return found;
+    const content = await gitBytes(cwd, "cat-file", "blob", sha);
+    return (
+      await call<{ sha: string }>("POST", "/git/blobs", {
+        content: content.toString("base64"),
+        encoding: "base64",
+      })
+    ).sha;
+  };
+
   let from = known[start] ?? mergeBase;
   let tree = await treeOf(from);
   const blobs = new Map<string, string>();
@@ -268,16 +329,7 @@ export async function publish(options: {
       const type = change.mode === "160000" ? "commit" : "blob";
       let remoteSha = change.sha;
       if (remoteSha !== null && type === "blob") {
-        remoteSha =
-          blobs.get(remoteSha) ??
-          (
-            await call<{ sha: string }>("POST", "/git/blobs", {
-              content: (
-                await gitBytes(cwd, "cat-file", "blob", remoteSha)
-              ).toString("base64"),
-              encoding: "base64",
-            })
-          ).sha;
+        remoteSha = blobs.get(remoteSha) ?? (await uploadBlob(remoteSha));
         blobs.set(change.sha as string, remoteSha);
       }
       entries.push({
@@ -321,18 +373,13 @@ export async function publish(options: {
     }).catch((error: unknown) => {
       if (error instanceof GatewayError && error.status === 422) {
         throw new PublishError(
-          `${branch} on GitHub has commits this worktree lacks, so it can't be fast-forwarded (${error.message})`,
+          `${branch} on GitHub isn't an ancestor of this branch: published commits were amended or rebased here, or someone pushed there; it can't be fast-forwarded (${error.message})`,
         );
       }
       throw error;
     });
   }
 
-  const open = await call<{ number: number; html_url: string }[]>(
-    "GET",
-    `/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`,
-  );
-  const existing = open[0];
   if (existing) {
     return {
       branch,
@@ -342,14 +389,11 @@ export async function publish(options: {
       pullRequest: { number: existing.number, url: existing.html_url },
     };
   }
-  if (!options.title) {
-    throw new PublishError("a title is needed to open the pull request");
-  }
   const pull = await call<{ number: number; html_url: string }>(
     "POST",
     "/pulls",
     {
-      title: options.title,
+      title: options.title as string,
       ...(options.body !== undefined && { body: options.body }),
       head: branch,
       base,

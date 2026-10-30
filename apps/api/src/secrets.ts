@@ -80,8 +80,8 @@ const sealedOf = (row: {
 };
 
 /**
- * The env's secrets as the runner's env: a value secret decrypted, a connector secret as its
- * Sprites connection id, which the sprite's GitHub gateway calls name.
+ * The env's secrets as the runner gets them: a value secret decrypted, a connector secret as its
+ * Sprites connection id, which a call through the sprite's connector gateway names.
  */
 export function openEnvSecrets(
   db: Db,
