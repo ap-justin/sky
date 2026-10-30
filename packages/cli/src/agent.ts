@@ -292,7 +292,7 @@ function decisionCommand(
           if (typeof recorded !== "string") throw err;
           return out.fail(
             "already_decided",
-            `${requestId} was already ${recorded} earlier; this ${verb} was not applied`,
+            `${requestId} was already ${recorded}; this ${verb} was not applied`,
           );
         }
       };

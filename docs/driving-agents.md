@@ -96,7 +96,7 @@ Starts the agent's next run in the same session and branch, once its last run ha
 sky agent archive agt_…
 ```
 
-Stops any active run and removes the agent's worktree; an archived agent takes no more runs.
+Stops any active run and deletes the agent's worktree, losing any uncommitted work in it; an archived agent takes no more runs.
 
 ## A whole loop
 

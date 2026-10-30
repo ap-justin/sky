@@ -35,11 +35,12 @@ const help = (io: Io) => `Usage:
       --connector, agents get the Sprites connection id as $NAME instead.
   sky agent start <env> --prompt=<text|@file> [options]
   sky agent follow-up <agent> --prompt=<text|@file> [options]
-      Start an agent on an environment (<env> is its id or name), or queue
-      the next run on one; @file reads the prompt from that file. Prints
-      "<agentId> <runId>".
+      Start an agent on an environment (<env> is its id or name), or start
+      an agent's next run once its last one has ended; @file reads the
+      prompt from that file. Prints "<agentId> <runId>".
   sky agent archive <agent> [options]
-      Archive an agent.
+      Stop any active run and delete the agent's worktree; uncommitted work
+      in it is lost.
   sky inbox <agent> [options]
       Print what the agent's newest run is waiting on: "question <requestId>"
       then the question, or "approval <requestId> <tool>" then what the tool

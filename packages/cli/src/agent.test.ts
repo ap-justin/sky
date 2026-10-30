@@ -511,7 +511,7 @@ test("already_decided exits 1: the earlier decision stands and this one was not 
     [["answer", agentId, "req_q", "dev"], "answered"],
   ] as const) {
     server.use(alreadyDecided(decision));
-    const message = `${argv[2]} was already ${decision} earlier; this ${argv[0]} was not applied`;
+    const message = `${argv[2]} was already ${decision}; this ${argv[0]} was not applied`;
     const r = await runCli([...argv]);
     expect(r.code, argv[0]).toBe(1);
     expect(r.stdout).toBe("");
