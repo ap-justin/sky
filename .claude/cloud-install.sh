@@ -28,6 +28,9 @@ else
   [ -x "$bin/pnpm" ] || { echo "cloud-install: no pnpm $ver under $home" >&2; exit 1; }
 fi
 export PATH="$bin:$PATH"
+# the image ships an older node; a failed setup download leaves it first on PATH
+node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
+[ "$node_major" -ge 24 ] || { echo "cloud-install: node $(node -v 2>/dev/null || echo missing) on PATH, need >=24 (setup's node download failed?)" >&2; exit 1; }
 # later shells read this file. without it they find the image's pnpm, which
 # self-switches to `packageManager` with lifecycle scripts off, and turbo, which
 # spawns that placeholder directly, fails with `Exec format error`.

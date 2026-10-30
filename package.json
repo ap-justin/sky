@@ -9,7 +9,7 @@
   "scripts": {
     "build": "pnpm --filter @harness/api --filter @harness/runner --filter @harness/cli build",
     "typecheck": "tsc -b",
-    "lint": "biome check",
+    "lint": "biome check && node lint/check-fixtures.mjs",
     "test": "vitest run"
   },
   "devDependencies": {

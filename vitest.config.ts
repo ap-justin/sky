@@ -8,5 +8,7 @@ export default defineConfig({
       "test/**/*.test.ts",
     ],
     setupFiles: ["test/setup.ts"],
+    // 8 GB laptop: default forks cores-1 workers; CI runners keep the default
+    maxWorkers: process.env.CI ? undefined : 2,
   },
 });

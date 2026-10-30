@@ -1,0 +1,9 @@
+{
+  "root": true,
+  "linter": { "enabled": true, "rules": { "preset": "none" } },
+  "plugins": [
+    "./no-sql-raw.grit",
+    "./no-coerce-boolean.grit",
+    "./no-stage-branching.grit"
+  ]
+}
