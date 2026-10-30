@@ -24,6 +24,36 @@ Authorization: Bearer <SKY_API_KEY>
 
 A missing or wrong key returns `401`.
 
+## Install and configure
+
+Your Sky API serves the CLI as one file. It needs Node 24 or later.
+
+```
+mkdir -p ~/.local/bin
+curl -fsSL https://<your-app>.fly.dev/cli/sky.mjs -o ~/.local/bin/sky && chmod +x ~/.local/bin/sky
+```
+
+Make sure `~/.local/bin` is on your `PATH`, then check the install with `sky --version`. Rerun the `curl` to update; the file always matches the API you deployed. The route is public, and the file holds no keys.
+
+Tell it where your API is and how to authenticate, with environment variables:
+
+```
+export SKY_URL=https://<your-app>.fly.dev
+export SKY_API_KEY=<the key you set at deploy time>
+```
+
+or with the config file `~/.config/sky/config.json` (`$XDG_CONFIG_HOME/sky/config.json` when that is set):
+
+```json
+{ "url": "https://<your-app>.fly.dev", "apiKey": "<the key>" }
+```
+
+Flags beat environment variables, which beat the file. To check the URL and key, list your environments; a `401` means the key is wrong:
+
+```
+curl -fsS -H "Authorization: Bearer $SKY_API_KEY" "$SKY_URL/v1/environments"
+```
+
 ## CLI
 
 ```

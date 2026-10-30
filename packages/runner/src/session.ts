@@ -79,6 +79,12 @@ function withGitConfig(
   return { ...env, ...added };
 }
 
+/**
+ * The runner syncs the Kru store itself, under a lock and through the connector; the plugin's own
+ * hook would clone from github.com, which a sprite can't reach, and race it on the same checkout.
+ */
+const KRU_PLUGIN_SYNC_OFF = { KRU_NO_STORE_SYNC: "1" };
+
 type RunnerEvent = Omit<RunnerEventPost, "runId">;
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
@@ -100,7 +106,10 @@ function sessionOptions(
     cwd,
     resume: config.sessionId,
     abortController,
-    env: withGitConfig({ ...env, ...SESSION_GIT_IDENTITY }, SESSION_GIT_CONFIG),
+    env: withGitConfig(
+      { ...env, ...SESSION_GIT_IDENTITY, ...KRU_PLUGIN_SYNC_OFF },
+      SESSION_GIT_CONFIG,
+    ),
     systemPrompt: {
       type: "preset",
       preset: "claude_code",

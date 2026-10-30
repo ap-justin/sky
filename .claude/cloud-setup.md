@@ -27,7 +27,10 @@ try() {
   echo "SETUP FAIL: $*"
 }
 
-# kru store
+# kru store: for Claude Code on the web only. A Sky sprite can't run these two lines: it reaches
+# GitHub through the Sprites connector's REST API, with no git transport, and the private store
+# 404s on github.com. Sky provisioning does the equivalent instead (`runner.mjs store-sync pull`,
+# then this store's setup.sh); see "Kru store" in CONTRIBUTING.md.
 try git clone -q https://github.com/ap-justin/kru-store ~/.kru
 [ -f ~/.kru/setup.sh ] && try bash ~/.kru/setup.sh
 

@@ -15,6 +15,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   claudeOauthToken: "sk-ant-oat01-test-oauth-token",
   publicBaseUrl: "https://sky.test",
   runnerBundlePath: "/unused/runner.mjs",
+  cliBundlePath: "/unused/sky.mjs",
   runTimeoutMs: 30 * 60_000,
   waitTimeoutMs: 120 * 60_000,
   webhookSigningKey: "webhook-signing-key-for-tests-0123456789",
@@ -46,7 +47,7 @@ export type Session = {
  */
 export function envFileOf(
   wire: { files: Map<string, Uint8Array> },
-  session: Session | undefined,
+  session: Pick<Session, "env"> | undefined,
 ): Record<string, string> {
   const path = session?.env.ENV_FILE;
   const bytes = path ? wire.files.get(path) : undefined;

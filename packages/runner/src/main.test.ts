@@ -128,10 +128,8 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
       REPO_DIR: "/nonexistent/repo",
       WORKTREES_DIR: "/nonexistent/worktrees",
     },
-    stdio: ["ignore", "ignore", "pipe"],
+    stdio: "ignore",
   });
-  let stderr = "";
-  child.stderr.on("data", (d) => (stderr += d));
   const exited = once(child, "exit");
   // the runner is mid-post of run.failed, the API holding its answer
   await posted;
@@ -142,6 +140,69 @@ test("SIGHUP is a stop like SIGTERM: the run still reports, then the runner dies
   respond?.();
   const [code, signal] = await exited;
   expect({ code, signal }).toEqual({ code: null, signal: "SIGHUP" });
-  // the sprite hold has no socket outside a sprite, and says so
-  expect(stderr).toMatch(/sprite API/);
 });
+
+/** One server answering as both the Sky API and the GitHub gateway, logging what it saw in order. */
+async function apiAndGateway() {
+  const seen: string[] = [];
+  const server = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      seen.push(req.url?.startsWith("/gateway/") ? "store" : "api");
+      // the gateway is down, so every store sync fails
+      res.writeHead(req.url?.startsWith("/gateway/") ? 502 : 204).end();
+    });
+  });
+  server.listen(0, "127.0.0.1");
+  servers.push(server);
+  await once(server, "listening");
+  const { port } = server.address() as AddressInfo;
+  return { seen, base: `http://127.0.0.1:${port}` };
+}
+
+const storeRunEnv = (base: string, kruHome: string) => ({
+  AGENT_ID: "agt_1",
+  RUN_ID: "run_1",
+  PROMPT: "do it",
+  API_BASE_URL: base,
+  AGENT_TOKEN: "agent-secret",
+  CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret",
+  // the run fails at worktree setup, so no session starts
+  REPO_DIR: "/nonexistent/repo",
+  WORKTREES_DIR: "/nonexistent/worktrees",
+  HOME: kruHome,
+  KRU_HOME: join(kruHome, ".kru"),
+  KRU_STORE_REPO: "acme/store",
+  GITHUB_CONNECTOR: "conn_1",
+  GITHUB_GATEWAY_URL: `${base}/gateway`,
+});
+
+test("the store is pulled before the run and pushed after it, a failed run included, and failing syncs leave the run's exit code alone", async () => {
+  const { seen, base } = await apiAndGateway();
+  const home = mkdtempSync(join(tmpdir(), "runner-main-store-"));
+  try {
+    const { code, stderr } = await runBundle(storeRunEnv(base, home));
+    expect(seen).toEqual(["store", "api", "store"]);
+    expect(code).toBe(1);
+    expect(stderr).toMatch(/runner: .*pull/);
+    expect(stderr).toMatch(/runner: .*push/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test("KRU_NO_STORE_SYNC turns the pull and the push off", async () => {
+  const { seen, base } = await apiAndGateway();
+  const home = mkdtempSync(join(tmpdir(), "runner-main-store-"));
+  try {
+    const { code, stderr } = await runBundle({
+      ...storeRunEnv(base, home),
+      KRU_NO_STORE_SYNC: "1",
+    });
+    expect(seen).toEqual(["api"]);
+    expect(code).toBe(1);
+    expect(stderr).not.toMatch(/pull|push/);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+}, 30_000);

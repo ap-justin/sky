@@ -63,6 +63,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   rmSync(root, { recursive: true, force: true });
 });
 
@@ -683,6 +684,44 @@ test("the session's git config pairs go after any the project's env already sets
   } finally {
     vi.unstubAllEnvs();
   }
+});
+
+test("the plugin's own store sync is off in the session, since the runner syncs the store under a lock", async () => {
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.env).toMatchObject({ KRU_NO_STORE_SYNC: "1" });
+});
+
+test.each([["0"], [""], ["true"]])(
+  "the plugin's store sync stays off in the session when the caller env says KRU_NO_STORE_SYNC=%j",
+  async (value) => {
+    vi.stubEnv("KRU_NO_STORE_SYNC", value);
+    const query = scripted([init, success]);
+    await runSession(config, {
+      query,
+      post: recorder().post,
+      signal: new AbortController().signal,
+      awaitDecision: noDecision,
+    });
+    expect(query.calls[0]?.options.env?.KRU_NO_STORE_SYNC).toBe("1");
+  },
+);
+
+test("the session sees the caller's KRU_STORE_REPO unchanged", async () => {
+  vi.stubEnv("KRU_STORE_REPO", "acme/store");
+  const query = scripted([init, success]);
+  await runSession(config, {
+    query,
+    post: recorder().post,
+    signal: new AbortController().signal,
+    awaitDecision: noDecision,
+  });
+  expect(query.calls[0]?.options.env?.KRU_STORE_REPO).toBe("acme/store");
 });
 
 test("with a GitHub connector in its env, the session is told to publish through the runner instead of git push or gh", async () => {

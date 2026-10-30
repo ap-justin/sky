@@ -292,6 +292,7 @@ test("the env's secrets reach the runner through the env file, quotes intact; a 
     TRICKY: tricky,
     DB_URL: "postgres://u:p@db/x",
     GITHUB_CONNECTOR: "VPpb7x",
+    KRU_STORE_REPO: "ap-justin/kru-store",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
   });
@@ -305,6 +306,54 @@ test("the env's secrets reach the runner through the env file, quotes intact; a 
       "GITHUB_CONNECTOR",
       "TRICKY",
     ]),
+  );
+});
+
+test("with a GITHUB_CONNECTOR connector, every agent's session gets the Kru store repo, whatever a secret says", async () => {
+  const envId = readyEnv();
+  expect(
+    (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
+      .status,
+  ).toBe(200);
+  expect(
+    (await putSecret(envId, "KRU_STORE_REPO", { value: "someone/else" }))
+      .status,
+  ).toBe(200);
+  await launched(envId);
+  await sessionOpened();
+  expect(envFileOf(wire, wire.sessions[0]).KRU_STORE_REPO).toBe(
+    "ap-justin/kru-store",
+  );
+});
+
+test("a launch's envVars cannot point the Kru store at another repo", async () => {
+  const envId = readyEnv();
+  expect(
+    (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
+      .status,
+  ).toBe(200);
+  const res = await launch({
+    envId,
+    prompt: "go",
+    envVars: { KRU_STORE_REPO: "someone/else" },
+  });
+  expect(res.status).toBe(202);
+  await sessionOpened();
+  expect(envFileOf(wire, wire.sessions[0]).KRU_STORE_REPO).toBe(
+    "ap-justin/kru-store",
+  );
+});
+
+test("a session in an env with no GITHUB_CONNECTOR connector is told of no Kru store", async () => {
+  const envId = readyEnv();
+  expect(
+    (await putSecret(envId, "GITHUB_CONNECTOR", { value: "ghp_pasted" }))
+      .status,
+  ).toBe(200);
+  await launched(envId);
+  await sessionOpened();
+  expect(envFileOf(wire, wire.sessions[0])).not.toHaveProperty(
+    "KRU_STORE_REPO",
   );
 });
 

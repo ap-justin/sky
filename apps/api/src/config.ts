@@ -4,6 +4,9 @@ import { z } from "zod";
 // the build copies the runner bundle next to the API bundle, which is where this module lands
 const bundledRunner = fileURLToPath(new URL("./runner.mjs", import.meta.url));
 
+// likewise the CLI bundle, which GET /cli/sky.mjs serves
+const bundledCli = fileURLToPath(new URL("./sky.mjs", import.meta.url));
+
 const configSchema = z.object({
   /** Token68 only: bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match. */
   SKY_API_KEY: z
@@ -17,6 +20,7 @@ const configSchema = z.object({
   /** How a sprite reaches this API; the runner posts its events here. */
   PUBLIC_BASE_URL: z.url({ protocol: /^https?$/ }),
   RUNNER_BUNDLE_PATH: z.string().min(1).default(bundledRunner),
+  CLI_BUNDLE_PATH: z.string().min(1).default(bundledCli),
   /** A run with no event for this long is failed with `runner_timeout`. */
   RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
   /** How long a runner waits on a question or approval before giving up; the runner gets it at launch. */
@@ -39,6 +43,7 @@ export type Config = {
   claudeOauthToken: string;
   publicBaseUrl: string;
   runnerBundlePath: string;
+  cliBundlePath: string;
   runTimeoutMs: number;
   waitTimeoutMs: number;
   webhookSigningKey: string;
@@ -64,6 +69,7 @@ export function loadConfig(
         claudeOauthToken: e.CLAUDE_CODE_OAUTH_TOKEN,
         publicBaseUrl: e.PUBLIC_BASE_URL,
         runnerBundlePath: e.RUNNER_BUNDLE_PATH,
+        cliBundlePath: e.CLI_BUNDLE_PATH,
         runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
         waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
         webhookSigningKey: e.WEBHOOK_SIGNING_KEY,

@@ -4,18 +4,24 @@ import type { EnvironmentId } from "@sky/shared";
 import { eq, sql } from "drizzle-orm";
 import { type KnownSecrets, redact } from "./redact.js";
 import { cloneUrl } from "./remote.js";
+import type { BundleInstaller } from "./runner-bundle.js";
+import { hasConnectorSecret, openEnvSecrets } from "./secrets.js";
 import {
   checkpointSprite,
   ensureSprite,
   execInSprite,
   execLogged,
   spriteNameFor,
+  writeSpriteFile,
 } from "./sprites.js";
 
 export const REPO_DIR = "/workspace/repo";
 // the runner's worktrees point at the clone, so they go when it does
 export const WORKTREES_DIR = "/workspace/worktrees";
 export const RUNNER_DIR = "/opt/sky";
+export const RUNNER = `${RUNNER_DIR}/runner.mjs`;
+/** The Kru store every agent's session syncs with; the runner reads it from `KRU_STORE_REPO`. */
+export const KRU_STORE_REPO = "ap-justin/kru-store";
 // = the version in packages/runner/package.json; the runner bundle leaves the SDK external
 const RUNNER_SDK = "@anthropic-ai/claude-agent-sdk@0.3.312";
 // no --omit=optional: the SDK ships the Claude Code binary as a platform-specific optional dep
@@ -85,6 +91,22 @@ claude("plugin", "marketplace", "update");
 for (const plugin of plugins) claude("plugin", "install", plugin, "--scope", "user");
 for (const plugin of plugins) claude("plugin", "update", plugin, "--scope", "user");
 `;
+const shellQuote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+
+/** `export NAME='value'` lines for sh to source; later names override earlier ones. */
+export const envFile = (vars: Iterable<readonly [string, string]>) =>
+  [...vars]
+    .map(([name, value]) => `export ${name}=${shellQuote(value)}\n`)
+    .join("");
+
+// the store steps' env, as a run's, rides in a file: an exec's argv and env reach the sprite as URL
+// query params
+const STORE_ENV_FILE = "/tmp/sky-kru-store.env";
+const PULL_STORE = `. "$1" && exec node ${RUNNER} store-sync pull`;
+// the store's root as Kru resolves it under the env a run has (its plugin is installed by now),
+// then the store's own setup script when it has one; the root falls back to Kru's default when the
+// plugin is missing. Only the root resolution sees the env file
+const RUN_STORE_SETUP = `home=$(. "$1" || exit 1; h=$(bash "$HOME/.claude/plugins/marketplaces/kru/scripts/kru-store.sh" home 2>/dev/null); printf %s "\${h:-\${KRU_HOME:-$HOME/.kru}}") || exit 1; if [ -f "$home/setup.sh" ]; then bash "$home/setup.sh"; fi`;
 // the sprite's node ships corepack but no pnpm or yarn; corepack's shims go under $HOME, so need no
 // root, and resolve the repo's `packageManager` version when run
 const PACKAGE_MANAGERS_DIR = "$HOME/.local/bin";
@@ -105,8 +127,10 @@ class StepFailed extends Error {}
 
 type Deps = {
   db: Db;
+  secretEncryptionKey: Buffer;
   secrets: KnownSecrets;
   sprites: SpritesClient;
+  ensureBundle: BundleInstaller;
   log: (line: string) => void;
 };
 type Target = { id: EnvironmentId; repo: string; setup: string };
@@ -116,7 +140,14 @@ type Target = { id: EnvironmentId; repo: string; setup: string };
  * `failure_stderr`: the failed command's output tail (stdout and stderr together), or the Sprites
  * error for create/checkpoint.
  */
-export function createProvisioner({ db, secrets, sprites, log }: Deps) {
+export function createProvisioner({
+  db,
+  secretEncryptionKey,
+  secrets,
+  sprites,
+  ensureBundle,
+  log,
+}: Deps) {
   async function run(env: Target): Promise<void> {
     const name = spriteNameFor(env.id);
     const exec = async (argv: [string, ...string[]]) => {
@@ -138,6 +169,52 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
       });
       if (out.exitCode !== 0) {
         throw new StepFailed(out.tail || `exited with code ${out.exitCode}`);
+      }
+    };
+    /**
+     * The sprite reaches GitHub only through its connector, which carries REST and no git
+     * transport, so the Kru store (private) is checked out by the runner's `store-sync pull`, then
+     * the store's own `setup.sh` runs, as the cloud setup script does after its clone. `~/.kru`
+     * outlives reprovisioning and a pull merges what is there, so this is safe to repeat. Without
+     * a connector secret there is nothing to reach GitHub with. A failure is logged and never
+     * fails provisioning: each run's own pull tries again.
+     */
+    const checkoutKruStore = async (
+      envId: EnvironmentId,
+      sprite: string,
+    ): Promise<void> => {
+      let stored = new Map<string, string>();
+      try {
+        if (!hasConnectorSecret(db, envId, "GITHUB_CONNECTOR")) return;
+        stored = openEnvSecrets(db, secretEncryptionKey, envId);
+        // the runner's own off switch, which it reads from the same env on every run
+        if (stored.get("KRU_NO_STORE_SYNC")) return;
+        await ensureBundle(sprite, `provision-${envId}`);
+        await writeSpriteFile(
+          sprites,
+          sprite,
+          STORE_ENV_FILE,
+          envFile([...stored, ["KRU_STORE_REPO", KRU_STORE_REPO]]),
+          { mode: 0o600 },
+        );
+        try {
+          await execNoisy(
+            ["sh", "-c", PULL_STORE, "sh", STORE_ENV_FILE],
+            "/tmp/sky-kru-store.log",
+          );
+          await execNoisy(
+            ["bash", "-c", RUN_STORE_SETUP, "bash", STORE_ENV_FILE],
+            "/tmp/sky-kru-setup.log",
+          );
+        } finally {
+          // the checkpoint must not keep the env's secrets
+          await execInSprite(sprites, sprite, ["rm", "-f", STORE_ENV_FILE]);
+        }
+      } catch (err) {
+        const detail = err instanceof Error ? err.message : String(err);
+        log(
+          `checking out the Kru store in ${sprite} failed: ${redact(detail, [...secrets.values(), ...stored.values()])}`,
+        );
       }
     };
     let step: (typeof environmentFailureSteps)[number] = "create";
@@ -170,6 +247,7 @@ export function createProvisioner({ db, secrets, sprites, log }: Deps) {
         "/tmp/sky-setup.log",
         REPO_DIR,
       );
+      await checkoutKruStore(env.id, name);
       begin("checkpoint");
       const checkpointId = await checkpointSprite(sprites, name, "sky setup");
       db.update(environments)
