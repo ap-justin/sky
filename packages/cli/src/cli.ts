@@ -43,7 +43,7 @@ Configuration, first found wins:
   API key: --api-key-env, SKY_API_KEY, "apiKey" in the config file
   config file: ${configPath(io.env, io.home)}
 
-Exit status: 0 done · 1 failed (API error, provisioning failed) · 2 usage or
+Exit status: 0 done; 1 failed (API error, provisioning failed); 2 usage or
   config error, a rejected API key included
 `;
 

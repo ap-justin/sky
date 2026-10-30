@@ -187,7 +187,8 @@ function buildServer(call: Call) {
   server.registerTool(
     "create_env",
     {
-      description: "Create an environment.",
+      description:
+        "Create an environment: a sprite with repo cloned and setup run once. Provisioning is asynchronous; poll status with envId until its status is ready, then launch.",
       inputSchema: { name, repo, setup },
     },
     (input) => api("POST", "/v1/environments", input),
@@ -195,7 +196,8 @@ function buildServer(call: Call) {
   server.registerTool(
     "launch",
     {
-      description: "Launch a new agent in a ready environment.",
+      description:
+        "Start a new agent, with its own session and branch, in a ready environment. To continue an existing agent, call followup.",
       inputSchema: { envId: EnvironmentId, prompt: nonEmpty },
     },
     (input) => api("POST", "/v1/agents", input),
@@ -203,7 +205,8 @@ function buildServer(call: Call) {
   server.registerTool(
     "followup",
     {
-      description: "Start the agent's next run, resuming its session.",
+      description:
+        "Start the agent's next run once its current run has ended, resuming its session.",
       inputSchema: { agentId: AgentId, prompt: nonEmpty },
     },
     ({ agentId, prompt }) =>
@@ -212,7 +215,8 @@ function buildServer(call: Call) {
   server.registerTool(
     "answer",
     {
-      description: "Answer the question a waiting run asked.",
+      description:
+        "Answer the question a waiting run asked; requestId is the pending request status returns.",
       inputSchema: { agentId: AgentId, requestId: RequestId, answer: nonEmpty },
     },
     ({ agentId, ...body }) =>
@@ -222,7 +226,7 @@ function buildServer(call: Call) {
     "approve",
     {
       description:
-        "Approve or deny the tool call a waiting run asked to make; a reason goes only with deny.",
+        "Approve or deny the tool call a waiting run asked to make; requestId is the pending request status returns. A reason goes only with deny.",
       inputSchema: {
         agentId: AgentId,
         requestId: RequestId,

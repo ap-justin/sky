@@ -44,7 +44,7 @@ const reservedNames = new Set([
 export const isReservedName = (name: string) => reservedNames.has(name);
 
 export const reservedName = (c: Context, name: string) =>
-  apiError(c, 400, "reserved_name", `${name} is reserved for the sky`);
+  apiError(c, 400, "reserved_name", `${name} is reserved by sky`);
 
 // a value is registered under its own nonce, so one replaced or deleted mid-run stays scrubbed
 // from the events of a runner that still holds it

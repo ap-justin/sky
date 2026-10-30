@@ -233,7 +233,7 @@ test("the sweep deletes envVars once their TTL passes, and redacts them only whi
   held("LONG", "long-lived-value-02", "2026-10-30T13:00:00.000Z");
   first.$client.close();
 
-  // long enough that the run itself stays live across the sweep
+  // the default run timeout, not `config()`'s 60 s, so the run itself stays live across the sweep
   const b = boot(testConfig({ dataDir: dir }), () => {});
   stops.push(b.stopSweeping, b.stopDelivering);
   db = b.db;

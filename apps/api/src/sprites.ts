@@ -177,7 +177,7 @@ export function startDetached(
         ),
       );
     });
-    // stays attached: an 'error' emitted with no listener would crash the process
+    // `on`, not `once`: an 'error' emitted after the first, with no listener, would crash the process
     session.on("error", (err: Error) => settle(err));
   });
 }

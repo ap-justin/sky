@@ -1,5 +1,5 @@
 # Required secrets (fly secrets set; names only, never values here):
-#   SKY_API_KEY          bearer key for /v1 and /mcp, >=32 token68 chars: openssl rand -hex 32
+#   SKY_API_KEY              bearer key for /v1 and /mcp, >=32 token68 chars: openssl rand -hex 32
 #   WEBHOOK_SIGNING_KEY      HMAC key for outbound webhooks, >=32 chars: openssl rand -hex 32
 #   SECRET_ENCRYPTION_KEY    AES-256 key, base64 of 32 bytes: openssl rand -base64 32
 #   SPRITES_TOKEN            Sprites API token, from the user's Sprites org

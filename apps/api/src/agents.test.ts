@@ -299,7 +299,8 @@ test("launching past the env's cap gets a typed 409 naming the cap, and nothing 
   expect(await res.json()).toEqual({
     error: {
       code: "concurrency_cap",
-      message: "this environment allows 2 active runs",
+      message:
+        "this environment allows 2 active runs; wait for one to end or stop one",
       limit: 2,
     },
   });
@@ -1176,7 +1177,7 @@ test("a follow-up right after stop waits for the stopped runner; still alive, it
   expect(
     db.$client.prepare("select status from agents where id = ?").get(agent.id),
   ).toEqual({ status: "idle" });
-  // the wait is bounded on the sprite, past the 30 s archive allows
+  // the wait is bounded on the sprite, to the same 30 s archive allows
   const wait = wire.calls.at(-1) ?? "";
   expect(wait.startsWith(`exec sky-${envId} - bash -c `)).toBe(true);
   expect(wait).toContain("seq 30");

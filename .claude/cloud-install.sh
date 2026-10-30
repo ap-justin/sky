@@ -15,8 +15,8 @@ exe="$home/.tools/pnpm-exe/$ver/pnpm"
 
 # link the binary, not the `pnpm` wrapper in PNPM_HOME: the wrapper resolves the
 # binary beside its own path, so a link to it breaks. the directory holds
-# nothing else — /usr/local/bin carries the image's node 20, which shadows 22
-# (wrangler refuses 20) unless the setup script put the repo's node there.
+# nothing else — /usr/local/bin carries the image's older node, which shadows
+# the repo's unless the setup script put the repo's node there.
 # pnpm 12's installer lays down no .tools binary, so its wrapper's own
 # directory goes on PATH whole.
 if [ -x "$exe" ]; then
@@ -32,8 +32,7 @@ export PATH="$bin:$PATH"
 node_major=$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null || echo 0)
 [ "$node_major" -ge 24 ] || { echo "cloud-install: node $(node -v 2>/dev/null || echo missing) on PATH, need >=24 (setup's node download failed?)" >&2; exit 1; }
 # later shells read this file. without it they find the image's pnpm, which
-# self-switches to `packageManager` with lifecycle scripts off, and turbo, which
-# spawns that placeholder directly, fails with `Exec format error`.
+# self-switches to `packageManager` with lifecycle scripts off.
 if [ -n "${CLAUDE_ENV_FILE:-}" ]; then
   echo "export PATH=\"$bin:\$PATH\"" >> "$CLAUDE_ENV_FILE"
 fi

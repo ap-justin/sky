@@ -274,7 +274,8 @@ test("an API error exits 1 with its message", async () => {
         {
           error: {
             code: "run_active",
-            message: "a run on this environment is active",
+            message:
+              "a run on this environment is active; wait for it or stop it",
           },
         },
         { status: 409 },
@@ -284,7 +285,7 @@ test("an API error exits 1 with its message", async () => {
   const r = await runCli(["apply", file]);
   expect(r.code).toBe(1);
   expect(r.stderr).toContain(
-    "a run on this environment is active (run_active)",
+    "a run on this environment is active; wait for it or stop it (run_active)",
   );
   expect(existsSync(lockFile)).toBe(false);
 });
@@ -484,7 +485,7 @@ test("Ctrl-C during a wait says the env keeps provisioning and how to pick it up
   const r = await runCli(["apply", file]);
   expect(r.code).toBe(0);
   expect(r.interruptNotes).toEqual([
-    "interrupted; web (env_1) keeps provisioning on the server — re-run sky apply to pick it up",
+    "interrupted; web (env_1) keeps provisioning on the server. Re-run sky apply to pick it up",
   ]);
   expect(r.armedAtExit).toBe(0);
 });

@@ -105,9 +105,10 @@ const unarchivedAgentIds = (tx: Tx, id: EnvironmentId) =>
     .map((a) => a.id);
 
 const notFound = "no such environment";
-const runActive = "a run on this environment is active";
-const nameTakenMessage = "an environment with this name exists";
-const stillProvisioning = "environment is still provisioning";
+const runActive = "a run on this environment is active; wait for it or stop it";
+const nameTakenMessage = "an environment with this name already exists";
+const stillProvisioning =
+  "environment is still provisioning; wait for it to finish";
 
 const reprovisioning = {
   status: "provisioning",

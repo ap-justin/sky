@@ -177,7 +177,7 @@ async function waitForProvisioned(
   const startedAt = io.now();
   out.progress(`provisioning ${name} (${id})…`);
   const disarm = io.onInterrupt(
-    `interrupted; ${name} (${id}) keeps provisioning on the server — re-run sky apply to pick it up`,
+    `interrupted; ${name} (${id}) keeps provisioning on the server. Re-run sky apply to pick it up`,
   );
   try {
     return await poll();

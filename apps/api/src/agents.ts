@@ -121,7 +121,7 @@ const atCap = (c: Context, limit: number) =>
     {
       error: {
         code: "concurrency_cap",
-        message: `this environment allows ${limit} active runs`,
+        message: `this environment allows ${limit} active runs; wait for one to end or stop one`,
         limit,
       },
     },

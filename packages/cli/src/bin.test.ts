@@ -166,6 +166,6 @@ test("Ctrl-C while waiting says the env keeps provisioning, then dies by SIGINT"
   expect({ code, signal }).toEqual({ code: null, signal: "SIGINT" });
   expect(stdout).toBe("");
   expect(stderr).toContain(
-    "sky: interrupted; web (env_slow) keeps provisioning on the server — re-run sky apply to pick it up\n",
+    "sky: interrupted; web (env_slow) keeps provisioning on the server. Re-run sky apply to pick it up\n",
   );
 });

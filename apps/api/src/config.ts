@@ -4,8 +4,8 @@ import { z } from "zod";
 // the build copies the runner bundle next to the API bundle, which is where this module lands
 const bundledRunner = fileURLToPath(new URL("./runner.mjs", import.meta.url));
 
-// bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match
 const configSchema = z.object({
+  /** Token68 only: bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match. */
   SKY_API_KEY: z
     .string()
     .min(32)

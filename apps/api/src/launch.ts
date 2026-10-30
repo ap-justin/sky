@@ -14,7 +14,7 @@ import { execInSprite, startDetached, writeSpriteFile } from "./sprites.js";
 
 const RUNNER = `${RUNNER_DIR}/runner.mjs`;
 // the session's env reaches the sprite as URL query params, so secrets ride in ENV_FILE, sourced
-// then deleted, and the prompt in PROMPT_FILE, which a query param is too short for.
+// then deleted, and the prompt in PROMPT_FILE, which a query param is too short for;
 // the run id in argv is what `runnerPattern` matches; the runner itself ignores it
 const RUNNER_COMMAND = `set -a && . "$ENV_FILE" && set +a && rm -f "$ENV_FILE" && PROMPT="$(cat "$PROMPT_FILE")" && export PROMPT && exec node ${RUNNER} "$RUN_ID"`;
 
@@ -149,7 +149,7 @@ export function createLauncher({
   watchMs,
 }: Deps) {
   let bundle: Promise<{ bytes: Buffer; sha256: string }> | undefined;
-  // read once: the bundle ships with this build of the API
+  // read once, again only after a failed read: the bundle ships with this build of the API
   const loadBundle = () => {
     bundle ??= readFile(config.runnerBundlePath).then((bytes) => ({
       bytes,
