@@ -1,4 +1,9 @@
-import { AgentId, RunId } from "@sky/shared";
+import {
+  AgentId,
+  type AutoApprove,
+  AutoApproveConfig,
+  RunId,
+} from "@sky/shared";
 import { z } from "zod";
 import { PolicyPattern } from "./policy.js";
 
@@ -26,6 +31,10 @@ const Env = z.object({
   REPO_DIR: z.string().min(1).default("/workspace/repo"),
   WORKTREES_DIR: z.string().min(1).default("/workspace/worktrees"),
   APPROVAL_POLICY: json.pipe(z.array(PolicyPattern)).default([]),
+  AUTO_APPROVE: json.pipe(AutoApproveConfig).default({
+    defaults: true,
+    commands: [],
+  }),
   WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
 });
 
@@ -40,6 +49,8 @@ export type Config = {
   worktreesDir: string;
   /** Tool-call patterns that wait for a person's approval; see `matchesPolicy`. */
   approvalPolicy: string[];
+  /** Read-only Bash commands that skip `approvalPolicy`; see `isAutoApproved`. */
+  autoApprove: AutoApprove;
   /** How long one wait for an answer or approval may last before the run fails. */
   waitTimeoutMs: number;
 };
@@ -66,6 +77,7 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     repoDir: e.REPO_DIR,
     worktreesDir: e.WORKTREES_DIR,
     approvalPolicy: e.APPROVAL_POLICY,
+    autoApprove: e.AUTO_APPROVE,
     waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
   };
 }

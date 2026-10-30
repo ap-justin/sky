@@ -356,6 +356,7 @@ export function agentRoutes(
         prompt,
         sessionId: null,
         approvalPolicy: outcome.env.approvalPolicy,
+        autoApprove: outcome.env.autoApprove,
       });
       c.header("Location", `/v1/agents/${agentId}/runs/${runId}`);
       return c.json(
@@ -469,6 +470,7 @@ export function agentRoutes(
         prompt,
         sessionId: outcome.agent.sessionId,
         approvalPolicy: outcome.env.approvalPolicy,
+        autoApprove: outcome.env.autoApprove,
       });
       c.header("Location", `/v1/agents/${id}/runs/${runId}`);
       return c.json(

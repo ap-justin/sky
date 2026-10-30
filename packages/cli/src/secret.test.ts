@@ -37,6 +37,7 @@ const list = http.get(`${apiUrl}/v1/environments`, () =>
         checkpointId: null,
         concurrency: 3,
         approvalPolicy: [],
+        autoApprove: { defaults: true, commands: [] },
         failure: null,
       },
     ],

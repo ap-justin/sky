@@ -38,6 +38,9 @@ repo: owner/name # GitHub repo, cloned once per environment
 setup: pnpm install # shell script run once after the clone
 concurrency: 3 # agents running at once (default 3)
 approvalPolicy: [Bash] # tool names whose calls wait for your approval
+autoApprove: # optional: Bash commands that skip approvalPolicy
+  defaults: true # false drops the built-in list
+  commands: [make check] # added to the built-ins (or all there is, with defaults: false)
 ```
 
 ```
@@ -55,6 +58,37 @@ sky status <agent>    # status, summary, error and compare link
 ```
 
 [Driving agents](docs/driving-agents.md) walks a bot through an agent end to end: start, wait, answer or approve, follow up, read the result, archive.
+
+### Approvals
+
+`approvalPolicy` holds the listed tool calls until you approve or deny them. A Bash command on the auto-approve list skips a bare `Bash` entry and runs at once, so `git status` or `grep` doesn't cost an approval. A `Bash(git diff:*)` entry still holds what it names, and `Read`, `Glob` and `Grep` are unaffected.
+
+A command skips approval only when it is one simple command of plain words that starts with a list entry, and none of the checks below asks. Anything else waits for you, and so does a command the runner can't evaluate.
+
+Built-in list (`defaults: true`), with what each asks on besides the checks on every command:
+
+- `ls`, `cat`, `head`, `pwd`, `which`: nothing more.
+- `wc`: asks on `--files0-from` and any `--f…`.
+- `echo`: the syntax check only; it prints its arguments, so they aren't checked as paths.
+- `grep`: asks on `-r`, `-R`, `-d` (also inside a bundle such as `-rn`), and any long option outside the plain matching and output ones.
+- `rg`: asks on `--pre`, `--pre-glob`, `--hidden`, `--follow`, `--no-ignore*`, `--ignore-file`, `--glob`, `--iglob`, `--type-add`, `--unrestricted`, `--search-zip`, `--hostname-bin`, `--trace`, `--debug`, and short options holding `z`, `u`, `L`, `g` or `.`.
+- `sed`: asks on anything but `sed -n 'N,Mp' file…` or `sed -n 'Np' file…`.
+- `tail`: asks on following, `-f`/`-F` in any bundle and any `--f…`.
+- `find`: asks on `-L`, `-follow`, `-files0-from`, `-exec`, `-execdir`, `-ok`, `-okdir`, `-delete`, `-fprint`, `-fprint0`, `-fprintf`, `-fls`.
+- `git status`, `git log`, `git diff`, `git show`, `git rev-parse`: asks on `-c`, `-O…`, `--output…`, `--ext-diff`, `--textconv`, `--no-index`, `--open-files-in-pager…`, `--exec-path…`, `--git-dir…`, `--work-tree…`.
+- `git branch`: asks on the git options above, any flag but `-l`/`--list`, `-a`/`--all`, `-r`/`--remotes`, `-v`/`-vv`/`--verbose`, `--show-current`, `--color`/`--no-color`, and a name without `--list` or `-l`.
+- `pnpm test`, `pnpm typecheck`, `pnpm lint`: see below.
+- `node --version`, `node -v`: asks on anything else.
+
+Checks on every command:
+
+- Syntax: unquoted `;` `&` `|` `<` `>` `(` `)` `*` `?` `[` `]` `{` `}` `#` ask (chaining, pipes, redirects, subshells, globs, braces, comments), and so do `$`, backticks, `\`, `!`, newlines, unbalanced quotes, a word starting with `~` (even quoted) and a word starting with an unquoted `=` (zsh expands `=ls` to a program's path). The first word must be a program name, not a variable assignment, a path or an option.
+- Paths: every argument, both sides of an `=` or `:` in it, and a value glued to a short option (`-o/etc/x`) is resolved against the shell's current directory, which an earlier `cd` may have moved. It asks when that lands outside the agent's worktree, when the shell itself is outside it, or when any path segment is `.claude`, `.config`, `.ssh`, `.aws`, `.gnupg`, `.kube`, `.docker` or `environ`, starts with `.env`, `.dev.vars`, `.npmrc`, `.yarnrc`, `.netrc`, `.pgpass`, `.pypirc`, `.htpasswd` or `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`, ends in `.pem`, `.key`, `.p12` or `.pfx`, or contains `credentials`, `token`, `secret` or `.tfstate` (any case), or when the path reaches `.git/config`. Segments are matched anywhere, so `cat .claude/CLAUDE.md` inside the worktree asks, and so does a search for `token` (`rg token src`).
+- Symlinks: each path that exists is followed to its real location and checked again, so a link inside the worktree that leads outside it, or onto a secret, asks. A path that doesn't exist is judged by its text; one that can't be resolved for another reason asks.
+
+`pnpm test`, `pnpm typecheck` and `pnpm lint` are built in, with `-r` and `--filter <pkg>` allowed before the script. They run whatever the repo's `package.json` and test files say, so approving them approves code the agent can edit; an environment that doesn't accept that sets `defaults: false` and lists the commands it does. They ask on script arguments starting with `-` other than `--`, `--run`, `--silent`, `--bail` and `--passWithNoTests`.
+
+`autoApprove.commands` adds entries and `defaults: false` replaces the built-ins; `defaults: false` with no `commands` turns auto-approval off. An entry is a prefix: `make check` approves `make check` followed by any plain arguments, so `git` alone approves `git push` and `git reset --hard`, and `pnpm exec` approves `pnpm exec rm build`. Added commands get the same syntax, path and per-program checks, and an entry those checks would always refuse is rejected when you apply the environment.
 
 ## Pull requests
 

@@ -1,8 +1,28 @@
 import { z } from "zod";
+import { commandEntryProblem } from "./auto-approve.js";
 import { EnvironmentId } from "./ids.js";
 
 export const EnvironmentStatus = z.enum(["provisioning", "ready", "failed"]);
 export type EnvironmentStatus = z.infer<typeof EnvironmentStatus>;
+
+/** Which Bash commands run without an approval request; see `isAutoApproved`. */
+export const AutoApproveConfig = z.strictObject({
+  /** Keep the built-in read-only commands; false leaves only `commands` (none turns it off). */
+  defaults: z.boolean().default(true),
+  /** Commands added to the built-ins, each the leading words of a command, e.g. `git tag --list`. */
+  commands: z
+    .array(
+      z
+        .string()
+        .max(200)
+        .superRefine((entry, ctx) => {
+          const problem = commandEntryProblem(entry);
+          if (problem) ctx.addIssue({ code: "custom", message: problem });
+        }),
+    )
+    .max(64)
+    .default(() => []),
+});
 
 export const Environment = z.object({
   id: EnvironmentId,
@@ -24,5 +44,10 @@ export const Environment = z.object({
   concurrency: z.int().positive().default(3),
   /** Tool-name patterns whose calls wait for an approval decision. */
   approvalPolicy: z.array(z.string().min(1)).default(() => []),
+  /** Read-only Bash commands that skip `approvalPolicy`; anything unlisted keeps asking. */
+  autoApprove: AutoApproveConfig.default(() => ({
+    defaults: true,
+    commands: [],
+  })),
 });
 export type Environment = z.infer<typeof Environment>;

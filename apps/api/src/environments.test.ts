@@ -140,6 +140,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     checkpointId: null,
     concurrency: 3,
     approvalPolicy: [],
+    autoApprove: { defaults: true, commands: [] },
     failure: null,
     createdAt: expect.stringMatching(
       /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z$/,
@@ -696,6 +697,75 @@ test("PATCH of name, concurrency or policy updates in place with 200 and no spri
   expect(wire.calls).toEqual([]);
 });
 
+test("POST stores a custom autoApprove, which GET returns", async () => {
+  const autoApprove = { defaults: false, commands: ["make check"] };
+  const res = await post({ ...kru, autoApprove });
+  expect(res.status).toBe(202);
+  const { id } = (await res.json()) as { id: string };
+  expect(await settled(id)).toMatchObject({ status: "ready", autoApprove });
+});
+
+test("POST with an autoApprove command holding a shell operator gets 400 naming the command and creates nothing", async () => {
+  const res = await post({ ...kru, autoApprove: { commands: ["ls; rm x"] } });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({
+    error: {
+      code: "invalid_body",
+      message: expect.stringContaining("autoApprove.commands[0]"),
+    },
+  });
+  const list = await app.request("/v1/environments", { headers: auth });
+  expect(await list.json()).toEqual({ data: [] });
+  expect(wire.calls).toEqual([]);
+});
+
+test("PATCH of autoApprove updates in place with 200, and a later GET returns it", async () => {
+  const id = await ready();
+  const autoApprove = { defaults: false, commands: ["make check"] };
+  const res = await patch(id, { autoApprove });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ autoApprove });
+  expect((await get(id)).body).toMatchObject({ autoApprove });
+  expect(wire.calls).toEqual([]);
+});
+
+test.each([
+  [
+    "commands keeps the stored defaults",
+    { commands: ["make check", "make lint"] },
+    { defaults: false, commands: ["make check", "make lint"] },
+  ],
+  [
+    "defaults keeps the stored commands",
+    { defaults: true },
+    { defaults: true, commands: ["make check"] },
+  ],
+])("PATCH of autoApprove with only %s", async (_, sent, stored) => {
+  const id = await ready();
+  await patch(id, {
+    autoApprove: { defaults: false, commands: ["make check"] },
+  });
+  const res = await patch(id, { autoApprove: sent });
+  expect(res.status).toBe(200);
+  expect(await res.json()).toMatchObject({ autoApprove: stored });
+  expect((await get(id)).body).toMatchObject({ autoApprove: stored });
+});
+
+test("PATCH with an autoApprove command holding a shell operator gets 400 naming the command and keeps the stored value", async () => {
+  const id = await ready();
+  const res = await patch(id, { autoApprove: { commands: ["ls; rm x"] } });
+  expect(res.status).toBe(400);
+  expect(await res.json()).toEqual({
+    error: {
+      code: "invalid_body",
+      message: expect.stringContaining("autoApprove.commands[0]"),
+    },
+  });
+  expect((await get(id)).body).toMatchObject({
+    autoApprove: { defaults: true, commands: [] },
+  });
+});
+
 test("PATCH that changes setup reruns setup and replaces checkpointId", async () => {
   const id = await ready();
   const res = await patch(id, { setup: "pnpm install --frozen-lockfile" });
@@ -809,6 +879,7 @@ test("PATCH to a taken name is 409; an empty PATCH changes nothing", async () =>
     name: "kru",
     concurrency: 3,
     approvalPolicy: [],
+    autoApprove: { defaults: true, commands: [] },
   });
 });
 

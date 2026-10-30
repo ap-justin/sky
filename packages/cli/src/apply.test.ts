@@ -14,6 +14,7 @@ const spec = {
   setup: "pnpm install",
   concurrency: 3,
   approvalPolicy: [],
+  autoApprove: { defaults: true, commands: [] },
 };
 const env = (over: Record<string, unknown> = {}) => ({
   id: "env_1",

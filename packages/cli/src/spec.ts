@@ -10,7 +10,8 @@ import {
 } from "yaml";
 import { z } from "zod";
 
-const { name, repo, setup, concurrency, approvalPolicy } = Environment.shape;
+const { name, repo, setup, concurrency, approvalPolicy, autoApprove } =
+  Environment.shape;
 
 /** What `env.yaml` holds; the API's create body, so the API URL and key can't be smuggled in. */
 export const EnvSpec = z.strictObject({
@@ -19,6 +20,7 @@ export const EnvSpec = z.strictObject({
   setup,
   concurrency,
   approvalPolicy,
+  autoApprove,
 });
 export type EnvSpec = z.infer<typeof EnvSpec>;
 

@@ -14,6 +14,7 @@ test("parses a spec and fills the schema defaults", () => {
       setup: "pnpm install\n",
       concurrency: 3,
       approvalPolicy: [],
+      autoApprove: { defaults: true, commands: [] },
     },
   });
 });
@@ -79,4 +80,23 @@ test("the hash ignores key order and formatting", () => {
   if (!a.ok || !b.ok) throw new Error("fixture invalid");
   expect(specHash(a.spec)).toBe(specHash(b.spec));
   expect(specHash(a.spec)).toMatch(/^sha256:[0-9a-f]{64}$/);
+});
+
+test("reads autoApprove overrides and names the line of a bad command", () => {
+  const base = "name: web\nrepo: acme/web\nsetup: x\n";
+  const ok = parseSpec(
+    `${base}autoApprove:\n  defaults: false\n  commands:\n    - make check\n`,
+    "env.yaml",
+  );
+  expect(ok).toMatchObject({
+    ok: true,
+    spec: { autoApprove: { defaults: false, commands: ["make check"] } },
+  });
+  const bad = parseSpec(
+    `${base}autoApprove:\n  commands:\n    - "ls; rm x"\n`,
+    "env.yaml",
+  );
+  expect(bad.ok).toBe(false);
+  if (bad.ok) return;
+  expect(bad.errors[0]).toMatch(/^env\.yaml:6: autoApprove\.commands\.0: /);
 });

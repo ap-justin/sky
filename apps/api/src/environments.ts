@@ -20,21 +20,31 @@ import { activeRunStatuses, type Tx } from "./runs.js";
 import { destroySprite, spriteNameFor } from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
 
-const { name, repo, setup, concurrency, approvalPolicy } = Environment.shape;
+const { name, repo, setup, concurrency, approvalPolicy, autoApprove } =
+  Environment.shape;
 const EnvironmentInput = z.strictObject({
   name,
   repo,
   setup,
   concurrency,
   approvalPolicy,
+  autoApprove,
 });
-// unwrapped: zod 4 applies a default even inside .optional(), which would reset omitted fields
+// unwrapped: zod 4 applies a default even inside .optional(), which would reset omitted fields;
+// autoApprove's own fields too, so the handler merges what was sent over the stored value
+const autoApproveFields = autoApprove.unwrap().shape;
 const EnvironmentPatch = z.strictObject({
   name: name.optional(),
   repo: repo.optional(),
   setup: setup.optional(),
   concurrency: concurrency.unwrap().optional(),
   approvalPolicy: approvalPolicy.unwrap().optional(),
+  autoApprove: z
+    .strictObject({
+      defaults: autoApproveFields.defaults.unwrap().optional(),
+      commands: autoApproveFields.commands.unwrap().optional(),
+    })
+    .optional(),
 });
 
 type EnvRow = typeof environments.$inferSelect;
@@ -50,6 +60,7 @@ const present = (row: EnvRow) => ({
     checkpointId: row.checkpointId,
     concurrency: row.concurrency,
     approvalPolicy: row.approvalPolicy,
+    autoApprove: row.autoApprove,
   } satisfies Environment),
   // while provisioning, failure_step holds the step in progress
   failure:
@@ -204,9 +215,17 @@ export function environmentRoutes(
             ) {
               return nameTakenResult;
             }
+            const { autoApprove: sentAutoApprove, ...rest } = patch;
+            const fields =
+              sentAutoApprove === undefined
+                ? rest
+                : {
+                    ...rest,
+                    autoApprove: { ...env.autoApprove, ...sentAutoApprove },
+                  };
             const changes = reprovision
-              ? { ...patch, ...reprovisioning }
-              : patch;
+              ? { ...fields, ...reprovisioning }
+              : fields;
             // drizzle refuses an update with nothing to set
             const row =
               Object.keys(changes).length === 0

@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SpritesClient } from "@fly/sprites";
-import { type Db, environments, migrate, openDb, runs } from "@sky/db";
+import { type Db, environments, migrate, openDb, runs, secrets } from "@sky/db";
 import {
   type AgentId,
   type EnvironmentId,
@@ -17,6 +17,7 @@ import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
 import type { Config } from "./config.js";
+import { envSecretAad, seal } from "./crypto.js";
 import { failStaleRuns } from "./runs.js";
 import { spriteNameFor } from "./sprites.js";
 import {
@@ -172,6 +173,7 @@ test("launch uploads the bundle, then starts the runner as a detached session an
     REPO_DIR: "/workspace/repo",
     WORKTREES_DIR: "/workspace/worktrees",
     APPROVAL_POLICY: "[]",
+    AUTO_APPROVE: JSON.stringify({ defaults: true, commands: [] }),
     WAIT_TIMEOUT_MINUTES: "120",
   });
   // the secrets ride in a file only the sprite user can read, which the command sources and deletes
@@ -223,6 +225,43 @@ test("the runner gets the env's approval policy as a JSON array", async () => {
   await sessionOpened();
   expect(wire.sessions[0]?.env.APPROVAL_POLICY).toBe(
     '["Bash","mcp__github__*"]',
+  );
+});
+
+test("the runner gets the env's auto-approve overrides as JSON", async () => {
+  const autoApprove = { defaults: false, commands: ["make check"] };
+  await launched(readyEnv({ autoApprove }));
+  await sessionOpened();
+  expect(wire.sessions[0]?.env.AUTO_APPROVE).toBe(JSON.stringify(autoApprove));
+});
+
+test("a secret stored under a reserved name never reaches the runner, so the env's auto-approve setting holds", async () => {
+  const envId = readyEnv({ autoApprove: { defaults: false, commands: [] } });
+  // PUT refuses the name; this is a row written before it was reserved
+  db.insert(secrets)
+    .values({
+      envId,
+      name: "AUTO_APPROVE",
+      kind: "value",
+      connector: null,
+      ...seal(
+        config.secretEncryptionKey,
+        '{"defaults":true,"commands":["rm"]}',
+        envSecretAad(envId, "AUTO_APPROVE"),
+      ),
+    })
+    .run();
+  const { agent, run } = await launched(envId);
+  await sessionOpened();
+  expect(envFileOf(wire, wire.sessions[0])).not.toHaveProperty("AUTO_APPROVE");
+  expect(wire.sessions[0]?.env.AUTO_APPROVE).toBe(
+    JSON.stringify({ defaults: false, commands: [] }),
+  );
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body.secretNames).toEqual([]),
+  );
+  expect(logs.join("\n")).toContain(
+    `secret AUTO_APPROVE on ${envId} is reserved by sky; not passed to ${run.id}`,
   );
 });
 
@@ -1374,6 +1413,21 @@ test("a follow-up run resumes the agent's session in the same worktree", async (
   ).toBe("now add a test");
 });
 
+test("a follow-up run gets the env's approval policy and auto-approve as they stand now", async () => {
+  const { agent, envId } = await finishedRun();
+  const autoApprove = { defaults: false, commands: ["make check"] };
+  db.update(environments)
+    .set({ approvalPolicy: ["Bash"], autoApprove })
+    .where(eq(environments.id, envId))
+    .run();
+  expect((await followUp(agent.id, { prompt: "more" })).status).toBe(202);
+  await sessionOpened(2);
+  expect(wire.sessions[1]?.env).toMatchObject({
+    APPROVAL_POLICY: '["Bash"]',
+    AUTO_APPROVE: JSON.stringify(autoApprove),
+  });
+});
+
 test("a follow-up on an agent whose first run never started a session starts a fresh one", async () => {
   const { agent, run, token } = await runningRun();
   await postEvent(token, {
@@ -1917,6 +1971,11 @@ test("an envVar a runner echoes is redacted from the stored event while it is he
 test.each([
   ["a reserved name", { envVars: { PATH: "/evil" } }, "reserved_name"],
   ["a sky name", { envVars: { AGENT_TOKEN: "x" } }, "reserved_name"],
+  [
+    "the env's auto-approve setting",
+    { envVars: { AUTO_APPROVE: '{"defaults":true,"commands":["rm"]}' } },
+    "reserved_name",
+  ],
   ["an invalid name", { envVars: { "1X": "y" } }, "invalid_body"],
   [
     "a TTL over a day",

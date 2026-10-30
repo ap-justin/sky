@@ -2,7 +2,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import type { SpritesClient } from "@fly/sprites";
 import { type Db, environments, runs } from "@sky/db";
-import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
+import type { AgentId, AutoApprove, EnvironmentId, RunId } from "@sky/shared";
 import { and, eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
 import type { Config } from "./config.js";
@@ -14,7 +14,7 @@ import {
 } from "./provision.js";
 import { type KnownSecrets, redact } from "./redact.js";
 import { failRun, isActive } from "./runs.js";
-import { openEnvSecrets, openRunEnvVars } from "./secrets.js";
+import { isReservedName, openEnvSecrets, openRunEnvVars } from "./secrets.js";
 import {
   execInSprite,
   spriteExists,
@@ -146,6 +146,8 @@ export type Launch = {
   sessionId: string | null;
   /** The env's tool patterns that wait for an approval. */
   approvalPolicy: string[];
+  /** The env's read-only Bash commands that skip the approval policy. */
+  autoApprove: AutoApprove;
 };
 
 /**
@@ -219,8 +221,22 @@ export function createLauncher({
       return;
     }
     const key = config.secretEncryptionKey;
-    const envSecrets = openEnvSecrets(db, key, launch.envId);
-    const envVars = openRunEnvVars(db, key, launch.runId);
+    // a name reserved after it was stored would override the runner's own variable once sourced
+    const unreserved = (vars: Map<string, string>, kind: string) => {
+      for (const name of vars.keys()) {
+        if (!isReservedName(name)) continue;
+        vars.delete(name);
+        log(
+          `${kind} ${name} on ${launch.envId} is reserved by sky; not passed to ${launch.runId}`,
+        );
+      }
+      return vars;
+    };
+    const envSecrets = unreserved(
+      openEnvSecrets(db, key, launch.envId),
+      "secret",
+    );
+    const envVars = unreserved(openRunEnvVars(db, key, launch.runId), "envVar");
     db.update(runs)
       .set({
         secretNames: [
@@ -257,6 +273,7 @@ export function createLauncher({
           REPO_DIR,
           WORKTREES_DIR,
           APPROVAL_POLICY: JSON.stringify(launch.approvalPolicy),
+          AUTO_APPROVE: JSON.stringify(launch.autoApprove),
           WAIT_TIMEOUT_MINUTES: String(config.waitTimeoutMs / 60_000),
           ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
         },

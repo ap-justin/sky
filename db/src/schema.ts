@@ -74,6 +74,10 @@ export const environments = sqliteTable(
       .$type<string[]>()
       .notNull()
       .default([]),
+    autoApprove: text("auto_approve", { mode: "json" })
+      .$type<{ defaults: boolean; commands: string[] }>()
+      .notNull()
+      .default({ defaults: true, commands: [] }),
     failureStep: text("failure_step", { enum: environmentFailureSteps }),
     // redacted and truncated by the API before it lands here
     failureStderr: text("failure_stderr"),
@@ -89,6 +93,10 @@ export const environments = sqliteTable(
     check(
       "environments_approval_policy",
       sql`json_type(${c(t.approvalPolicy)}) = 'array'`,
+    ),
+    check(
+      "environments_auto_approve",
+      sql`json_type(${c(t.autoApprove)}) = 'object'`,
     ),
     check(
       "environments_failure_step",
