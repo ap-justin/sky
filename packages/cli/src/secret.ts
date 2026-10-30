@@ -20,7 +20,7 @@ async function readValue(name: string, io: Io): Promise<string> {
 }
 
 /** An id is used as given; anything else is looked up as a name. */
-async function resolveEnvId(api: Api, ref: string, out: Output) {
+export async function resolveEnvId(api: Api, ref: string, out: Output) {
   if (EnvironmentId.safeParse(ref).success) return ref;
   const env = (await api.listEnvironments()).find((e) => e.name === ref);
   if (env === undefined) {

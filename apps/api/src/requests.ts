@@ -48,6 +48,14 @@ const resumedAs = {
   deny: "denied",
 } as const;
 
+const alreadyDecided = (recorded: Decision | null | undefined) => {
+  if (!recorded) throw new Error("a decided request has no decision");
+  return {
+    kind: "already_decided",
+    decision: resumedAs[recorded.decision],
+  } as const;
+};
+
 /**
  * Records `decision` on its request, if it is open on the agent's waiting run, and moves the run and
  * agent back to `running`. Publish the request's decision once `tx` commits.
@@ -66,6 +74,7 @@ export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
   if (found.request.kind !== wanted) {
     return { kind: "wrong_kind", requestKind: found.request.kind } as const;
   }
+  if (found.request.decidedAt) return alreadyDecided(found.request.decision);
   if (found.run.status !== "waiting") return { kind: "closed" } as const;
   // the decided_at guard makes a concurrent second decision a no-op
   const { changes } = tx
@@ -78,7 +87,14 @@ export function decideRequest(tx: Tx, agentId: AgentId, decision: Decision) {
       ),
     )
     .run();
-  if (changes === 0) return { kind: "closed" } as const;
+  if (changes === 0) {
+    const recorded = tx
+      .select({ decision: runRequests.decision })
+      .from(runRequests)
+      .where(eq(runRequests.id, decision.requestId))
+      .get();
+    return alreadyDecided(recorded?.decision);
+  }
   const run = tx
     .update(runs)
     .set({ status: "running" })

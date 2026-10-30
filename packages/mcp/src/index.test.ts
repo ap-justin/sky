@@ -213,7 +213,7 @@ test("approve posts a deny decision with its reason", async () => {
   ]);
 });
 
-test("approve sends no reason with an approve, which the API rejects", async () => {
+test("approve sends its reason with an approve too", async () => {
   const decided = { id: "req_2", decision: { decision: "approve" } };
   const seen = route("post", "/v1/agents/agt_1/approvals", 200, decided);
   const client = await connect();
@@ -230,8 +230,109 @@ test("approve sends no reason with an approve, which the API rejects", async () 
 
   expect(result.isError).toBeFalsy();
   expect(seen.map((s) => s.body)).toEqual([
-    { requestId: "req_2", decision: "approve" },
+    { requestId: "req_2", decision: "approve", reason: "looks fine" },
   ]);
+});
+
+const alreadyDecided = (decision: string) => ({
+  error: {
+    code: "already_decided",
+    message: "req_1 was already decided",
+    decision,
+  },
+});
+
+test.each([
+  {
+    tool: "answer",
+    path: "/answers",
+    args: { answer: "use pnpm" },
+    decision: "answered",
+  },
+  {
+    tool: "approve",
+    path: "/approvals",
+    args: { decision: "approve" },
+    decision: "approved",
+  },
+  {
+    tool: "approve",
+    path: "/approvals",
+    args: { decision: "deny" },
+    decision: "denied",
+  },
+])(
+  "$tool on a request already $decision that way is resolved, not an error",
+  async ({ tool, path, args, decision }) => {
+    route("post", `/v1/agents/agt_1${path}`, 409, alreadyDecided(decision));
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: tool,
+      arguments: { agentId: "agt_1", requestId: "req_1", ...args },
+    });
+
+    expect(result.isError).toBeFalsy();
+    expect(textOf(result)).toEqual({
+      requestId: "req_1",
+      alreadyResolved: true,
+      decision,
+    });
+  },
+);
+
+test.each([
+  {
+    tool: "answer",
+    path: "/answers",
+    args: { answer: "use pnpm" },
+    decision: "denied",
+  },
+  {
+    tool: "approve",
+    path: "/approvals",
+    args: { decision: "approve" },
+    decision: "denied",
+  },
+  {
+    tool: "approve",
+    path: "/approvals",
+    args: { decision: "deny" },
+    decision: "approved",
+  },
+])(
+  "$tool on a request already $decision otherwise stays an error",
+  async ({ tool, path, args, decision }) => {
+    const envelope = alreadyDecided(decision);
+    route("post", `/v1/agents/agt_1${path}`, 409, envelope);
+    const client = await connect();
+
+    const result = await client.callTool({
+      name: tool,
+      arguments: { agentId: "agt_1", requestId: "req_1", ...args },
+    });
+
+    expect(result.isError).toBe(true);
+    expect(textOf(result)).toEqual({ status: 409, ...envelope });
+  },
+);
+
+test("archive posts to the agent's archive route and is listed destructive", async () => {
+  const archived = { id: "agt_1", archivedAt: "2026-10-30T00:00:00Z" };
+  const seen = route("post", "/v1/agents/agt_1/archive", 200, archived);
+  const client = await connect();
+
+  const result = await client.callTool({
+    name: "archive",
+    arguments: { agentId: "agt_1" },
+  });
+  const { tools } = await client.listTools();
+
+  expect(textOf(result)).toEqual(archived);
+  expect(seen).toEqual([{ auth: `Bearer ${KEY}`, body: null }]);
+  expect(
+    tools.find((t) => t.name === "archive")?.annotations?.destructiveHint,
+  ).toBe(true);
 });
 
 test("stop posts to the agent's stop route", async () => {

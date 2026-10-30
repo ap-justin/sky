@@ -46,6 +46,16 @@ sky secret set web NPM_TOKEN < token.txt
 
 Stores a secret on an environment; on a terminal it prompts without echo. `sky --help` lists the options, the config file location, and exit codes.
 
+```
+sky agent start web --prompt @task.md
+sky wait <agent>      # until it needs an answer or approval, or ends
+sky inbox <agent>     # the pending question or approval
+sky approve <agent> <requestId>   # or deny --reason=…, or answer <text>
+sky status <agent>    # status, summary, error and compare link
+```
+
+[Driving agents](docs/driving-agents.md) walks a bot through an agent end to end: start, wait, answer or approve, follow up, read the result, archive.
+
 ## Pull requests
 
 An agent's sandbox holds no GitHub token, so `git push` and `gh` don't work there. Agents publish through a Sprites connector to GitHub instead:
@@ -94,7 +104,7 @@ Errors come back as `{ "error": { "code": …, "message": … } }`. The ones you
 
 ## MCP
 
-`POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
+`POST /mcp` (streamable HTTP, same bearer key) exposes `create_env`, `launch`, `followup`, `status`, `answer`, `approve`, `stop`, `archive` and `wait_for_events`, so a chat bot can dispatch, follow and answer agents.
 
 `wait_for_events` waits up to 30 seconds and returns as soon as something happens, with a `cursor` to pass back as `after` on the next call. Call it in a loop to follow every agent live without a public URL. On a first call, use `status` for agents already waiting.
 

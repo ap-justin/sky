@@ -25,7 +25,11 @@ export type PendingRequest = z.infer<typeof PendingRequest>;
 export const EventCursor = z.string().regex(/^(?:evt_)?\d{1,15}$/);
 
 export const Decision = z.discriminatedUnion("decision", [
-  z.object({ requestId: RequestId, decision: z.literal("approve") }),
+  z.object({
+    requestId: RequestId,
+    decision: z.literal("approve"),
+    reason: z.string().optional(),
+  }),
   z.object({
     requestId: RequestId,
     decision: z.literal("deny"),

@@ -258,16 +258,47 @@ test("an answer for an approval gets 409 wrong_kind", async () => {
   expect(wire.calls).not.toContain("exec sky-env_test - true");
 });
 
-test("a second decision gets 409 request_closed", async () => {
-  const { requestId } = await waitingOn(question());
-  expect((await decide("answers", { requestId, answer: "a" })).status).toBe(
-    200,
-  );
-  const wakes = wire.calls.length;
-  const res = await decide("answers", { requestId, answer: "b" });
-  expect([res.status, await errorCode(res)]).toEqual([409, "request_closed"]);
-  expect(wire.calls).toHaveLength(wakes);
-});
+test.each([
+  [
+    "a second answer",
+    question,
+    ["answers", { answer: "secret a" }],
+    ["answers", { answer: "b" }],
+    "answered",
+  ],
+  [
+    "a second approve",
+    approval,
+    ["approvals", { decision: "approve" }],
+    ["approvals", { decision: "approve" }],
+    "approved",
+  ],
+  [
+    "an approve after a deny",
+    approval,
+    ["approvals", { decision: "deny", reason: "secret why" }],
+    ["approvals", { decision: "approve" }],
+    "denied",
+  ],
+] as const)(
+  "%s gets 409 already_decided naming the recorded decision, and wakes nothing",
+  async (_, request, [firstVerb, first], [againVerb, again], recorded) => {
+    const { requestId } = await waitingOn(request());
+    expect((await decide(firstVerb, { requestId, ...first })).status).toBe(200);
+    const wakes = wire.calls.length;
+    const res = await decide(againVerb, { requestId, ...again });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toEqual({
+      error: {
+        code: "already_decided",
+        message: "the request is already decided",
+        decision: recorded,
+      },
+    });
+    expect(wire.calls).toHaveLength(wakes);
+    expect(resumed()).toHaveLength(1);
+  },
+);
 
 test("a request unknown to the agent gets 404", async () => {
   const { requestId } = await waitingOn(question());
@@ -318,14 +349,15 @@ test("deciding without a bearer gets 401 and decides nothing", async () => {
   expect(statuses().run).toBe("waiting");
 });
 
-test("an approve with a reason gets 400", async () => {
+test("an approve with an empty reason gets 400", async () => {
   const { requestId } = await waitingOn(approval());
   const res = await decide("approvals", {
     requestId,
     decision: "approve",
-    reason: "fine",
+    reason: "",
   });
   expect(res.status).toBe(400);
+  expect(statuses().run).toBe("waiting");
 });
 
 const poll = (requestId: string, bearer = token, signal?: AbortSignal) =>
@@ -381,6 +413,20 @@ test("the long-poll on an already decided request returns its decision at once",
   expect(await (await poll(requestId)).json()).toEqual({
     status: "decided",
     decision: { requestId, decision: "deny", reason: "no" },
+  });
+});
+
+test("an approve's reason is recorded with the decision the long-poll returns", async () => {
+  const { requestId } = await waitingOn(approval());
+  const res = await decide("approvals", {
+    requestId,
+    decision: "approve",
+    reason: "scoped to build/",
+  });
+  expect(res.status).toBe(200);
+  expect(await (await poll(requestId)).json()).toEqual({
+    status: "decided",
+    decision: { requestId, decision: "approve", reason: "scoped to build/" },
   });
 });
 
