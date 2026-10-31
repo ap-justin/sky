@@ -1,13 +1,22 @@
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
   GATEWAY_URL_ENV,
+  GatewayError,
   gateway,
 } from "./publish.js";
-import { fetchMissing, git, messageOf, remoteHead } from "./store.js";
+import {
+  fetchMissing,
+  git,
+  messageOf,
+  type Progress,
+  remoteHead,
+  type TreeItem,
+} from "./store.js";
 
 export const REPO_PULL_USAGE = "repo-pull <owner/repo> <dir>";
 
@@ -46,19 +55,40 @@ const objectId = (body: string) => {
 };
 
 /**
- * The commit's raw object text, which hashes to `sha`; null when no reading of what GitHub's API
- * returned does. Tries the author's and committer's zone (UTC, then every real one) and the message
- * with and without its final newline, and a signed commit with its signature put back.
+ * A signed commit's object text: the signed payload with the signature as its last header, where
+ * git writes it, so headers the API has no field for (`mergetag`, `encoding`) come back verbatim.
  */
-export function rebuildCommit(sha: string, commit: ApiCommit): string | null {
+function signedText(payload: string, signature: string): string {
+  const gpgsig = `gpgsig ${signature.replace(/\n$/, "").split("\n").join("\n ")}\n`;
+  const blank = payload.indexOf("\n\n");
+  const at = blank === -1 ? payload.length : blank + 1;
+  return `${payload.slice(0, at)}${gpgsig}${payload.slice(at)}`;
+}
+
+/**
+ * The commit's raw object text, which hashes to `sha`; throws, saying why, when what GitHub's API
+ * returned can't reproduce it. A signed commit comes from its signed payload. An unsigned one is
+ * rebuilt from its fields, trying the author's and committer's zone (UTC, then every real one) and
+ * the message with and without its final newline.
+ */
+export function rebuildCommit(sha: string, commit: ApiCommit): string {
+  const { signature, payload } = commit.verification ?? {};
+  if (signature) {
+    if (!payload) {
+      throw new Error(
+        `commit ${sha} is signed, but GitHub's API gave no signed text to rebuild it from`,
+      );
+    }
+    const text = signedText(payload, signature);
+    if (objectId(text) === sha) return text;
+    throw new Error(
+      `commit ${sha} is signed, but its signed text from GitHub's API doesn't hash to it, as when its message isn't UTF-8`,
+    );
+  }
   const head = [
     `tree ${commit.tree.sha}`,
     ...commit.parents.map((p) => `parent ${p.sha}`),
   ];
-  const signature = commit.verification?.signature;
-  const gpgsig = signature
-    ? `gpgsig ${signature.replace(/\n$/, "").split("\n").join("\n ")}`
-    : null;
   const tries: [number, number][] = [
     ...OFFSETS_MIN.map((m): [number, number] => [m, m]),
     ...OFFSETS_MIN.flatMap((a) =>
@@ -71,14 +101,14 @@ export function rebuildCommit(sha: string, commit: ApiCommit): string | null {
       `author ${identity(commit.author, a)}`,
       `committer ${identity(commit.committer, c)}`,
     ];
-    for (const extra of gpgsig ? [[gpgsig], []] : [[]]) {
-      for (const tail of ["", "\n"]) {
-        const text = `${[...headers, ...extra].join("\n")}\n\n${commit.message}${tail}`;
-        if (objectId(text) === sha) return text;
-      }
+    for (const tail of ["", "\n"]) {
+      const text = `${headers.join("\n")}\n\n${commit.message}${tail}`;
+      if (objectId(text) === sha) return text;
     }
   }
-  return null;
+  throw new Error(
+    `commit ${sha} is unsigned and carries more than GitHub's API returns (a mergetag or encoding header, or a message that isn't UTF-8), so it can't be rebuilt`,
+  );
 }
 
 /**
@@ -86,7 +116,8 @@ export function rebuildCommit(sha: string, commit: ApiCommit): string | null {
  * and no git transport: the branch's commit, its tree and every blob are fetched and written as git
  * objects, so the checkout holds the same commit sha as GitHub, and `origin/HEAD` names it, which
  * is what a worktree branches from and what a publish takes as its parent. The commit is shallow:
- * its ancestors stay on GitHub. `dir` must not already be a checkout.
+ * its ancestors stay on GitHub. A failure removes what this run created; a checkout an earlier,
+ * killed run left is finished, not refused.
  */
 export async function pullRepo(options: {
   repo: string;
@@ -103,32 +134,77 @@ export async function pullRepo(options: {
     repo: name,
   });
   const progress = options.progress ?? (() => {});
-  const remote = await remoteHead(call);
+  const remote = await remoteHead(call).catch((error: unknown) => {
+    if (error instanceof GatewayError && error.status === 404) {
+      throw new Error(
+        `the connector in ${CONNECTOR_ENV} can't see ${options.repo}; check its connection id and the repos it grants (${error.message})`,
+      );
+    }
+    // GitHub's answer to a ref lookup in a repo with no commits
+    if (error instanceof GatewayError && error.status === 409) {
+      throw new Error(
+        `${options.repo} is empty: its default branch has no commit to check out; push one first (${error.message})`,
+      );
+    }
+    throw error;
+  });
   const commit = await call<ApiCommit>("GET", `/git/commits/${remote.sha}`);
   const listing = await call<{
-    tree: { path: string; mode: string; type: string; sha: string }[];
+    tree: TreeItem[];
     truncated: boolean;
   }>("GET", `/git/trees/${commit.tree.sha}?recursive=1`);
   if (listing.truncated) {
     throw new Error(`the tree of ${options.repo} is too large to fetch`);
   }
-  const raw = rebuildCommit(remote.sha, commit);
-  if (raw === null) {
+  let raw: string;
+  try {
+    raw = rebuildCommit(remote.sha, commit);
+  } catch (error) {
     throw new Error(
-      `could not reproduce commit ${remote.sha} from GitHub's API; a checkout would not share its sha`,
+      `${messageOf(error)}; a checkout would not share GitHub's sha. Move ${remote.branch} to a commit that rebuilds, such as a new one on top`,
     );
   }
 
-  await mkdir(options.dir, { recursive: true });
-  const g = git(options.dir);
+  const dir = resolve(options.dir);
+  const hadGit = existsSync(join(dir, ".git"));
+  // the first directory mkdir made, which a failure takes back with it
+  const created = await mkdir(dir, { recursive: true });
+  try {
+    await writeCheckout(dir, options.repo, remote, commit, listing.tree, raw, {
+      call,
+      progress,
+    });
+  } catch (error) {
+    if (created) await rm(created, { recursive: true, force: true });
+    else if (!hadGit)
+      await rm(join(dir, ".git"), { recursive: true, force: true });
+    throw error;
+  }
+  return remote;
+}
+
+/**
+ * Writes the fetched commit into `dir` as a checkout of it. Each step converges on a repo an
+ * earlier, killed run left, so a re-run finishes it.
+ */
+async function writeCheckout(
+  dir: string,
+  repo: string,
+  remote: { branch: string; sha: string },
+  commit: ApiCommit,
+  tree: TreeItem[],
+  raw: string,
+  source: { call: ReturnType<typeof gateway>; progress: Progress },
+): Promise<void> {
+  const g = git(dir);
   await g(["init", "-q", "-b", remote.branch]);
-  const blobs = listing.tree.filter((item) => item.type === "blob");
-  await fetchMissing(g, call, blobs, progress, "repo pull");
+  const blobs = tree.filter((item) => item.type === "blob");
+  await fetchMissing(g, source.call, blobs, source.progress, "repo pull");
   // a submodule is a gitlink: a commit sha in the tree with nothing behind it here
-  const entries = listing.tree.filter(
+  const entries = tree.filter(
     (item) => item.type === "blob" || item.type === "commit",
   );
-  const index = join(options.dir, ".git", "sky-pull-index");
+  const index = join(dir, ".git", "sky-pull-index");
   const env = { GIT_INDEX_FILE: index };
   try {
     await g(["update-index", "-z", "--add", "--index-info"], {
@@ -137,9 +213,9 @@ export async function pullRepo(options: {
         .join(""),
       env,
     });
-    const tree = await g(["write-tree"], { env });
-    if (tree !== commit.tree.sha) {
-      throw new Error(`tree ${commit.tree.sha} arrived as ${tree}`);
+    const built = await g(["write-tree"], { env });
+    if (built !== commit.tree.sha) {
+      throw new Error(`tree ${commit.tree.sha} arrived as ${built}`);
     }
   } finally {
     await rm(index, { force: true });
@@ -150,12 +226,18 @@ export async function pullRepo(options: {
   if (written !== remote.sha) {
     throw new Error(`commit ${remote.sha} arrived as ${written}`);
   }
-  if (commit.parents.length > 0) {
-    await writeFile(join(options.dir, ".git", "shallow"), `${remote.sha}\n`);
-  }
-  const url = `https://github.com/${options.repo}.git`;
+  const shallow = join(dir, ".git", "shallow");
+  if (commit.parents.length > 0) await writeFile(shallow, `${remote.sha}\n`);
+  else await rm(shallow, { force: true });
   const remoteRef = `refs/remotes/origin/${remote.branch}`;
-  await g(["remote", "add", "origin", url]);
+  // what `git remote add` writes, set rather than added so an existing origin is overwritten
+  await g(["config", "remote.origin.url", `https://github.com/${repo}.git`]);
+  await g([
+    "config",
+    "--replace-all",
+    "remote.origin.fetch",
+    "+refs/heads/*:refs/remotes/origin/*",
+  ]);
   await g(["update-ref", remoteRef, remote.sha]);
   await g(["symbolic-ref", "refs/remotes/origin/HEAD", remoteRef]);
   await g(["update-ref", `refs/heads/${remote.branch}`, remote.sha]);
@@ -166,7 +248,6 @@ export async function pullRepo(options: {
     `refs/heads/${remote.branch}`,
   ]);
   await g(["reset", "--quiet", "--hard", remote.sha]);
-  return remote;
 }
 
 /**

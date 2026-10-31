@@ -158,9 +158,9 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `create ${sprite}`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
-    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     setupCall(sprite, "pnpm install"),
     pluginsCall(sprite),
     `checkpoint ${sprite}`,
@@ -574,7 +574,7 @@ test.each([
   },
 );
 
-test("a runner SDK install that fails ends failed at the setup step", async () => {
+test("a runner SDK install that fails ends failed at the setup step, before any clone", async () => {
   wire.exec = (argv) =>
     argv[0] === "sh"
       ? { exitCode: 1, stderr: "npm ERR! network\n" }
@@ -585,6 +585,19 @@ test("a runner SDK install that fails ends failed at the setup step", async () =
     failure: { step: "setup", stderr: "npm ERR! network\n" },
   });
   expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
+  expect(wire.calls.some((c) => c.includes("git clone"))).toBe(false);
+});
+
+test("a plain clone that fails after the SDK install ends failed at the clone step", async () => {
+  wire.exec = (argv) =>
+    argv[0] === "git"
+      ? { exitCode: 128, stderr: "fatal: repository not found\n" }
+      : { exitCode: 0 };
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  expect(await settled(id)).toMatchObject({
+    status: "failed",
+    failure: { step: "clone", stderr: "fatal: repository not found\n" },
+  });
 });
 
 test("a clone that hangs past the long bound ends failed at the clone step with the timeout, and logs it", async () => {
@@ -891,9 +904,9 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
   const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
-    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     setupCall(sprite, "pnpm install --frozen-lockfile"),
     pluginsCall(sprite),
     `checkpoint ${sprite}`,
@@ -952,6 +965,8 @@ test("with a connector, provisioning checks the Kru store out through the runner
   const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
+    // the runner loads the SDK at startup, so a fresh sprite's repo-pull needs it installed first
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
     `write ${sprite} /opt/sky/runner.mjs.provision-${id}`,
@@ -963,7 +978,6 @@ test("with a connector, provisioning checks the Kru store out through the runner
       ),
     ),
     `exec ${sprite} - rm -f ${REPO_ENV_FILE}`,
-    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     setupCall(sprite, "pnpm install --frozen-lockfile"),
     pluginsCall(sprite),
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
@@ -988,8 +1002,11 @@ test("with a connector, provisioning checks the Kru store out through the runner
     KRU_STORE_REPO: "ap-justin/kru-store",
   });
   expect(wire.execUrls.join("\n")).not.toContain("VPpb7x");
-  // the repo pull's env is only the connector, in a 0600 file, and no git clone is attempted
+  // the repo pull's env is only the connector (the runner defaults the gateway), in a 0600 file
   expect(wire.modes.get(REPO_ENV_FILE)).toBe("0600");
+  expect(envFileOf(wire, { env: { ENV_FILE: REPO_ENV_FILE } })).toEqual({
+    GITHUB_CONNECTOR: "VPpb7x",
+  });
   expect(wire.calls.some((c) => c.includes("git clone"))).toBe(false);
 });
 
@@ -1040,10 +1057,114 @@ test("a failed repo pull ends failed at the clone step with the runner's output,
   );
 });
 
-test("with a connector but no runner bundle to upload, the clone step fails naming the bundle", async () => {
-  const { env } = await reprovisionWith(githubConnector, null);
+test("a repo env file write that fails ends failed at the clone step, runs no pull, and still removes the file", async () => {
+  const { id, env } = await reprovisionWith(
+    githubConnector,
+    "// runner",
+    () => {
+      // the bundle's upload lands; the env file's write after it fails
+      wire.exec = (argv) => {
+        if (argv[0] === "mv") wire.writeStatus = 500;
+        return { exitCode: 0 };
+      };
+    },
+  );
   expect(env).toMatchObject({ status: "failed", failure: { step: "clone" } });
+  const sprite = spriteNameFor(id);
+  expect(wire.calls.some((c) => c.includes("repo-pull"))).toBe(false);
+  expect(wire.calls).toContain(`exec ${sprite} - rm -f ${REPO_ENV_FILE}`);
+});
+
+test("a repo env file that won't remove after a failed pull keeps the pull's failure and logs the file it left", async () => {
+  const { env, logged } = await reprovisionWith(
+    githubConnector,
+    "// runner",
+    () => {
+      wire.exec = (argv) => {
+        if (argv.join(" ").includes("repo-pull")) {
+          return { exitCode: 1, stderr: "repo pull: failed: 404 Not Found" };
+        }
+        if (argv[0] === "rm" && argv[2] === REPO_ENV_FILE) {
+          return { exitCode: 1, stderr: "rm: Read-only file system" };
+        }
+        return { exitCode: 0 };
+      };
+    },
+  );
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "clone",
+      stderr: expect.stringContaining("repo pull: failed: 404 Not Found"),
+    },
+  });
+  expect(logged.join("\n")).toContain(REPO_ENV_FILE);
+  expect(logged.join("\n")).toContain("Read-only file system");
+  expect(logged.join("\n")).not.toContain("VPpb7x");
+});
+
+test("a repo env file that won't remove after a pull ends failed at the clone step naming the file, with nothing checkpointed", async () => {
+  const { env } = await reprovisionWith(githubConnector, "// runner", () => {
+    wire.exec = (argv) =>
+      argv[0] === "rm" && argv[2] === REPO_ENV_FILE
+        ? { exitCode: 1, stderr: "rm: Read-only file system" }
+        : { exitCode: 0 };
+  });
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "clone",
+      stderr: expect.stringContaining(REPO_ENV_FILE),
+    },
+  });
+  expect(wire.calls.some((c) => c.startsWith("checkpoint"))).toBe(false);
+});
+
+test("with a connector but no runner bundle to upload, the clone step fails naming the bundle, writing no env file and running no pull", async () => {
+  const { env } = await reprovisionWith(githubConnector, null);
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: { step: "clone", stderr: expect.stringContaining("runner.mjs") },
+  });
+  expect(wire.calls.some((c) => c.includes(REPO_ENV_FILE))).toBe(false);
+  expect(wire.calls.some((c) => c.includes("repo-pull"))).toBe(false);
   expect(wire.calls.some((c) => c.includes("git clone"))).toBe(false);
+});
+
+const failedPullEchoing = (gateway: string) =>
+  reprovisionWith(
+    { ...githubConnector, GITHUB_GATEWAY_URL: { value: gateway } },
+    "// runner",
+    () => {
+      wire.exec = (argv) =>
+        argv.join(" ").includes("repo-pull")
+          ? {
+              exitCode: 1,
+              stderr: `repo pull: failed: GET ${gateway}/VPpb7x/repos/acme/kru returned 502`,
+            }
+          : argv[0] === "rm" && argv[2] === REPO_ENV_FILE
+            ? { exitCode: 1, stderr: `rm: ${gateway} VPpb7x busy` }
+            : { exitCode: 0 };
+    },
+  );
+
+test("a failed repo pull whose output carries the gateway URL stores it nowhere, and the log of a file left behind scrubs the gateway URL and connector id", async () => {
+  const gateway = "https://gw.example/github";
+  const { env, logged } = await failedPullEchoing(gateway);
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: { step: "clone", stderr: expect.stringContaining("returned 502") },
+  });
+  const logs = logged.join("\n");
+  expect(logs).toContain("kept");
+  expect(JSON.stringify(env)).not.toContain(gateway);
+  expect(logs).not.toContain(gateway);
+  expect(logs).not.toContain("VPpb7x");
+});
+
+test("a failed repo pull whose output carries the connector id stores it nowhere", async () => {
+  const { env } = await failedPullEchoing("https://gw.example/github");
+  expect(JSON.stringify(env)).not.toContain("VPpb7x");
 });
 
 test("provisioning's store steps see the env's own gateway and KRU_HOME, as a run does, and a KRU_STORE_REPO secret overrides nothing", async () => {
@@ -1133,22 +1254,6 @@ test("a Kru store checkout that fails is logged without the connector id and nev
   expect(logged.join("\n")).toContain("checking out the Kru store");
   expect(logged.join("\n")).toContain("pull failed");
   expect(logged.join("\n")).not.toContain("VPpb7x");
-});
-
-test("env secrets that fail to decrypt for the store step are logged and never fail provisioning", async () => {
-  const { env, logged } = await reprovisionWith(
-    { ...githubConnector, TOKEN: { value: "t0ken" } },
-    "// runner",
-    () => {
-      db.$client
-        .prepare(
-          "UPDATE secrets SET ciphertext = zeroblob(16) WHERE name = 'TOKEN'",
-        )
-        .run();
-    },
-  );
-  expect(env).toMatchObject({ status: "ready", failure: null });
-  expect(logged.join("\n")).toContain("checking out the Kru store");
 });
 
 test("env secrets that fail to decrypt for the store step are logged and never fail provisioning", async () => {
@@ -1430,9 +1535,9 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
   const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
+    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
-    `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     setupCall(sprite, "pnpm install"),
     pluginsCall(sprite),
     `checkpoint ${sprite}`,

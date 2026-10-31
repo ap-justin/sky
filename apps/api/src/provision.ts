@@ -179,6 +179,8 @@ export function createProvisioner({
 }: Deps) {
   async function run(env: Target): Promise<void> {
     const name = spriteNameFor(env.id);
+    // env secret values a step handed to the sprite, which its output may echo into the stored failure
+    const stepSecrets: string[] = [];
     const exec = async (argv: [string, ...string[]], op: string) => {
       const out = await execInSprite(sprites, name, argv, { op });
       if (out.exitCode !== 0) {
@@ -279,26 +281,46 @@ export function createProvisioner({
         "GITHUB_GATEWAY_URL",
       ]);
       const known = [...pulled.values()];
+      stepSecrets.push(...known);
+      // the checkpoint must not keep the env's secrets, so a file that stays fails the step
+      const removeEnvFile = async () => {
+        const out = await execInSprite(
+          sprites,
+          name,
+          ["rm", "-f", REPO_ENV_FILE],
+          { op: "rm-repo-env", known },
+        );
+        if (out.exitCode !== 0) {
+          throw new StepFailed(
+            `could not remove ${REPO_ENV_FILE}: ${out.stderr || `exited with code ${out.exitCode}`}`,
+          );
+        }
+      };
       await ensureBundle(name, `provision-${env.id}`);
-      await writeSpriteFile(sprites, name, REPO_ENV_FILE, envFile(pulled), {
-        op: "write-repo-env",
-        mode: 0o600,
-        known,
-      });
       try {
+        // in the try: a write that errors client-side may still have landed
+        await writeSpriteFile(sprites, name, REPO_ENV_FILE, envFile(pulled), {
+          op: "write-repo-env",
+          mode: 0o600,
+          known,
+        });
         await execNoisy(
           ["sh", "-c", PULL_REPO, "sh", REPO_ENV_FILE, env.repo, REPO_DIR],
           "clone",
           "/tmp/sky-clone.log",
           { known },
         );
-      } finally {
-        // the checkpoint must not keep the env's secrets
-        await execInSprite(sprites, name, ["rm", "-f", REPO_ENV_FILE], {
-          op: "rm-repo-env",
-          known,
+      } catch (err) {
+        // the pull's failure is the one recorded; a file left behind is only logged
+        await removeEnvFile().catch((rmErr: unknown) => {
+          const detail = rmErr instanceof Error ? rmErr.message : String(rmErr);
+          log(
+            `sprite ${name} kept ${REPO_ENV_FILE} after a failed clone: ${redact(detail, [...secrets.values(), ...known])}`,
+          );
         });
+        throw err;
       }
+      await removeEnvFile();
     };
     let step: (typeof environmentFailureSteps)[number] = "create";
     // the step in progress is stored as it starts, so a restart can name where it stopped
@@ -312,15 +334,17 @@ export function createProvisioner({
     try {
       begin("create");
       await ensureSprite(sprites, name);
-      begin("clone");
-      await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR], "rm-repo");
-      await cloneRepo();
+      // before the clone: the runner imports the SDK at load, and the connector's repo-pull runs it
       begin("setup");
       await execNoisy(
         ["sh", "-c", installRunnerSdk],
         "install-sdk",
         "/tmp/sky-sdk.log",
       );
+      begin("clone");
+      await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR], "rm-repo");
+      await cloneRepo();
+      begin("setup");
       await execNoisy(
         ["sh", "-c", PREPARE_SETUP, "sh", "bash", "-c", env.setup],
         "setup",
@@ -346,7 +370,10 @@ export function createProvisioner({
         .set({
           status: "failed",
           failureStep: step,
-          failureStderr: redact(detail, secrets.values()).slice(-TAIL_CHARS),
+          failureStderr: redact(detail, [
+            ...secrets.values(),
+            ...stepSecrets,
+          ]).slice(-TAIL_CHARS),
         })
         .where(eq(environments.id, env.id))
         .run();
