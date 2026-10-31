@@ -68,6 +68,21 @@ export type Config = {
 
 type Env = Record<string, string | undefined>;
 
+/**
+ * A union no branch matched reports one issue at the union, "Invalid input"; its branches' own
+ * issues, with their full paths, are what name the field that's wrong.
+ */
+function unionBranchIssues(issue: z.core.$ZodIssue): z.core.$ZodIssue[] {
+  if (issue.code !== "invalid_union" || issue.errors.length === 0) {
+    return [issue];
+  }
+  return issue.errors
+    .flat()
+    .flatMap((inner) =>
+      unionBranchIssues({ ...inner, path: [...issue.path, ...inner.path] }),
+    );
+}
+
 /** Names each bad variable; values stay out of the message since some are secrets. */
 export function loadConfig(
   env: Env,
@@ -96,13 +111,15 @@ export function loadConfig(
     };
   }
   // zod's default issue messages describe the rule, never the input
-  const problems = parsed.error.issues.map((issue) => {
-    const name = String(issue.path[0]);
-    // a nested path names the field inside a JSON variable, never its value
-    const field = issue.path.slice(1).map(String).join(".");
-    return env[name] === undefined
-      ? `${name} is missing`
-      : `${name}${field ? `.${field}` : ""} is invalid: ${issue.message}`;
-  });
+  const problems = parsed.error.issues
+    .flatMap(unionBranchIssues)
+    .map((issue) => {
+      const name = String(issue.path[0]);
+      // a nested path names the field inside a JSON variable, never its value
+      const field = issue.path.slice(1).map(String).join(".");
+      return env[name] === undefined
+        ? `${name} is missing`
+        : `${name}${field ? `.${field}` : ""} is invalid: ${issue.message}`;
+    });
   return { ok: false, message: `invalid config: ${problems.join("; ")}` };
 }

@@ -730,6 +730,68 @@ test("a layout's merge script, when it exists under $HOME, is the line files' dr
   );
 });
 
+test("the line files' merge script is run by a real merge with the base, ours and theirs files in that order", async () => {
+  mkdirSync(join(root, "home", "bin"));
+  // reports each argument's content, so a swapped %O %A %B shows up in the merged file
+  writeFileSync(
+    join(root, "home", "bin/merge.sh"),
+    [
+      "#!/bin/bash",
+      'out="O=$(tr \'\\n\' , < "$1") A=$(tr \'\\n\' , < "$2") B=$(tr \'\\n\' , < "$3")"',
+      'printf \'%s\\n\' "$out" > "$2"',
+      "",
+    ].join("\n"),
+  );
+  const scripted = {
+    ...options(),
+    layout: { ...layout, mergeScript: "bin/merge.sh" },
+  };
+  await pullStore(scripted);
+  writeFileSync(join(home, "inbox.md"), "one\ntwo\nlocal\n");
+  pushElsewhere({ "inbox.md": "one\ntwo\nremote\n" });
+
+  await pullStore(scripted);
+
+  // the pull rebases local work onto the remote, so the remote is "ours" and the local commit "theirs"
+  expect(local("inbox.md")).toBe(
+    "O=one,two, A=one,two,remote, B=one,two,local,\n",
+  );
+});
+
+test("with no merge script, a real merge of two appends to a line file keeps both", async () => {
+  await pullStore(options());
+  writeFileSync(join(home, "inbox.md"), "one\ntwo\nlocal\n");
+  pushElsewhere({ "inbox.md": "one\ntwo\nremote\n" });
+
+  await pullStore(options());
+
+  const lines = local("inbox.md").trim().split("\n");
+  expect(lines.sort()).toEqual(["local", "one", "remote", "two"]);
+});
+
+test("SKY_STORE_HOME names the checkout over the layout's home, and the layout's home is used without it", async () => {
+  const env = {
+    SKY_STORE_LAYOUT: JSON.stringify({ ...layout, home: ".from-layout" }),
+    SKY_STORE_REPO: "acme/store",
+    GITHUB_CONNECTOR: CONNECTOR,
+    GITHUB_GATEWAY_URL: GATEWAY,
+  };
+  const withEnv = io();
+  expect(
+    await storeSyncMain(
+      ["pull", "--locked"],
+      { ...env, SKY_STORE_HOME: ".from-env" },
+      withEnv.io,
+    ),
+  ).toBe(0);
+  const base = join(root, "home");
+  expect(existsSync(join(base, ".from-env/inbox.md"))).toBe(true);
+  expect(existsSync(join(base, ".from-layout"))).toBe(false);
+
+  expect(await storeSyncMain(["pull", "--locked"], env, io().io)).toBe(0);
+  expect(existsSync(join(base, ".from-layout/inbox.md"))).toBe(true);
+});
+
 test("a malformed SKY_STORE_LAYOUT stops the sync with a message that names the variable, not its value", async () => {
   const bad = io();
   const env = {

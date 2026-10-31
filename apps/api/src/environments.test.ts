@@ -110,6 +110,21 @@ const pluginsCall = (sprite: string) =>
     ),
   );
 
+const BASE_FILE = "/tmp/sky-base.json";
+const LEFTOVER_BASE_FILE = "/tmp/sky-base-profile.json";
+// the profile step's script is opaque here; the base profile tests below run it in node and pin what it does
+const baseApplyCall = (sprite: string) =>
+  expect.stringMatching(
+    new RegExp(
+      `^exec ${sprite} /workspace/repo node -e [\\s\\S]+ /opt/sky ${BASE_FILE} ${LEFTOVER_BASE_FILE} &> /tmp/sky-base\\.log$`,
+    ),
+  );
+const baseApplyCalls = (sprite: string) => [
+  `write ${sprite} ${BASE_FILE}`,
+  baseApplyCall(sprite),
+  `exec ${sprite} - rm -f ${BASE_FILE} ${LEFTOVER_BASE_FILE}`,
+];
+
 /**
  * Runs the setup in a real local shell, as a sprite would: HOME is `home`, and node's bin holds
  * `corepack` (a script standing in for it) but no pnpm. Git, rm and the runner SDK's install stay stubbed.
@@ -174,6 +189,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    ...baseApplyCalls(sprite),
     setupCall(sprite, "pnpm install"),
     pluginsCall(sprite),
     `exec ${sprite} - ${ENV_FILES_RM}`,
@@ -335,7 +351,7 @@ test("a corepack that can't enable its shims ends failed at the setup step with 
 });
 
 const isPluginInstall = (argv: string[]) =>
-  argv[0] === "node" && argv[1] === "-e";
+  argv[0] === "node" && argv[1] === "-e" && !argv.includes(BASE_FILE);
 
 // logs its argv; `marketplace add` makes a marketplace known under its source's last path segment,
 // and `marketplace list --json` prints the known ones
@@ -1039,6 +1055,7 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    ...baseApplyCalls(sprite),
     setupCall(sprite, "pnpm install --frozen-lockfile"),
     pluginsCall(sprite),
     `exec ${sprite} - ${ENV_FILES_RM}`,
@@ -1118,6 +1135,7 @@ test("with a connector, provisioning checks the profile's store out through the 
       ),
     ),
     `exec ${sprite} - rm -f ${REPO_ENV_FILE}`,
+    ...baseApplyCalls(sprite),
     setupCall(sprite, "pnpm install --frozen-lockfile"),
     pluginsCall(sprite),
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
@@ -1747,6 +1765,7 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    ...baseApplyCalls(sprite),
     setupCall(sprite, "pnpm install"),
     pluginsCall(sprite),
     `exec ${sprite} - ${ENV_FILES_RM}`,
@@ -1899,7 +1918,6 @@ test("a rename another writer raced to is still 409 name_taken", async () => {
 
 // ---- base profiles
 
-const BASE_FILE = "/tmp/sky-base-profile.json";
 const acme = BaseProfile.parse({
   marketplaces: ["acme/plugins"],
   plugins: ["review@plugins"],
@@ -1930,12 +1948,156 @@ const serveProfiles = (baseProfiles: Record<string, BaseProfile>) => {
 // how a profile writes an env secret into the sprite's MCP config
 const ref = (name: string) => `\${${name}}`;
 
-const baseApplyCall = (sprite: string) =>
-  expect.stringMatching(
-    new RegExp(
-      `^exec ${sprite} /workspace/repo node -e [\\s\\S]+ /opt/sky ${BASE_FILE} &> /tmp/sky-base\\.log$`,
-    ),
+type ClaudeState = {
+  marketplaces: string[];
+  plugins: string[];
+  mcpServers: Record<string, unknown>;
+};
+
+/**
+ * A `claude` that keeps the user config the profile steps touch in `$HOME/claude-state.json` and
+ * answers as the real one does: `marketplace add --json` names the marketplace (its source's last
+ * path segment), the lists print JSON, and removing what isn't there exits 1.
+ */
+function statefulClaude() {
+  const fs = require("node:fs") as typeof import("node:fs");
+  const home = process.env.HOME ?? "";
+  const [group, verb, ...rest] = process.argv.slice(2);
+  fs.appendFileSync(
+    `${home}/claude-runs`,
+    `${process.argv.slice(2).join(" ")}\n`,
   );
+  const file = `${home}/claude-state.json`;
+  const state: ClaudeState = fs.existsSync(file)
+    ? JSON.parse(fs.readFileSync(file, "utf8"))
+    : { marketplaces: [], plugins: [], mcpServers: {} };
+  const save = () => fs.writeFileSync(file, JSON.stringify(state));
+  const fail = (message: string) => {
+    process.stderr.write(`${message}\n`);
+    process.exit(1);
+  };
+  const list = (items: object[]) =>
+    process.stdout.write(`${JSON.stringify(items, null, 2)}\n`);
+  const without = (items: string[], item: string) => {
+    if (!items.includes(item)) fail(`'${item}' not found`);
+    return items.filter((i) => i !== item);
+  };
+  const action = group === "plugin" && verb === "marketplace" ? rest[0] : verb;
+  const arg = group === "plugin" && verb === "marketplace" ? rest[1] : rest[0];
+  if (group === "plugin" && verb === "marketplace") {
+    if (action === "add" && arg) {
+      const name =
+        (arg.split("#")[0] ?? "")
+          .split("/")
+          .pop()
+          ?.replace(/\.git$/, "") ?? "";
+      if (!state.marketplaces.includes(name)) state.marketplaces.push(name);
+      if (rest.includes("--json"))
+        process.stdout.write(
+          `${JSON.stringify({ outcome: "ok", marketplace: name })}\n`,
+        );
+    }
+    if (action === "remove" && arg)
+      state.marketplaces = without(state.marketplaces, arg);
+    if (action === "list") list(state.marketplaces.map((name) => ({ name })));
+  } else if (group === "plugin") {
+    if (action === "install" && arg && !state.plugins.includes(arg))
+      state.plugins.push(arg);
+    if (action === "uninstall" && arg)
+      state.plugins = without(state.plugins, arg);
+    if (action === "list")
+      list(state.plugins.map((id) => ({ id, scope: "user" })));
+  } else if (group === "mcp") {
+    if (action === "remove" && arg) {
+      if (!(arg in state.mcpServers))
+        fail(`No MCP server named "${arg}" in user scope`);
+      delete state.mcpServers[arg];
+    }
+    if (action === "add-json" && arg)
+      state.mcpServers[arg] = JSON.parse(rest[1] ?? "");
+  }
+  save();
+}
+
+/**
+ * Runs the profile and plugin steps in a real local node against {@link statefulClaude}, with the
+ * sprite's profile files copied in; `user` is config the sprite held before, from no profile.
+ */
+function runBaseLocally(home: string, user?: Partial<ClaudeState>) {
+  writeFileSync(
+    join(home, "claude-state.json"),
+    JSON.stringify({ marketplaces: [], plugins: [], mcpServers: {}, ...user }),
+  );
+  const claudeRuns = runPluginsLocally(
+    home,
+    undefined,
+    `#!${process.execPath}\n(${statefulClaude.toString()})();\n`,
+  );
+  const runLocally = wire.exec;
+  const local = (path: string) => join(home, path.replaceAll("/", "_"));
+  wire.exec = (argv) => {
+    if (argv[0] === "rm") {
+      for (const path of argv.slice(2)) wire.files.delete(path);
+      return { exitCode: 0 };
+    }
+    if (!argv.includes(BASE_FILE)) return runLocally(argv);
+    const files = [BASE_FILE, LEFTOVER_BASE_FILE];
+    for (const path of files) {
+      const bytes = wire.files.get(path);
+      if (bytes) writeFileSync(local(path), bytes);
+      else rmSync(local(path), { force: true });
+    }
+    return runLocally(argv.map((a) => (files.includes(a) ? local(a) : a)));
+  };
+  return {
+    claudeRuns,
+    state: (): ClaudeState =>
+      JSON.parse(readFileSync(join(home, "claude-state.json"), "utf8")),
+  };
+}
+
+const other = BaseProfile.parse({
+  marketplaces: ["acme/tools"],
+  plugins: ["lint@tools"],
+  mcpServers: {
+    search: {
+      url: "https://search.example.com/mcp",
+      headers: { "X-Api-Key": "SEARCH_SECRET" },
+    },
+  },
+});
+// what a session's own setup or a person put in the sprite's user config, outside any profile
+const userConfig = {
+  marketplaces: ["own"],
+  plugins: ["mine@own"],
+  mcpServers: { local: { type: "stdio", command: "local-mcp" } },
+};
+
+test("a rebuild onto another profile leaves exactly what that profile declares, beside what no profile declared", async () => {
+  serveProfiles({ acme, other });
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const sprite = runBaseLocally(home, userConfig);
+  try {
+    const id = await ready({ ...kru, base: "acme" } as typeof kru);
+    expect(sprite.state().plugins).toContain("review@plugins");
+    expect((await patch(id, { base: "other" })).status).toBe(202);
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(sprite.state()).toEqual({
+      marketplaces: ["own", "tools"],
+      plugins: ["mine@own", "lint@tools"],
+      mcpServers: {
+        local: userConfig.mcpServers.local,
+        search: {
+          type: "http",
+          url: "https://search.example.com/mcp",
+          headers: { "X-Api-Key": ref("SEARCH_SECRET") },
+        },
+      },
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
 
 test("an unknown base is refused on create and on patch, naming the profiles the server has", async () => {
   serveProfiles({ acme });
@@ -2009,27 +2171,89 @@ test("PATCH of base reprovisions like a setup change, is refused while agents ex
   expect(wire.calls).toEqual([]);
 });
 
-test("PATCH of base to null removes the profile and reprovisions", async () => {
+test("PATCH of base to null reprovisions and takes everything the profile added out of the sprite", async () => {
   serveProfiles({ acme });
-  const id = await ready({ ...kru, base: "acme" } as typeof kru);
-  expect((await patch(id, { base: null })).status).toBe(202);
-  expect(await settled(id)).toMatchObject({ status: "ready", base: null });
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const sprite = runBaseLocally(home, userConfig);
+  try {
+    const id = await ready({ ...kru, base: "acme" } as typeof kru);
+    expect(Object.keys(sprite.state().mcpServers)).toContain("docs");
+    expect((await patch(id, { base: null })).status).toBe(202);
+    expect(await settled(id)).toMatchObject({
+      status: "ready",
+      base: null,
+      failure: null,
+    });
+    expect(sprite.state()).toEqual(userConfig);
+    expect(wire.files.has(BASE_FILE)).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a rebuild after a profile drops a server and a plugin removes just those", async () => {
+  serveProfiles({ acme });
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const sprite = runBaseLocally(home);
+  try {
+    const id = await ready({ ...kru, base: "acme" } as typeof kru);
+    const { docs: _, ...rest } = acme.mcpServers;
+    serveProfiles({ acme: { ...acme, plugins: [], mcpServers: rest } });
+    expect((await patch(id, { setup: "make" })).status).toBe(202);
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(sprite.state()).toMatchObject({
+      marketplaces: ["plugins"],
+      plugins: [],
+      mcpServers: { search: expect.anything() },
+    });
+    expect(Object.keys(sprite.state().mcpServers)).toEqual(["search"]);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("what the profile added but someone already removed doesn't fail the rebuild", async () => {
+  serveProfiles({ acme });
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const sprite = runBaseLocally(home, userConfig);
+  try {
+    const id = await ready({ ...kru, base: "acme" } as typeof kru);
+    writeFileSync(join(home, "claude-state.json"), JSON.stringify(userConfig));
+    expect((await patch(id, { base: null })).status).toBe(202);
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(sprite.state()).toEqual(userConfig);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a sprite holding only the profile file an earlier version left loses that profile's plugins and servers, and the file", async () => {
+  serveProfiles({ acme });
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const sprite = runBaseLocally(home, {
+    ...userConfig,
+    plugins: [...userConfig.plugins, "review@plugins"],
+    mcpServers: { ...userConfig.mcpServers, docs: {}, search: {} },
+  });
+  try {
+    const id = await ready();
+    wire.files.set(
+      LEFTOVER_BASE_FILE,
+      new TextEncoder().encode(JSON.stringify(acme)),
+    );
+    expect((await patch(id, { setup: "make" })).status).toBe(202);
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(sprite.state()).toEqual(userConfig);
+    expect(wire.files.has(LEFTOVER_BASE_FILE)).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
 test("provisioning with a profile applies it after the clone and before the env's setup, then installs the repo's own plugins", async () => {
   serveProfiles({ acme });
   const home = mkdtempSync(join(tmpdir(), "sky-home-"));
-  const claudeRuns = runPluginsLocally(home, undefined);
-  const plugins = wire.exec;
-  // the profile's JSON file is a sprite file here; run its script on the local copy
-  wire.exec = (argv) => {
-    if (argv[0] === "node" && argv[1] === "-e" && argv.includes(BASE_FILE)) {
-      const local = join(home, "base-profile.json");
-      writeFileSync(local, wire.files.get(BASE_FILE) ?? "");
-      return plugins(argv.map((a) => (a === BASE_FILE ? local : a)));
-    }
-    return { exitCode: 0 };
-  };
+  const { claudeRuns } = runBaseLocally(home);
   try {
     const { id } = (await (await post({ ...kru, base: "acme" })).json()) as {
       id: string;
@@ -2044,7 +2268,7 @@ test("provisioning with a profile applies it after the clone and before the env'
     expect(apply).toBeLessThan(setup);
     expect(wire.calls[apply]).toEqual(baseApplyCall(sprite));
     expect(claudeRuns().split("\n")).toEqual([
-      "plugin marketplace add acme/plugins",
+      "plugin marketplace add acme/plugins --json",
       "plugin marketplace update",
       "plugin install review@plugins --scope user",
       "plugin update review@plugins --scope user",
@@ -2084,19 +2308,26 @@ test("the profile file holds names of secrets, never a value", async () => {
   expect(wire.execUrls.join("\n")).not.toContain("docs-secret-value");
 });
 
-test("a profile with only a store or checks applies nothing to the sprite", async () => {
+test("a profile with only a store or checks adds nothing to the sprite's user config", async () => {
   serveProfiles({
     light: BaseProfile.parse({ checks: ["lint"], storeRepo: "acme/store" }),
   });
-  const { id } = (await (await post({ ...kru, base: "light" })).json()) as {
-    id: string;
-  };
-  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
-  expect(wire.calls.some((c) => c.includes("sky-base"))).toBe(false);
-  expect(wire.files.has(BASE_FILE)).toBe(false);
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const sprite = runBaseLocally(home, userConfig);
+  try {
+    const { id } = (await (await post({ ...kru, base: "light" })).json()) as {
+      id: string;
+    };
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(sprite.state()).toEqual(userConfig);
+    expect(sprite.claudeRuns()).toBe("");
+    expect(wire.files.has(BASE_FILE)).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
 });
 
-test("an env with no base provisions as before: no profile file, no store pull, even with a connector", async () => {
+test("an env with no base pulls no store, even with a connector", async () => {
   const { id, env } = await reprovisionWith(
     githubConnector,
     "// runner",
@@ -2104,10 +2335,7 @@ test("an env with no base provisions as before: no profile file, no store pull, 
     null,
   );
   expect(env).toMatchObject({ status: "ready", failure: null });
-  expect(
-    wire.calls.some((c) => c.includes("store-sync") || c.includes("sky-base")),
-  ).toBe(false);
-  expect(wire.files.has(BASE_FILE)).toBe(false);
+  expect(wire.calls.some((c) => c.includes("store-sync"))).toBe(false);
   expect(wire.calls.at(-1)).toBe(`checkpoint ${spriteNameFor(id)}`);
 });
 

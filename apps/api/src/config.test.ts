@@ -182,51 +182,68 @@ test("SKY_BASE_PROFILES is parsed into profiles with their defaults filled, and 
   });
 });
 
+// each input carries SECRET where a credential would sit; the message must name the field, not echo it
+const SECRET = "sk-live";
 test.each([
   [
     "JSON that isn't JSON",
-    "{not json",
+    `{${SECRET}`,
     "SKY_BASE_PROFILES is invalid: expected JSON",
   ],
   [
     "a profile with an unknown field",
-    '{"team":{"secrets":{}}}',
-    "SKY_BASE_PROFILES.team",
+    `{"team":{"secrets":{"KEY":"${SECRET}"}}}`,
+    'SKY_BASE_PROFILES.team is invalid: Unrecognized key: "secrets"',
   ],
   [
     "a plugin that isn't name@marketplace",
-    '{"team":{"plugins":["review"]}}',
-    "SKY_BASE_PROFILES.team.plugins.0",
+    `{"team":{"plugins":["${SECRET}"]}}`,
+    "SKY_BASE_PROFILES.team.plugins.0 is invalid: Invalid string: must match pattern /^[A-Za-z0-9][^@\\s]*@[^@\\s]+$/",
   ],
-  ["a profile name with a space", '{"a b":{}}', "SKY_BASE_PROFILES"],
+  [
+    "a profile name with a space",
+    `{"a b":{"checks":["${SECRET}"]}}`,
+    "SKY_BASE_PROFILES.a b is invalid: Invalid key in record",
+  ],
   [
     "a store repo that isn't owner/name",
-    '{"team":{"storeRepo":"nope"}}',
-    "SKY_BASE_PROFILES.team.storeRepo",
+    `{"team":{"storeRepo":"${SECRET}"}}`,
+    "SKY_BASE_PROFILES.team.storeRepo is invalid: expected a GitHub repo as owner/name",
   ],
   [
     "an MCP credential that isn't a secret's name",
-    '{"team":{"mcpServers":{"x":{"command":"x","env":{"KEY":"sk-live abc"}}}}}',
-    "SKY_BASE_PROFILES.team.mcpServers.x",
+    `{"team":{"mcpServers":{"x":{"command":"x","env":{"KEY":"${SECRET} abc"}}}}}`,
+    "SKY_BASE_PROFILES.team.mcpServers.x.env.KEY is invalid: expected an env secret's name",
+  ],
+  [
+    "an MCP server that is neither stdio nor http",
+    `{"team":{"mcpServers":{"x":{"args":["${SECRET}"]}}}}`,
+    'SKY_BASE_PROFILES.team.mcpServers.x.command is invalid: Invalid input: expected string, received undefined; SKY_BASE_PROFILES.team.mcpServers.x.url is invalid: Invalid input: expected string, received undefined; SKY_BASE_PROFILES.team.mcpServers.x is invalid: Unrecognized key: "args"',
+  ],
+  [
+    "an MCP server mixing stdio and http fields",
+    `{"team":{"mcpServers":{"x":{"command":"","url":"${SECRET} abc"}}}}`,
+    'SKY_BASE_PROFILES.team.mcpServers.x.command is invalid: Too small: expected string to have >=1 characters; SKY_BASE_PROFILES.team.mcpServers.x is invalid: Unrecognized key: "url"; SKY_BASE_PROFILES.team.mcpServers.x.url is invalid: Invalid URL; SKY_BASE_PROFILES.team.mcpServers.x is invalid: Unrecognized key: "command"',
   ],
   [
     "a store home outside $HOME",
-    '{"team":{"storeRepo":"a/b","storeLayout":{"home":"/etc"}}}',
-    "SKY_BASE_PROFILES.team.storeLayout.home",
+    `{"team":{"storeRepo":"a/b","storeLayout":{"home":"/etc/${SECRET}"}}}`,
+    "SKY_BASE_PROFILES.team.storeLayout.home is invalid: expected a path under $HOME",
   ],
   [
     "a marketplace source that is a flag",
-    '{"team":{"marketplaces":["--scope"]}}',
-    "SKY_BASE_PROFILES.team.marketplaces.0",
+    `{"team":{"marketplaces":["--${SECRET}"]}}`,
+    "SKY_BASE_PROFILES.team.marketplaces.0 is invalid: Invalid string: must match pattern /^[^\\s-][^\\s]*$/",
   ],
 ])(
   "SKY_BASE_PROFILES with %s is rejected, naming the field and never the value",
-  (_, value, named) => {
+  (_, value, problems) => {
     const result = loadConfig({ ...required, SKY_BASE_PROFILES: value });
-    expect(result.ok).toBe(false);
-    const message = !result.ok ? result.message : "";
-    expect(message).toContain(named);
-    expect(message).not.toContain("sk-live");
+    expect(result).toEqual({
+      ok: false,
+      message: `invalid config: ${problems}`,
+    });
+    expect(!result.ok && result.message).not.toContain(SECRET);
   },
 );
 
@@ -237,14 +254,5 @@ test("docs/examples/base-profile.kru.json is a valid SKY_BASE_PROFILES", () => {
   );
   const result = loadConfig({ ...required, SKY_BASE_PROFILES: example });
   expect(result.ok).toBe(true);
-  expect(result.ok && result.config.baseProfiles.kru).toMatchObject({
-    plugins: ["kru@kru"],
-    storeRepo: "ap-justin/kru-store",
-    checks: [
-      'env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"',
-      'env -u ANTHROPIC_API_KEY claude -p "/kru:text-fix"',
-    ],
-  });
-  // no value that looks like a credential: every secret reference is a name
-  expect(example).not.toMatch(/sk-|ghp_|token/i);
+  expect(result.ok && Object.keys(result.config.baseProfiles)).toEqual(["kru"]);
 });

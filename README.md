@@ -90,12 +90,12 @@ A base profile is what every sprite gets before its own `setup`, defined once on
 
 A profile holds:
 
-- `marketplaces`: sources for `claude plugin marketplace add`.
-- `plugins`: `name@marketplace`, installed at user scope. Provisioning installs and updates them after adding the marketplaces.
-- `mcpServers`: user-scope MCP servers by name, each `command` (with `args`, `env`) or `url` (with `headers`). Credentials are never inline: an `env` or `headers` value is the **name** of an env secret (`sky secret set`), which the session expands from its own env. Sky writes it into the sprite's config as `${NAME}`, so no secret value reaches the checkpoint.
-- `storeRepo`: a GitHub `owner/name` synced through the env's `GITHUB_CONNECTOR`, as the next section describes. `storeLayout` says where the checkout lives under `$HOME` (`home`), which paths stay local (`exclude`), which are append-only line files to merge (`lineFiles`) and an optional merge script (`mergeScript`).
-- `sessionEnv`: non-secret variables set in every session, such as a plugin's own switch. Never put a secret here.
-- `checks`: lines the runner tells the agent to follow before it finishes, each an instruction or a command, run in order from the repo root. A command that calls `claude -p` runs as a nested headless session the runner has logged in; an API key stays out of it.
+- `marketplaces`: sources for `claude plugin marketplace add`. None may start with `-`.
+- `plugins`: `name@marketplace`, installed at user scope, starting with a letter or digit. Provisioning installs and updates them after adding the marketplaces.
+- `mcpServers`: user-scope MCP servers by name (letters, digits, `_` and `-`, starting with a letter or digit), each `command` (with `args`, `env`) or `url` (with `headers`). Credentials are never inline: an `env` or `headers` value is the **name** of an env secret (`sky secret set`), which the session expands from its own env. Sky writes it into the sprite's config as `${NAME}`, so no secret value reaches the checkpoint. A header can only name a secret, so that secret holds the entire header value: for `Authorization`, store `Bearer <token>`, not the token alone.
+- `storeRepo`: a GitHub `owner/name` synced through the env's `GITHUB_CONNECTOR`, as the next section describes. `storeLayout` says where the checkout lives under `$HOME` (`home`), which paths stay local (`exclude`), which are append-only line files to merge (`lineFiles`) and an optional merge script (`mergeScript`); it requires a `storeRepo`. `home` must be a directory below `$HOME`, neither `$HOME` itself nor anything under `.claude`. `exclude` and `lineFiles` patterns contain no whitespace. `mergeScript` is a path under `$HOME` of letters, digits and `.` `_` `/` `-`.
+- `sessionEnv`: non-secret variables set in every session, such as a plugin's own switch. Never put a secret here. A name the runner sets or reads itself is rejected: `PATH`, `HOME`, `NODE_OPTIONS`, `AGENT_TOKEN`, `ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, the runner's own variables (the `SKY_` ones among them), and anything starting `GIT_`.
+- `checks`: lines the runner tells the agent to follow before it finishes, each an instruction or a command on a single line, run in order from the repo root. A command that calls `claude -p` runs as a nested headless session the runner has logged in; an API key stays out of it.
 
 Provisioning applies the profile after the clone and before `setup`, so `setup` can use what it installs; the env's own plugins from `.claude/settings.json` follow `setup`. Plugins are updated on each provision; a run does not update them again. Reprovision to refresh.
 
@@ -109,6 +109,10 @@ Provisioning applies the profile after the clone and before `setup`, so `setup` 
         "command": "npx",
         "args": ["-y", "docs-mcp"],
         "env": { "DOCS_API_KEY": "DOCS_API_KEY" }
+      },
+      "search": {
+        "url": "https://search.example.com/mcp",
+        "headers": { "Authorization": "SEARCH_AUTH" }
       }
     },
     "storeRepo": "acme/agent-store",
@@ -117,7 +121,7 @@ Provisioning applies the profile after the clone and before `setup`, so `setup` 
 }
 ```
 
-Here `DOCS_API_KEY` on the left is the variable the server sees, and on the right the env secret that fills it. [`docs/examples/base-profile.kru.json`](docs/examples/base-profile.kru.json) is a full profile with a store layout. Set it with `fly secrets set SKY_BASE_PROFILES="$(jq -c . profiles.json)"`. A bad value stops the API at boot, naming the field.
+Here `DOCS_API_KEY` on the left is the variable the server sees, and on the right the env secret that fills it; the `SEARCH_AUTH` secret holds `Bearer <token>`. [`docs/examples/base-profile.kru.json`](docs/examples/base-profile.kru.json) is a full profile with a store layout. Set it with `fly secrets set SKY_BASE_PROFILES="$(jq -c . profiles.json)"`. A bad value stops the API at boot, naming the field.
 
 ```
 sky secret set web NPM_TOKEN < token.txt

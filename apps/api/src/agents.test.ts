@@ -277,6 +277,21 @@ const team = BaseProfile.parse({
   checks: ["run the linter", "update the changelog"],
 });
 
+const BASE_NAMES = [
+  "SKY_STORE_REPO",
+  "SKY_STORE_HOME",
+  "SKY_STORE_LAYOUT",
+  "SKY_SESSION_ENV",
+  "SKY_CHECKS",
+];
+const profileEnv: Record<string, string> = {
+  SKY_STORE_REPO: "acme/store",
+  SKY_STORE_HOME: ".store",
+  SKY_STORE_LAYOUT: JSON.stringify(team.storeLayout),
+  SKY_SESSION_ENV: '{"PLUGIN_SWITCH":"1"}',
+  SKY_CHECKS: '["run the linter","update the changelog"]',
+};
+
 const putSecret = (envId: string, name: string, body: unknown) =>
   app.request(`/v1/environments/${envId}/secrets/${name}`, {
     method: "PUT",
@@ -340,30 +355,87 @@ test("an env with a base profile and a GITHUB_CONNECTOR connector gives every se
   });
 });
 
-test.each([
-  "SKY_STORE_REPO",
-  "SKY_STORE_HOME",
-  "SKY_STORE_LAYOUT",
-  "SKY_SESSION_ENV",
-  "SKY_CHECKS",
-])("a secret named %s is refused, since the profile fills it", async (name) => {
-  const envId = readyEnv({ base: "team" });
-  const res = await putSecret(envId, name, { value: "someone/else" });
-  expect(res.status).toBe(400);
-  expect(await res.json()).toMatchObject({ error: { code: "reserved_name" } });
-});
+test.each(BASE_NAMES)(
+  "a secret named %s is refused, since the profile fills it",
+  async (name) => {
+    const envId = readyEnv({ base: "team" });
+    const res = await putSecret(envId, name, { value: "someone/else" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: { code: "reserved_name" },
+    });
+  },
+);
 
-test("a launch's envVars cannot point the store or the checks at something else", async () => {
-  const envId = readyEnv({ base: "team" });
-  await connect(envId);
-  const res = await launch({
-    envId,
-    prompt: "go",
-    envVars: { SKY_STORE_REPO: "someone/else" },
-  });
-  expect(res.status).toBe(400);
-  expect(await res.json()).toMatchObject({ error: { code: "reserved_name" } });
-});
+test.each(BASE_NAMES)(
+  "a launch's envVars cannot set %s, which the profile fills",
+  async (name) => {
+    const envId = readyEnv({ base: "team" });
+    await connect(envId);
+    const res = await launch({
+      envId,
+      prompt: "go",
+      envVars: { [name]: "someone/else" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: { code: "reserved_name", message: `${name} is reserved by sky` },
+    });
+    expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+      n: 0,
+    });
+  },
+);
+
+/** A row written before the name was reserved; PUT refuses it now. */
+const seedLegacySecret = (
+  envId: `env_${string}`,
+  name: string,
+  value: string,
+) =>
+  db
+    .insert(secrets)
+    .values({
+      envId,
+      name,
+      kind: "value",
+      connector: null,
+      ...seal(config.secretEncryptionKey, value, envSecretAad(envId, name)),
+    })
+    .run();
+
+test.each(BASE_NAMES)(
+  "a stored %s secret never overrides the profile's value, and the log says it was dropped",
+  async (name) => {
+    const envId = readyEnv({ base: "team" });
+    await connect(envId);
+    seedLegacySecret(envId, name, "someone/else");
+    const { agent, run } = await launched(envId);
+    await sessionOpened();
+    const file = envFileOf(wire, wire.sessions[0]);
+    expect(file[name]).toBe(profileEnv[name]);
+    await vi.waitFor(async () =>
+      expect((await getRun(agent.id, run.id)).body.secretNames).toEqual([
+        "GITHUB_CONNECTOR",
+      ]),
+    );
+    expect(logs.join("\n")).toContain(
+      `secret ${name} on ${envId} is reserved by sky; not passed to ${run.id}`,
+    );
+  },
+);
+
+test.each(BASE_NAMES)(
+  "a stored %s secret in an env with no base profile reaches no session",
+  async (name) => {
+    const envId = readyEnv();
+    await connect(envId);
+    seedLegacySecret(envId, name, "someone/else");
+    await launched(envId);
+    await sessionOpened();
+    expect(envFileOf(wire, wire.sessions[0])).not.toHaveProperty(name);
+  },
+);
 
 test("a session in an env with no GITHUB_CONNECTOR connector gets no store, but still the profile's variables and checks", async () => {
   const envId = readyEnv({ base: "team" });

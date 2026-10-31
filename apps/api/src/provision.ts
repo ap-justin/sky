@@ -35,17 +35,63 @@ const platform = readdirSync(sdk).find(
 if (!platform) throw new Error("no claude binary under " + sdk);
 const bin = sdk + "/" + platform + "/claude";
 `;
+// under $HOME, which outlives reprovisioning as the user config it records does
+const APPLIED_BASE_FILE = ".sky/base-applied.json";
+// the base profile holds no secret value, but its JSON is longer than an exec's URL query allows
+const BASE_PROFILE_FILE = "/tmp/sky-base.json";
+// a sprite with no `APPLIED_BASE_FILE` may hold the profile an earlier API version applied here and
+// left; its plugins and MCP servers are what that version added
+const LEFTOVER_BASE_FILE = "/tmp/sky-base-profile.json";
 /**
- * Applies a base profile for the sprite's user: adds its marketplaces, installs and updates its
- * plugins at user scope, and registers its MCP servers at user scope. It runs as `node -e` with the
- * runner dir and the profile's JSON file as arguments. A secret an MCP server needs is written as
- * a `${NAME}` reference the session expands from its own env, so the profile's config holds no value.
- * Marketplaces and plugins refresh on every run; an MCP server is removed first so a rerun replaces it.
+ * Makes the sprite user's profile-added config match a base profile, which may declare nothing.
+ * `$HOME/.claude` outlives reprovisioning, so what earlier applies added is recorded in
+ * `APPLIED_BASE_FILE` (a marketplace by the name its `add` reported), and whatever of it the profile
+ * no longer declares is removed first; config no profile declared is never touched. Then it adds the
+ * marketplaces, installs and updates the plugins at user scope, and registers the MCP servers at user
+ * scope. The record is written before the adds, so a failed apply still names what it may have added.
+ * It runs as `node -e` with the runner dir, the profile's JSON file and `LEFTOVER_BASE_FILE` as
+ * arguments. A secret an MCP server needs is written as a `${NAME}` reference the session expands
+ * from its own env, so the profile's config holds no value. Marketplaces and plugins refresh on every
+ * run; an MCP server is removed first so a rerun replaces it.
  */
 const APPLY_BASE = `
 const { execFileSync } = require("node:child_process");
-const { existsSync, readdirSync, readFileSync } = require("node:fs");
+const { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
+const { homedir } = require("node:os");
+const { dirname } = require("node:path");
+const readJson = (file) => (existsSync(file) ? JSON.parse(readFileSync(file, "utf8")) : undefined);
 const profile = JSON.parse(readFileSync(process.argv[2], "utf8"));
+const recordFile = homedir() + "/${APPLIED_BASE_FILE}";
+const leftover = readJson(process.argv[3]);
+const applied = readJson(recordFile) ?? {
+  marketplaces: {},
+  plugins: leftover?.plugins ?? [],
+  mcpServers: Object.keys(leftover?.mcpServers ?? {}),
+};
+const dropped = {
+  marketplaces: Object.entries(applied.marketplaces)
+    .filter(([source]) => !profile.marketplaces.includes(source))
+    .map(([, name]) => name),
+  plugins: applied.plugins.filter((plugin) => !profile.plugins.includes(plugin)),
+  mcpServers: applied.mcpServers.filter((name) => !(name in profile.mcpServers)),
+};
+const record = {
+  marketplaces: Object.fromEntries(
+    Object.entries(applied.marketplaces).filter(([source]) => profile.marketplaces.includes(source)),
+  ),
+  plugins: profile.plugins,
+  mcpServers: Object.keys(profile.mcpServers),
+};
+const declaresNothing = profile.marketplaces.length === 0 && record.plugins.length === 0 && record.mcpServers.length === 0;
+const save = () => {
+  if (declaresNothing) return rmSync(recordFile, { force: true });
+  mkdirSync(dirname(recordFile), { recursive: true });
+  writeFileSync(recordFile, JSON.stringify(record));
+};
+if (declaresNothing && Object.values(dropped).every((items) => items.length === 0)) {
+  save();
+  process.exit(0);
+}
 ${FIND_CLAUDE}
 const claude = (...args) => {
   try {
@@ -54,7 +100,48 @@ const claude = (...args) => {
     process.exit(err.status || 1);
   }
 };
-for (const source of profile.marketplaces) claude("plugin", "marketplace", "add", source);
+const claudeOut = (...args) => {
+  try {
+    const out = execFileSync(bin, args, { encoding: "utf8", stdio: ["ignore", "pipe", "inherit"] });
+    process.stdout.write(out);
+    return out;
+  } catch (err) {
+    process.exit(err.status || 1);
+  }
+};
+// claude has no JSON list of MCP servers, and \`mcp get\` health-checks the server, so absence is read
+// from the message this pinned version prints
+const removeMcp = (name) => {
+  try {
+    execFileSync(bin, ["mcp", "remove", name, "--scope", "user"], { encoding: "utf8", stdio: ["ignore", "inherit", "pipe"] });
+  } catch (err) {
+    if (String(err.stderr).includes("No MCP server named")) return;
+    process.stderr.write(err.stderr ?? "");
+    process.exit(err.status || 1);
+  }
+};
+// plugins before their marketplaces: removing a marketplace leaves its plugins installed
+if (dropped.plugins.length > 0) {
+  const installed = JSON.parse(claudeOut("plugin", "list", "--json"))
+    .filter((plugin) => plugin.scope === "user")
+    .map((plugin) => plugin.id);
+  for (const plugin of dropped.plugins) {
+    if (installed.includes(plugin)) claude("plugin", "uninstall", plugin, "--scope", "user");
+  }
+}
+if (dropped.marketplaces.length > 0) {
+  const known = JSON.parse(claudeOut("plugin", "marketplace", "list", "--json")).map((m) => m.name);
+  for (const name of dropped.marketplaces) {
+    if (known.includes(name)) claude("plugin", "marketplace", "remove", name, "--scope", "user");
+  }
+}
+for (const name of dropped.mcpServers) removeMcp(name);
+save();
+for (const source of profile.marketplaces) {
+  const added = claudeOut("plugin", "marketplace", "add", source, "--json").trim().split("\\n").at(-1);
+  record.marketplaces[source] = JSON.parse(added).marketplace;
+  save();
+}
 if (profile.plugins.length > 0) {
   claude("plugin", "marketplace", "update");
   for (const plugin of profile.plugins) claude("plugin", "install", plugin, "--scope", "user");
@@ -62,9 +149,7 @@ if (profile.plugins.length > 0) {
 }
 const refs = (names) => Object.fromEntries(Object.entries(names).map(([key, secret]) => [key, "\${" + secret + "}"]));
 for (const [name, server] of Object.entries(profile.mcpServers)) {
-  try {
-    execFileSync(bin, ["mcp", "remove", name, "--scope", "user"], { stdio: "ignore" });
-  } catch {}
+  removeMcp(name);
   const config = "command" in server
     ? { type: "stdio", command: server.command, args: server.args, env: refs(server.env) }
     : { type: "http", url: server.url, headers: refs(server.headers) };
@@ -165,8 +250,6 @@ export const envFile = (vars: Iterable<readonly [string, string]>) =>
     .map(([name, value]) => `export ${name}=${shellQuote(value)}\n`)
     .join("");
 
-// the base profile holds no secret value, but its JSON is longer than an exec's URL query allows
-const BASE_PROFILE_FILE = "/tmp/sky-base-profile.json";
 // the store steps' env, as a run's, rides in a file: an exec's argv and env reach the sprite as URL
 // query params
 const STORE_ENV_FILE = "/tmp/sky-store.env";
@@ -386,28 +469,39 @@ export function createProvisioner({
       }
       await removeEnvFile();
     };
-    /** Puts the profile's plugins and MCP servers in the sprite's user config; its values are secret names, never secrets. */
+    /**
+     * Makes the sprite's user config hold the profile's plugins and MCP servers and none an earlier
+     * profile added, so it runs with no profile too; its values are secret names, never secrets.
+     */
     const applyBase = async (profile: BaseProfile | undefined) => {
-      if (
-        !profile ||
-        (profile.marketplaces.length === 0 &&
-          profile.plugins.length === 0 &&
-          Object.keys(profile.mcpServers).length === 0)
-      ) {
-        return;
-      }
+      const {
+        marketplaces = [],
+        plugins = [],
+        mcpServers = {},
+      } = profile ?? {};
       await writeSpriteFile(
         sprites,
         name,
         BASE_PROFILE_FILE,
-        JSON.stringify(profile),
+        JSON.stringify({ marketplaces, plugins, mcpServers }),
         { op: "write-base-profile", known: [] },
       );
       await execNoisy(
-        ["node", "-e", APPLY_BASE, RUNNER_DIR, BASE_PROFILE_FILE],
+        [
+          "node",
+          "-e",
+          APPLY_BASE,
+          RUNNER_DIR,
+          BASE_PROFILE_FILE,
+          LEFTOVER_BASE_FILE,
+        ],
         "apply-base",
         "/tmp/sky-base.log",
         { cwd: REPO_DIR },
+      );
+      await exec(
+        ["rm", "-f", BASE_PROFILE_FILE, LEFTOVER_BASE_FILE],
+        "rm-base-profile",
       );
     };
     let step: (typeof environmentFailureSteps)[number] = "create";

@@ -138,12 +138,14 @@ const publishInstructions = () =>
 /**
  * The env's base profile lists what to run before finishing. A command that calls `claude` runs as
  * a nested headless session, which the runner has logged in with the subscription; an API key must
- * stay out of it.
+ * stay out of it. The session env carries the project's ANTHROPIC_API_KEY, which a nested `claude`
+ * would use over the login, so the prompt has it unset whatever the profile wrote.
  */
 const checkInstructions = (checks: string[]) =>
   [
-    "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command as written through Bash:",
+    "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command through Bash:",
     ...checks.map((check) => `- ${check}`),
+    "Run each command that calls `claude` with ANTHROPIC_API_KEY unset, as `env -u ANTHROPIC_API_KEY claude -p …`, even where the check leaves that prefix out.",
     "A nested `claude` session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
   ].join("\n");
 
