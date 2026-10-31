@@ -243,6 +243,22 @@ export function gateway(options: {
       response.status,
     );
   }
+  /** Reads a body `send` returned; the request's timeout and a reset mid-body land here, named. */
+  async function read<T>(
+    method: string,
+    path: string,
+    response: Response,
+    as: (response: Response) => Promise<T>,
+  ): Promise<T> {
+    try {
+      return await as(response);
+    } catch (error) {
+      const cause = error instanceof Error ? error.cause : undefined;
+      throw new GatewayError(
+        `GitHub gateway: ${method} ${repoPath}${path} failed reading its body: ${messageOf(error)}${cause ? ` (${messageOf(cause)})` : ""}`,
+      );
+    }
+  }
   async function call<T>(
     method: string,
     path: string,
@@ -254,7 +270,7 @@ export function gateway(options: {
       "application/vnd.github+json",
       body,
     );
-    return (await response.json()) as T;
+    return read(method, path, response, (r) => r.json() as Promise<T>);
   }
   const methods = {
     /**
@@ -263,18 +279,19 @@ export function gateway(options: {
      * sends none a cross-origin hop could leak.
      */
     async tarball(sha: string): Promise<Buffer> {
-      const response = await send(
-        "GET",
-        `/tarball/${encodeURIComponent(sha)}`,
-        "application/vnd.github+json",
+      const path = `/tarball/${encodeURIComponent(sha)}`;
+      const response = await send("GET", path, "application/vnd.github+json");
+      return read("GET", path, response, async (r) =>
+        Buffer.from(await r.arrayBuffer()),
       );
-      return Buffer.from(await response.arrayBuffer());
     },
   };
   // a getter, not a copied number: Object.assign would read it once
-  return Object.defineProperty(Object.assign(call, methods), "calls", {
-    get: () => calls,
-  }) as typeof call & typeof methods & { readonly calls: number };
+  return Object.defineProperties(Object.assign(call, methods), {
+    calls: { get: () => calls },
+    repo: { value: `${options.owner}/${options.repo}` },
+  }) as typeof call &
+    typeof methods & { readonly calls: number; readonly repo: string };
 }
 
 /**

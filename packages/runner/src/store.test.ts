@@ -9,14 +9,17 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { gunzipSync, gzipSync } from "node:zlib";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
+import { tarballFaults } from "../../../test/tarball-faults.js";
 import {
   pullStore,
   pushStore,
   storeSyncMain,
   syncStoreQuietly,
+  TARBALL_MIN_BLOBS,
   underLock,
 } from "./store.js";
 
@@ -279,6 +282,7 @@ beforeEach(() => {
   hub = fakeGitHub();
 });
 afterEach(() => {
+  vi.restoreAllMocks();
   vi.unstubAllEnvs();
   rmSync(root, { recursive: true, force: true });
 });
@@ -409,9 +413,40 @@ const remoteBlob = (sha: string) =>
     "base64",
   );
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+// well under the tarball threshold even with the seed's three blobs, so a pull of this many goes blob by blob
+const SOME = TARBALL_MIN_BLOBS - 20;
+const distinctBlobs = () =>
+  new Set(
+    git(remote, "ls-tree", "-r", "main")
+      .split("\n")
+      .map((line) => line.split(/\s+/)[2]),
+  ).size;
+
+/** The tarball GitHub would serve for `sha`. */
+const archive = (sha: string) =>
+  execFileSync(
+    "git",
+    ["archive", "--format=tar.gz", `--prefix=acme-store-${sha}/`, sha],
+    { cwd: remote, maxBuffer: 64 * 1024 * 1024 },
+  );
+
+/** Replaces what codeload answers for every tarball. */
+const codeload = (answer: (archive: Buffer) => Response) =>
+  server.use(
+    http.get(`${CODELOAD}/:sha`, ({ params }) =>
+      answer(archive(String(params.sha))),
+    ),
+  );
+
+const refuseTarball = () =>
+  server.use(
+    http.get(`${REPO}/tarball/:sha`, () =>
+      HttpResponse.json({ message: "tarball refused" }, { status: 403 }),
+    ),
+  );
 
 test("a pull fetches missing blobs several at a time, never more than 8", async () => {
-  pushElsewhere(many(30, "bulk"));
+  pushElsewhere(many(SOME, "bulk"));
   let inFlight = 0;
   let peak = 0;
   let fetched = 0;
@@ -433,8 +468,9 @@ test("a pull fetches missing blobs several at a time, never more than 8", async 
 
   expect(peak).toBeGreaterThan(1);
   expect(peak).toBeLessThanOrEqual(8);
-  expect(fetched).toBe(33);
-  for (const [path, content] of Object.entries(many(30, "bulk")))
+  expect(fetched).toBe(SOME + 3);
+  expect(hub.tarballs).toBe(0);
+  for (const [path, content] of Object.entries(many(SOME, "bulk")))
     expect(local(path)).toBe(content);
   expect(local("inbox.md")).toBe("one\ntwo\n");
   expect(git(home, "status", "--porcelain")).toBe("");
@@ -473,7 +509,7 @@ test("a pull missing fewer than 50 blobs fetches just those, without a tarball",
   expect(lines).toContain("store sync: pull used 53 GitHub API calls");
 });
 
-test("a pull whose tarball is refused fails naming the repo and the status", async () => {
+test("a pull whose tarball is refused logs it naming the repo and the status, and fetches each blob instead", async () => {
   pushElsewhere(many(60, "bulk"));
   server.use(
     http.get(`${REPO}/tarball/:sha`, () =>
@@ -483,15 +519,107 @@ test("a pull whose tarball is refused fails naming the repo and the status", asy
       ),
     ),
   );
+  const lines: string[] = [];
 
-  const failure = pullStore(options());
+  await pullStore({ ...options(), progress: (line) => lines.push(line) });
 
-  await expect(failure).rejects.toThrow(/acme\/store.*returned 403/);
-  await expect(failure).rejects.toThrow("API rate limit exceeded");
+  expect(lines.join("\n")).toMatch(
+    /tarball of acme\/store at \w+ failed.*returned 403: API rate limit exceeded/,
+  );
+  expect(hub.blobGets).toBeGreaterThanOrEqual(60);
+  expect(git(home, "rev-parse", "refs/sky/synced^{tree}")).toBe(
+    git(remote, "rev-parse", "main^{tree}"),
+  );
+});
+
+test("a pull missing exactly 50 blobs takes the tarball", async () => {
+  await pullStore(options());
+  hub.blobGets = 0;
+  hub.tarballs = 0;
+  pushElsewhere(many(50, "edge"));
+
+  await pullStore(options());
+
+  expect(hub.tarballs).toBe(1);
+  expect(hub.blobGets).toBe(0);
+  expect(local("edge/49.md")).toBe("edge 49\n");
+});
+
+test("a pull whose tarball and blobs both fail stops with the synced ref, the index and the working tree as they were", async () => {
+  await pullStore(options());
+  const synced = git(home, "rev-parse", "refs/sky/synced");
+  writeFileSync(join(home, "inbox.md"), "one\ntwo\nmine\n");
+  pushElsewhere(many(60, "bulk"));
+  refuseTarball();
+  server.use(
+    http.get(`${REPO}/git/blobs/:sha`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+    ),
+  );
+
+  await expect(pullStore(options())).rejects.toThrow("returned 500");
+
+  expect(git(home, "rev-parse", "refs/sky/synced")).toBe(synced);
+  expect(existsSync(join(home, ".git", "sky-sync-index"))).toBe(false);
+  expect(existsSync(join(home, "bulk"))).toBe(false);
+  expect(local("inbox.md")).toBe("one\ntwo\nmine\n");
+  expect(git(home, "status", "--porcelain")).toBe("");
+});
+
+test.each(tarballFaults("remote todos"))(
+  "a tarball that fails ($name) is logged and every blob is fetched alone, to the same tree",
+  async (fault) => {
+    pushElsewhere(many(60, "bulk"));
+    fault.setup?.();
+    codeload(fault.answer);
+    const lines: string[] = [];
+
+    await pullStore({ ...options(), progress: (line) => lines.push(line) });
+
+    const fallback = lines.find((line) => line.includes("the tarball of"));
+    expect(fallback).toMatch(
+      /^store sync: the tarball of acme\/store at \w{40} failed, fetching its blobs one by one: /,
+    );
+    expect(fallback).toMatch(fault.cause);
+    expect(hub.blobGets).toBe(distinctBlobs());
+    expect(git(home, "rev-parse", "refs/sky/synced^{tree}")).toBe(
+      git(remote, "rev-parse", "main^{tree}"),
+    );
+    for (const [path, content] of Object.entries(many(60, "bulk")))
+      expect(local(path)).toBe(content);
+    expect(git(home, "status", "--porcelain")).toBe("");
+  },
+);
+
+test("a tarball entry whose bytes differ from the tree is never written, and its blob is fetched alone", async () => {
+  pushElsewhere(many(60, "bulk"));
+  codeload((real) => {
+    const tar = gunzipSync(real);
+    const at = tar.indexOf("bulk 7\n");
+    expect(at).toBeGreaterThan(0);
+    tar.write("bulk Z\n", at);
+    return new HttpResponse(gzipSync(tar));
+  });
+
+  await pullStore(options());
+
+  expect(hub.tarballs).toBe(1);
+  // the rest of the 63 came from the tarball
+  expect(hub.blobGets).toBe(1);
+  expect(local("bulk/7.md")).toBe("bulk 7\n");
+  expect(git(home, "rev-parse", "refs/sky/synced^{tree}")).toBe(
+    git(remote, "rev-parse", "main^{tree}"),
+  );
+  const forged = execFileSync("git", ["hash-object", "--stdin"], {
+    cwd: home,
+    input: "bulk Z\n",
+    encoding: "utf8",
+  }).trim();
+  expect(() => git(home, "cat-file", "-e", forged)).toThrow();
 });
 
 test("a blob that arrives with the wrong content fails the pull, and no new fetch starts after it", async () => {
-  pushElsewhere(many(30, "bulk"));
+  pushElsewhere(many(SOME, "bulk"));
   let started = 0;
   let inFlight = 0;
   server.use(
@@ -513,6 +641,7 @@ test("a blob that arrives with the wrong content fails the pull, and no new fetc
   await expect(pullStore(options())).rejects.toThrow("arrived as");
 
   // the first wave of 8 and nothing after it; every one of them finished before the rejection
+  expect(hub.tarballs).toBe(0);
   expect(started).toBe(8);
   expect(inFlight).toBe(0);
   await sleep(250);
@@ -583,6 +712,29 @@ test("a push the remote outran pulls, rebases and pushes again", async () => {
   expect(hub.patches).toBe(2);
   expect(remoteFiles()).toContain("race-1");
   expect(onRemote("inbox.md")).toBe("one\ntwo\nmine");
+});
+
+test("each pull of a push's retries counts only its own API calls", async () => {
+  server.resetHandlers();
+  let raced = false;
+  hub = fakeGitHub({
+    racing: () => {
+      const first = !raced;
+      raced = true;
+      return first;
+    },
+  });
+  await pullStore(options());
+  writeFileSync(join(home, "inbox.md"), "one\ntwo\nmine\n");
+  const lines: string[] = [];
+
+  await pushStore({ ...options(), progress: (line) => lines.push(line) });
+
+  // repo and ref, the remote unmoved; then after the race repo, ref, commit, tree and race-1's blob
+  expect(lines.filter((line) => line.includes("pull used"))).toEqual([
+    "store sync: pull used 2 GitHub API calls",
+    "store sync: pull used 5 GitHub API calls",
+  ]);
 });
 
 test("a push that keeps losing the race gives up with an error", async () => {

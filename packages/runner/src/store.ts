@@ -219,11 +219,18 @@ async function pull(
   message: string,
   progress: Progress = () => {},
 ): Promise<{ sha: string; branch: string }> {
+  // `call` outlives this pull: a push's retries reuse it
+  const before = call.calls;
+  const reportCalls = () =>
+    progress(`store sync: pull used ${call.calls - before} GitHub API calls`);
   await anchor(g);
   await commitLocal(g, message);
   const remote = await remoteHead(call);
   const known = await g(["config", "--get", REMOTE_SHA_KEY]).catch(() => "");
-  if (known === remote.sha) return remote;
+  if (known === remote.sha) {
+    reportCalls();
+    return remote;
+  }
 
   const { tree } = await call<{ tree: { sha: string } }>(
     "GET",
@@ -266,7 +273,7 @@ async function pull(
   } finally {
     await rm(index, { force: true });
   }
-  progress(`store sync: pull used ${call.calls} GitHub API calls`);
+  reportCalls();
   return remote;
 }
 
@@ -290,7 +297,7 @@ async function missingObjects(
  * listed it under. When `source.min` or more are missing they come from one tarball of commit
  * `source.sha`, a single API call whatever the count; a blob the tarball lacks or carries
  * differently (`export-ignore`, `export-subst`) is fetched alone, `BLOB_FETCH_CONCURRENCY` at a
- * time, as are all of them when fewer are missing.
+ * time, as are all of them when fewer are missing or the tarball fails, which is logged, not thrown.
  */
 export async function fetchMissing(
   g: ReturnType<typeof git>,
@@ -305,14 +312,21 @@ export async function fetchMissing(
   if (!missing.length) return;
   progress(`${label}: fetching ${missing.length} of ${listed.length} blobs`);
   if (missing.length >= source.min) {
-    const wanted = new Set(missing);
-    const blobs = new Map<string, Buffer>();
-    for (const content of readTarball(await call.tarball(source.sha))) {
-      const sha = blobId(content);
-      if (wanted.has(sha)) blobs.set(sha, content);
+    try {
+      const wanted = new Set(missing);
+      const blobs = new Map<string, Buffer>();
+      for (const content of readTarball(await call.tarball(source.sha))) {
+        const sha = blobId(content);
+        if (wanted.has(sha)) blobs.set(sha, content);
+      }
+      await writeBlobs(g, [...blobs.values()]);
+      progress(`${label}: ${blobs.size} blobs from one tarball`);
+    } catch (error) {
+      // readTarball returns every file or throws, so no blob of a failed tarball is written
+      progress(
+        `${label}: the tarball of ${call.repo} at ${source.sha} failed, fetching its blobs one by one: ${messageOf(error)}`,
+      );
     }
-    await writeBlobs(g, [...blobs.values()]);
-    progress(`${label}: ${blobs.size} blobs from one tarball`);
     missing = await missingObjects(g, missing);
   }
   const total = missing.length;
@@ -321,7 +335,8 @@ export async function fetchMissing(
   await eachLimited(missing, BLOB_FETCH_CONCURRENCY, async (sha) => {
     const blob = await call<{ content: string }>("GET", `/git/blobs/${sha}`);
     const written = await writeBlob(g, Buffer.from(blob.content, "base64"));
-    if (written !== sha) throw new Error(`blob ${sha} arrived as ${written}`);
+    if (written !== sha)
+      throw new Error(`blob ${sha} of ${call.repo} arrived as ${written}`);
     fetched++;
     if (fetched % PROGRESS_EVERY === 0 || fetched === total)
       progress(`${label}: fetched ${fetched}/${total} blobs`);

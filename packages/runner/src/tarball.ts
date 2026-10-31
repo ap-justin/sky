@@ -13,7 +13,8 @@ const text = (block: Buffer, from: number, length: number) => {
 
 const octal = (block: Buffer, from: number, length: number) => {
   const field = block.subarray(from, from + length);
-  // base-256 for sizes past 8 GiB; a repo tarball never gets there, but misreading one would corrupt
+  // base-256, which `git archive` never writes: past 8 GiB it puts 0 here and the size in a pax
+  // `size` record, which this ignores; unreachable under GitHub's 100 MB file cap
   if (field[0] !== undefined && field[0] & 0x80) {
     let value = field[0] & 0x7f;
     for (const byte of field.subarray(1)) value = value * 256 + byte;
