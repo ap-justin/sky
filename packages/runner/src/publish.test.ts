@@ -740,7 +740,7 @@ test("a ref GitHub refuses to fast-forward says the history was rewritten", asyn
   );
 
   await expect(run()).rejects.toThrow(
-    "claude/agt_1 on GitHub isn't an ancestor of this branch: published commits were amended or rebased here, or someone pushed there; it can't be fast-forwarded (GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 422: Update is not a fast forward)",
+    "claude/agt_1 on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten (GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 422: Update is not a fast forward)",
   );
 });
 

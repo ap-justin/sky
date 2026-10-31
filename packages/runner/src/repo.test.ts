@@ -15,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { HttpResponse, http } from "msw";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { DEFAULT_GATEWAY_URL, publish } from "./publish.js";
 import { pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
@@ -305,7 +305,8 @@ test("a stale clone publishes on GitHub's current head: it is fetched over REST 
   expect(seen.refs).toEqual([
     { ref: "refs/heads/claude/agt_1", sha: "d".repeat(40) },
   ]);
-  expect(git(dir, "rev-parse", "origin/HEAD")).toBe(fresh);
+  // every agent's worktree reads origin/HEAD, so one agent's refresh leaves it alone
+  expect(git(dir, "rev-parse", "origin/HEAD")).toBe(headSha);
   expect(git(tree, "rev-parse", "HEAD~1")).toBe(fresh);
   expect(git(tree, "log", "-1", "--format=%an <%ae> %aI|%s")).toBe(author);
   expect(readFileSync(join(tree, "other.txt"), "utf8")).toBe("someone else\n");
@@ -339,6 +340,681 @@ test("a base that moved onto a change the agent also made fails with a clear err
     ),
   ).toBe(false);
   expect(git(dir, "rev-parse", "origin/HEAD")).toBe(headSha);
+});
+
+test("a first publish with no title after the base moved is refused before the clone fetches or rebases anything", async () => {
+  fakeGitHub();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = advanceRemote("other.txt", "someone else\n");
+
+  await expect(
+    publish({ cwd: tree, gatewayUrl: GATEWAY, connectorId: CONNECTOR }),
+  ).rejects.toThrow("a title is needed to open the pull request");
+
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+  expect(
+    spawnSync("git", ["cat-file", "-e", fresh], { cwd: tree }).status,
+  ).not.toBe(0);
+  expect(
+    spawnSync("git", ["for-each-ref", "refs/sky"], {
+      cwd: tree,
+      encoding: "utf8",
+    }).stdout,
+  ).toBe("");
+});
+
+test("a branch whose every change already landed on the base is refused before any branch or PR is created", async () => {
+  const seen = fakeGitHub();
+  const opened: unknown[] = [];
+  server.use(
+    http.post(`${REPO}/pulls`, async ({ request }) => {
+      opened.push(await request.json());
+      return HttpResponse.json({}, { status: 201 });
+    }),
+  );
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "other.txt"), "same change\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("other.txt", "same change\n");
+
+  await expect(publishFrom(tree)).rejects.toThrow(
+    /the changes on claude\/agt_1 are already on trunk/,
+  );
+  expect(seen.commits).toEqual([]);
+  expect(seen.refs).toEqual([]);
+  expect(opened).toEqual([]);
+});
+
+test("the rebase runs none of the repo's hooks and signs nothing, so neither can fail it", async () => {
+  fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = advanceRemote("other.txt", "someone else\n");
+  const hooks = join(root, "hooks");
+  mkdirSync(hooks);
+  for (const hook of ["pre-rebase", "post-checkout", "post-rewrite"]) {
+    writeFileSync(join(hooks, hook), "#!/bin/sh\nexit 1\n");
+    chmodSync(join(hooks, hook), 0o755);
+  }
+  git(dir, "config", "core.hooksPath", hooks);
+  git(dir, "config", "commit.gpgsign", "true");
+  git(dir, "config", "gpg.program", "false");
+
+  await publishFrom(tree);
+
+  expect(git(tree, "rev-parse", "HEAD~1")).toBe(fresh);
+});
+
+test("a rebase that fails other than on a conflict says what git said, not that the commits conflict", async () => {
+  fakeGitHub();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("other.txt", "someone else\n");
+  // another git process holding the worktree's index
+  writeFileSync(
+    join(git(tree, "rev-parse", "--absolute-git-dir"), "index.lock"),
+    "",
+  );
+
+  const failure = publishFrom(tree);
+
+  await expect(failure).rejects.toThrow(/index\.lock/);
+  await expect(failure).rejects.not.toThrow(/rebase cleanly/);
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+});
+
+const gitDirOf = (tree: string) => git(tree, "rev-parse", "--absolute-git-dir");
+
+const rebaseInProgress = (tree: string) =>
+  ["rebase-merge", "rebase-apply"].some((dir) =>
+    existsSync(join(gitDirOf(tree), dir)),
+  );
+
+const skyRefs = (tree: string) => git(tree, "for-each-ref", "refs/sky");
+
+/** The requests publish makes, as `METHOD path` under the repo, in order. */
+const logRequests = () => {
+  const log: string[] = [];
+  server.use(
+    // answers nothing: each request falls through to the handler that does
+    http.all(`${REPO}/*`, ({ request }) => {
+      log.push(
+        `${request.method} ${new URL(request.url).pathname.split("/repos/acme/private")[1]}`,
+      );
+    }),
+  );
+  return log;
+};
+
+test("a base that hasn't moved fetches nothing, writes no ref and rebases nothing", async () => {
+  const seen = fakeGitHub();
+  const { tree } = await agentWorktree();
+  const log = logRequests();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+
+  await publishFrom(tree);
+
+  expect(log).toContain("GET /git/ref/heads/trunk");
+  expect(log.filter((r) => /\/git\/(commits|trees)\//.test(r))).toEqual([]);
+  expect(skyRefs(tree)).toBe("");
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+  expect(git(tree, "reflog", "HEAD", "--format=%gs")).not.toMatch(/rebase/);
+  expect(seen.commits[0]?.parents).toEqual([headSha]);
+});
+
+test("a base that moved is fetched by commit and tree, recorded in a ref and rebased onto, as the unmoved case is not", async () => {
+  fakeGitHub();
+  const { tree } = await agentWorktree();
+  const log = logRequests();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = advanceRemote("other.txt", "someone else\n");
+
+  await publishFrom(tree);
+
+  expect(log).toContain(`GET /git/commits/${fresh}`);
+  expect(log.some((r) => r.startsWith("GET /git/trees/"))).toBe(true);
+  expect(skyRefs(tree)).toContain(
+    `${fresh} commit\trefs/sky/rebased-onto/claude/agt_1`,
+  );
+  expect(git(tree, "rev-parse", "HEAD")).not.toBe(mine);
+  expect(git(tree, "reflog", "HEAD", "--format=%gs")).toMatch(/rebase/);
+});
+
+test("the base ref answering a gateway error that isn't a 404 fails the publish with that error, and leaves the branch and worktree as they were", async () => {
+  const seen = fakeGitHub();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("other.txt", "someone else\n");
+  server.use(
+    http.get(`${REPO}/git/ref/heads/trunk`, () =>
+      HttpResponse.json({ message: "Bad Gateway" }, { status: 502 }),
+    ),
+  );
+
+  const failure = publishFrom(tree);
+
+  await expect(failure).rejects.toThrow(
+    /GET \/repos\/acme\/private\/git\/ref\/heads\/trunk returned 502: Bad Gateway/,
+  );
+  await expect(failure).rejects.not.toThrow(/doesn't exist on GitHub/);
+  expect(seen.commits).toEqual([]);
+  expect(seen.refs).toEqual([]);
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+  expect(git(tree, "symbolic-ref", "HEAD")).toBe("refs/heads/claude/agt_1");
+  expect(git(tree, "status", "--porcelain")).toBe("");
+  expect(rebaseInProgress(tree)).toBe(false);
+  expect(skyRefs(tree)).toBe("");
+});
+
+test.each([
+  ["commit", "commits"],
+  ["tree", "trees"],
+])(
+  "a failure fetching the new base's %s fails the publish naming the request, and leaves the branch, worktree and clone as they were",
+  async (_, endpoint) => {
+    const seen = fakeGitHub();
+    const { tree } = await agentWorktree();
+    writeFileSync(join(tree, "new.txt"), "agent work\n");
+    const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+    const fresh = advanceRemote("other.txt", "someone else\n");
+    server.use(
+      http.get(`${REPO}/git/${endpoint}/:sha`, () =>
+        HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+      ),
+    );
+
+    await expect(publishFrom(tree)).rejects.toThrow(
+      new RegExp(
+        `GET /repos/acme/private/git/${endpoint}/[0-9a-f]{40}.* returned 500`,
+      ),
+    );
+
+    expect(seen.commits).toEqual([]);
+    expect(seen.refs).toEqual([]);
+    expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+    expect(git(tree, "symbolic-ref", "HEAD")).toBe("refs/heads/claude/agt_1");
+    expect(git(tree, "status", "--porcelain")).toBe("");
+    expect(rebaseInProgress(tree)).toBe(false);
+    expect(skyRefs(tree)).toBe("");
+    expect(
+      spawnSync("git", ["cat-file", "-e", fresh], { cwd: tree }).status,
+    ).not.toBe(0);
+  },
+);
+
+test("a conflict on the second of two agent commits aborts the whole rebase: the branch stays checked out at its own head with nothing half-applied", async () => {
+  const seen = fakeGitHub();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent first", "2026-10-31T10:00:00+00:00");
+  writeFileSync(join(tree, "README.md"), "agent's line\n");
+  const mine = commitAs(tree, "agent second", "2026-10-31T10:30:00+00:00");
+  advanceRemote("README.md", "someone else's line\n");
+
+  await expect(publishFrom(tree)).rejects.toThrow(
+    /trunk moved on GitHub to [0-9a-f]{40}, and this branch's commits don't rebase onto it cleanly/,
+  );
+
+  expect(seen.commits).toEqual([]);
+  expect(seen.refs).toEqual([]);
+  expect(git(tree, "symbolic-ref", "HEAD")).toBe("refs/heads/claude/agt_1");
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+  expect(git(tree, "rev-parse", "claude/agt_1")).toBe(mine);
+  expect(git(tree, "status", "--porcelain")).toBe("");
+  expect(git(tree, "ls-files", "--unmerged")).toBe("");
+  expect(rebaseInProgress(tree)).toBe(false);
+  expect(skyRefs(tree)).toBe("");
+  expect(readFileSync(join(tree, "README.md"), "utf8")).toBe("agent's line\n");
+});
+
+test("with no git identity configured the rebase commits as sky-agent and keeps each commit's author", async () => {
+  fakeGitHub();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const author = git(tree, "log", "-1", "--format=%an <%ae>", mine);
+  advanceRemote("other.txt", "someone else\n");
+  const empty = join(root, "no-home");
+  mkdirSync(empty);
+  vi.stubEnv("HOME", empty);
+  vi.stubEnv("XDG_CONFIG_HOME", empty);
+  vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null");
+  vi.stubEnv("GIT_CONFIG_NOSYSTEM", "1");
+  for (const key of [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "EMAIL",
+  ]) {
+    vi.stubEnv(key, undefined);
+  }
+  try {
+    // the premise: this environment has no identity, so git itself would refuse a commit
+    expect(
+      spawnSync("git", ["config", "user.email"], { cwd: tree }).status,
+    ).not.toBe(0);
+
+    await publishFrom(tree);
+
+    expect(git(tree, "log", "-1", "--format=%an <%ae>|%cn <%ce>")).toBe(
+      `${author}|sky-agent <agent@sky.local>`,
+    );
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("a merge commit on the agent's branch is flattened by the rebase into its constituent commits, none of them a merge", async () => {
+  const seen = fakeGitHub();
+  const { tree } = await agentWorktree();
+  git(tree, "checkout", "-q", "-b", "side", "origin/HEAD");
+  writeFileSync(join(tree, "b.txt"), "side work\n");
+  commitAs(tree, "side commit", "2026-10-31T09:00:00+00:00");
+  git(tree, "checkout", "-q", "claude/agt_1");
+  writeFileSync(join(tree, "a.txt"), "agent work\n");
+  commitAs(tree, "agent commit", "2026-10-31T10:00:00+00:00");
+  execFileSync(
+    "git",
+    [
+      ...NO_SIGN,
+      "-c",
+      "user.name=Ada L",
+      "-c",
+      "user.email=ada@example.com",
+      "merge",
+      "-q",
+      "--no-ff",
+      "-m",
+      "merge side",
+      "side",
+    ],
+    { cwd: tree },
+  );
+  expect(git(tree, "rev-list", "--merges", "origin/HEAD..HEAD")).not.toBe("");
+  const fresh = advanceRemote("other.txt", "someone else\n");
+
+  await publishFrom(tree);
+
+  expect(git(tree, "rev-list", "--merges", `${fresh}..HEAD`)).toBe("");
+  expect(seen.commits.map((c) => c.message.trim()).sort()).toEqual([
+    "agent commit",
+    "side commit",
+  ]);
+  expect(seen.commits.map((c) => c.parents)).toEqual([
+    [fresh],
+    [expect.stringMatching(/^d{40}$/)],
+  ]);
+  expect(readFileSync(join(tree, "b.txt"), "utf8")).toBe("side work\n");
+  expect(readFileSync(join(tree, "a.txt"), "utf8")).toBe("agent work\n");
+});
+
+/** A branch on GitHub other than the default, one commit past the default's head; the clone never saw it. */
+const releaseBranch = () => {
+  const seed = join(root, "seed");
+  git(seed, "checkout", "-qb", "release");
+  writeFileSync(join(seed, "release.txt"), "release notes\n");
+  const sha = commitAs(seed, "cut release", "2026-10-31T07:00:00+00:00");
+  git(seed, "push", "-q", remote, "release");
+  git(seed, "checkout", "-q", "trunk");
+  server.use(
+    http.get(`${REPO}/git/ref/heads/release`, () =>
+      HttpResponse.json({ object: { sha } }),
+    ),
+  );
+  return sha;
+};
+
+test("--base naming a branch the clone has no ref for publishes onto GitHub's head of it", async () => {
+  const seen = fakeGitHub();
+  const opened: unknown[] = [];
+  server.use(
+    http.post(`${REPO}/pulls`, async ({ request }) => {
+      opened.push(await request.json());
+      return HttpResponse.json(
+        { number: 7, html_url: "https://github.com/acme/private/pull/7" },
+        { status: 201 },
+      );
+    }),
+  );
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const release = releaseBranch();
+
+  const result = await publish({
+    cwd: tree,
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    title: "Agent change",
+    base: "release",
+  });
+
+  expect(result).toMatchObject({ base: "release", created: true });
+  expect(seen.commits).toHaveLength(1);
+  expect(seen.commits[0]?.parents).toEqual([release]);
+  expect(opened).toEqual([
+    expect.objectContaining({ head: "claude/agt_1", base: "release" }),
+  ]);
+  expect(git(tree, "rev-parse", "HEAD~1")).toBe(release);
+});
+
+test("--base naming a branch GitHub doesn't have fails saying so, and sends nothing", async () => {
+  const seen = fakeGitHub();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+
+  await expect(
+    publish({
+      cwd: tree,
+      gatewayUrl: GATEWAY,
+      connectorId: CONNECTOR,
+      title: "Agent change",
+      base: "nope",
+    }),
+  ).rejects.toThrow("nope doesn't exist on GitHub");
+  expect(seen.commits).toEqual([]);
+  expect(seen.refs).toEqual([]);
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+});
+
+/**
+ * GitHub's writes, landing in the bare remote as GitHub's would: blobs, trees and commits are real
+ * objects there, a ref update with force off refuses anything but a fast-forward, and a pull
+ * request opened stays open.
+ */
+function githubWrites() {
+  const pulls: { number: number; html_url: string; head: string }[] = [];
+  const index = join(root, "github-index");
+  const bareIn = (args: string[], input: string | Buffer, env = {}) =>
+    execFileSync("git", args, {
+      cwd: remote,
+      input,
+      encoding: "utf8",
+      env: { ...process.env, ...env },
+    }).trim();
+  const refSha = (ref: string) =>
+    spawnSync("git", ["rev-parse", "--verify", "--quiet", ref], {
+      cwd: remote,
+      encoding: "utf8",
+    }).stdout.trim();
+  server.use(
+    http.post(`${REPO}/git/blobs`, async ({ request }) => {
+      const { content } = (await request.json()) as { content: string };
+      const sha = bareIn(
+        ["hash-object", "-w", "--stdin"],
+        Buffer.from(content, "base64"),
+      );
+      return HttpResponse.json({ sha }, { status: 201 });
+    }),
+    http.post(`${REPO}/git/trees`, async ({ request }) => {
+      const body = (await request.json()) as {
+        base_tree: string;
+        tree: { path: string; mode: string; sha: string | null }[];
+      };
+      const env = { GIT_INDEX_FILE: index };
+      bareIn(["read-tree", body.base_tree], "", env);
+      for (const entry of body.tree) {
+        bareIn(
+          entry.sha === null
+            ? ["update-index", "--force-remove", entry.path]
+            : [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                `${entry.mode},${entry.sha},${entry.path}`,
+              ],
+          "",
+          env,
+        );
+      }
+      const sha = bareIn(["write-tree"], "", env);
+      rmSync(index, { force: true });
+      return HttpResponse.json({ sha }, { status: 201 });
+    }),
+    http.post(`${REPO}/git/commits`, async ({ request }) => {
+      type Person = { name: string; email: string; date: string };
+      const body = (await request.json()) as {
+        message: string;
+        tree: string;
+        parents: string[];
+        author: Person;
+        committer: Person;
+      };
+      const sha = bareIn(
+        [
+          "commit-tree",
+          body.tree,
+          ...body.parents.flatMap((p) => ["-p", p]),
+          "-F",
+          "-",
+        ],
+        body.message,
+        {
+          GIT_AUTHOR_NAME: body.author.name,
+          GIT_AUTHOR_EMAIL: body.author.email,
+          GIT_AUTHOR_DATE: body.author.date,
+          GIT_COMMITTER_NAME: body.committer.name,
+          GIT_COMMITTER_EMAIL: body.committer.email,
+          GIT_COMMITTER_DATE: body.committer.date,
+        },
+      );
+      return HttpResponse.json({ sha }, { status: 201 });
+    }),
+    http.get(`${REPO}/git/ref/heads/claude/*`, ({ request }) => {
+      const ref = new URL(request.url).pathname.split("/git/ref/")[1] ?? "";
+      const sha = refSha(`refs/${decodeURIComponent(ref)}`);
+      return sha
+        ? HttpResponse.json({ object: { sha } })
+        : HttpResponse.json({ message: "Not Found" }, { status: 404 });
+    }),
+    http.post(`${REPO}/git/refs`, async ({ request }) => {
+      const { ref, sha } = (await request.json()) as {
+        ref: string;
+        sha: string;
+      };
+      if (refSha(ref)) {
+        return HttpResponse.json(
+          { message: "Reference already exists" },
+          { status: 422 },
+        );
+      }
+      bareIn(["update-ref", ref, sha], "");
+      return HttpResponse.json({ object: { sha } }, { status: 201 });
+    }),
+    http.patch(`${REPO}/git/refs/heads/*`, async ({ request }) => {
+      const ref = `refs/${decodeURIComponent(new URL(request.url).pathname.split("/git/refs/")[1] ?? "")}`;
+      const { sha, force } = (await request.json()) as {
+        sha: string;
+        force: boolean;
+      };
+      const fastForward =
+        spawnSync("git", ["merge-base", "--is-ancestor", refSha(ref), sha], {
+          cwd: remote,
+        }).status === 0;
+      if (!force && !fastForward) {
+        return HttpResponse.json(
+          { message: "Update is not a fast forward" },
+          { status: 422 },
+        );
+      }
+      bareIn(["update-ref", ref, sha], "");
+      return HttpResponse.json({ object: { sha } });
+    }),
+    http.get(`${REPO}/pulls`, ({ request }) => {
+      const head = new URL(request.url).searchParams.get("head");
+      return HttpResponse.json(pulls.filter((p) => `acme:${p.head}` === head));
+    }),
+    http.post(`${REPO}/pulls`, async ({ request }) => {
+      const { head } = (await request.json()) as { head: string };
+      const number = pulls.length + 7;
+      const pull = {
+        number,
+        html_url: `https://github.com/acme/private/pull/${number}`,
+        head,
+      };
+      pulls.push(pull);
+      return HttpResponse.json(pull, { status: 201 });
+    }),
+    http.patch(`${REPO}/pulls/:number`, ({ params }) =>
+      HttpResponse.json({ number: Number(params.number) }),
+    ),
+  );
+  return { pulls };
+}
+
+/** The branch on GitHub: its commits past `base`, oldest first, by subject, and its tree. */
+const onGitHub = (branch: string, base: string) => ({
+  subjects: bare("log", "--reverse", "--format=%s", `${base}..${branch}`),
+  tree: bare("rev-parse", `${branch}^{tree}`),
+  onBase: spawnSync("git", ["merge-base", "--is-ancestor", base, branch], {
+    cwd: remote,
+  }).status,
+});
+
+test("a re-publish after the base moved two commits updates GitHub's branch to the rebased history, and the PR stays open", async () => {
+  fakeGitHub();
+  const { pulls } = githubWrites();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const first = await publishFrom(tree);
+
+  writeFileSync(join(tree, "fix.txt"), "review fix\n");
+  commitAs(tree, "review fix", "2026-10-31T11:00:00+00:00");
+  advanceRemote("one.txt", "1\n");
+  const fresh = advanceRemote("two.txt", "2\n");
+  const second = await publishFrom(tree);
+
+  expect(second).toMatchObject({
+    created: false,
+    pullRequest: first.pullRequest,
+  });
+  expect(pulls).toHaveLength(1);
+  expect(onGitHub("claude/agt_1", fresh)).toEqual({
+    subjects: "agent change\nreview fix",
+    tree: git(tree, "rev-parse", "HEAD^{tree}"),
+    onBase: 0,
+  });
+  // the base's tip arrived without its parent, so the clone holds it as shallow
+  expect(readFileSync(join(dir, ".git/shallow"), "utf8")).toContain(fresh);
+});
+
+test("a branch already rebased by a publish rebases again from that base when the base moves again", async () => {
+  fakeGitHub();
+  githubWrites();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("one.txt", "1\n");
+  advanceRemote("two.txt", "2\n");
+  await publishFrom(tree);
+
+  advanceRemote("three.txt", "3\n");
+  const fresh = advanceRemote("four.txt", "4\n");
+  await publishFrom(tree);
+
+  expect(git(tree, "rev-parse", "HEAD~1")).toBe(fresh);
+  expect(onGitHub("claude/agt_1", fresh)).toEqual({
+    subjects: "agent change",
+    tree: git(tree, "rev-parse", "HEAD^{tree}"),
+    onBase: 0,
+  });
+});
+
+test.each([
+  ["claude/agt_1", "claude/agt_2"],
+  ["claude/agt_2", "claude/agt_1"],
+])(
+  "two agents in one sprite publish %s then %s after the base moved two commits, each rebased onto it",
+  async (...order) => {
+    fakeGitHub();
+    githubWrites();
+    const dir = join(root, "repo");
+    await pull(dir);
+    const trees: Record<string, string> = {};
+    for (const branch of ["claude/agt_1", "claude/agt_2"]) {
+      const tree = join(root, branch.replace("/", "-"));
+      git(dir, "worktree", "add", "-b", branch, tree, "origin/HEAD");
+      writeFileSync(join(tree, `${branch.slice(7)}.txt`), `${branch}\n`);
+      commitAs(tree, `work on ${branch}`, "2026-10-31T10:00:00+00:00");
+      trees[branch] = tree;
+    }
+    advanceRemote("one.txt", "1\n");
+    const fresh = advanceRemote("two.txt", "2\n");
+
+    for (const branch of order) {
+      const tree = trees[branch] ?? "";
+      await publishFrom(tree);
+      expect(onGitHub(branch, fresh)).toEqual({
+        subjects: `work on ${branch}`,
+        tree: git(tree, "rev-parse", "HEAD^{tree}"),
+        onBase: 0,
+      });
+    }
+  },
+);
+
+/** A commit pushed to the agent's branch on GitHub by someone else, as a review suggestion is. */
+const suggestOnGitHub = (branch: string) => {
+  const reviewer = join(root, "reviewer");
+  execFileSync("git", ["clone", "-q", "-b", branch, remote, reviewer]);
+  writeFileSync(join(reviewer, "suggested.txt"), "reviewer\n");
+  const sha = commitAs(reviewer, "suggestion", "2026-10-31T12:00:00+00:00");
+  git(reviewer, "push", "-q", "origin", branch);
+  return sha;
+};
+
+test("a commit someone else pushed to the branch on GitHub is never overwritten by a re-publish after the base moved", async () => {
+  fakeGitHub();
+  githubWrites();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  await publishFrom(tree);
+  const suggestion = suggestOnGitHub("claude/agt_1");
+  advanceRemote("one.txt", "1\n");
+  advanceRemote("two.txt", "2\n");
+
+  await expect(publishFrom(tree)).rejects.toThrow(
+    "claude/agt_1 on GitHub isn't an ancestor of this branch",
+  );
+  expect(bare("rev-parse", "claude/agt_1")).toBe(suggestion);
+});
+
+test("a write to the branch on GitHub while a forced re-publish runs is not overwritten", async () => {
+  fakeGitHub();
+  githubWrites();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  await publishFrom(tree);
+  advanceRemote("one.txt", "1\n");
+  advanceRemote("two.txt", "2\n");
+  let suggestion = "";
+  // the other write lands after the publish read the branch and before it moves it
+  server.use(
+    http.post(
+      `${REPO}/git/commits`,
+      () => {
+        suggestion = suggestOnGitHub("claude/agt_1");
+      },
+      { once: true },
+    ),
+  );
+
+  await expect(publishFrom(tree)).rejects.toThrow(
+    /claude\/agt_1 moved on GitHub to [0-9a-f]{40} while this publish ran; nothing was overwritten/,
+  );
+  expect(bare("rev-parse", "claude/agt_1")).toBe(suggestion);
 });
 
 test("nothing outside the repo's REST endpoints is called, and no request carries a credential", async () => {

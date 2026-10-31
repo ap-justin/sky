@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { appendFile, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   CONNECTOR_ENV,
@@ -262,9 +262,9 @@ export async function fetchCommit(
       "shallow",
     ]);
     const held = existsSync(shallow) ? await readFile(shallow, "utf8") : "";
-    if (!held.split("\n").includes(sha)) {
-      await writeFile(shallow, `${held}${sha}\n`);
-    }
+    // appended, not rewritten: the file is shared by every worktree, and another agent's fetch may
+    // add its own line between the read and the write; git takes a line twice as once
+    if (!held.split("\n").includes(sha)) await appendFile(shallow, `${sha}\n`);
   }
 }
 

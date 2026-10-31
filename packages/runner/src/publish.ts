@@ -232,18 +232,32 @@ export function gateway(options: {
 }
 
 /**
- * Brings the clone's `origin/<base>` up to GitHub's current head of the base, which a sandbox's
- * clone, made once at provisioning, falls behind. The head commit is materialized from the REST API
- * when it isn't here, and this branch's commits are rebased onto it, so what is published sits on
- * the base as it is now, not as the clone saw it. A conflict aborts the rebase, restores
- * `origin/<base>`, and fails without a word sent to GitHub.
+ * The base commit this branch was last rebased onto by a publish. Kept per branch, not in
+ * `origin/<base>`, which every agent's worktree in the clone shares: a base fetched over REST is
+ * shallow, so moving the shared ref to it would cut every other branch off from its own base.
+ */
+const rebasedOnto = (branch: string) => `refs/sky/rebased-onto/${branch}`;
+
+const resolves = (cwd: string, ref: string) =>
+  git(cwd, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`).then(
+    (sha) => sha.trim(),
+    () => "",
+  );
+
+/**
+ * Rebases this branch's commits from `mergeBase` onto GitHub's current head of the base, which a
+ * sandbox's clone, made once at provisioning, falls behind, so what is published sits on the base
+ * as it is now, not as the clone saw it. The head commit is materialized from the REST API when it
+ * isn't here, and recorded in `rebasedOnto(branch)`. A failed rebase is aborted and fails the
+ * publish before anything is sent to GitHub: as a conflict where git stopped on one, else with
+ * git's own message.
  */
 async function refreshBase(
   cwd: string,
   call: ReturnType<typeof gateway>,
-  base: string,
+  options: { base: string; branch: string; mergeBase: string },
 ): Promise<void> {
-  const ref = `refs/remotes/origin/${base}`;
+  const { base, branch, mergeBase } = options;
   const { object } = await call<{ object: { sha: string } }>(
     "GET",
     `/git/ref/heads/${base.split("/").map(encodeURIComponent).join("/")}`,
@@ -255,11 +269,9 @@ async function refreshBase(
     }
     throw error;
   });
-  const old = (await git(cwd, "rev-parse", ref)).trim();
-  if (object.sha === old) return;
+  if (object.sha === mergeBase) return;
   await fetchCommit(repoGit(cwd), call, object.sha);
-  const oldBase = (await git(cwd, "merge-base", old, "HEAD")).trim();
-  await git(cwd, "update-ref", ref, object.sha);
+  const recorded = await resolves(cwd, rebasedOnto(branch));
   // the rebase commits as whoever git is configured as; a sandbox may have no identity of its own
   const identity = (await git(cwd, "config", "user.email").catch(() => ""))
     ? []
@@ -268,19 +280,35 @@ async function refreshBase(
     await git(
       cwd,
       ...identity,
+      // the repo's hooks and the user's signing are no part of moving commits, and either could fail it
+      "-c",
+      "commit.gpgsign=false",
+      "-c",
+      "core.hooksPath=/dev/null",
       "rebase",
       "--quiet",
       "--onto",
       object.sha,
-      oldBase,
+      mergeBase,
     );
   } catch (error) {
+    const conflicted = (
+      await git(cwd, "ls-files", "--unmerged").catch(() => "")
+    ).trim();
     await git(cwd, "rebase", "--abort").catch(() => {});
-    await git(cwd, "update-ref", ref, old);
+    if (conflicted) {
+      throw new PublishError(
+        `${base} moved on GitHub to ${object.sha}, and this branch's commits don't rebase onto it cleanly; rebase it by hand and publish again (${messageOf(error).split("\n")[0]})`,
+      );
+    }
+    const said =
+      (error as { stderr?: string }).stderr?.trim() || messageOf(error);
     throw new PublishError(
-      `${base} moved on GitHub to ${object.sha}, and this branch's commits don't rebase onto it cleanly; rebase it by hand and publish again (${messageOf(error).split("\n")[0]})`,
+      `rebasing ${branch} onto ${base} at ${object.sha} failed: ${said}`,
     );
   }
+  // the expected old value, empty for none, fails this if another publish of the branch moved it
+  await git(cwd, "update-ref", rebasedOnto(branch), object.sha, recorded);
 }
 
 /**
@@ -289,10 +317,14 @@ async function refreshBase(
  * the commit with its own message and identities), then the branch ref is created or fast-forwarded
  * and a pull request into the base opened, or the open one given the new title and body. Claude
  * Code's attribution is stripped from each commit message and the pull request's body, never its
- * title. Only first-parent history is replayed, so a merge commit arrives as a plain commit with
- * the same content, and a merge from the base shows the base's changes in the pull request's diff
- * as the branch's own. The base is first refreshed to GitHub's current head, with the branch's
- * commits rebased onto it when it moved (`refreshBase`).
+ * title. The base is first refreshed to GitHub's current head, with the branch's commits rebased
+ * onto it when it moved (`refreshBase`). That rebase flattens a merge: the merge commit is dropped
+ * and the commits it brought in are replayed one by one. Where the base hasn't moved, only
+ * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
+ * content, and a merge from the base shows the base's changes in the pull request's diff as the
+ * branch's own. A branch on GitHub whose head this branch
+ * held before a rebase or amend here is force-updated to the rewritten history; one holding a
+ * commit this branch never had is only ever fast-forwarded.
  */
 export async function publish(options: {
   cwd: string;
@@ -324,9 +356,25 @@ export async function publish(options: {
     (await git(cwd, "remote", "get-url", "origin")).trim(),
   );
   const pending = async () => {
+    // the newest of the clone's base and the one a publish last rebased this branch onto; a clone
+    // pulled through the connector holds only the default branch, so a branch cut from it is
+    // rebased from there onto GitHub's head of any other base
+    const known = (
+      await Promise.all([
+        resolves(cwd, `refs/remotes/origin/${base}`),
+        resolves(cwd, rebasedOnto(branch)),
+      ])
+    ).filter(Boolean);
+    const bases =
+      known.length > 0 ? known : [await resolves(cwd, "origin/HEAD")];
     const mergeBase = (
-      await git(cwd, "merge-base", `origin/${base}`, "HEAD")
+      await git(cwd, "merge-base", "HEAD", ...bases).catch(() => "")
     ).trim();
+    if (!mergeBase) {
+      throw new PublishError(
+        `${branch} shares no commit here with ${base}, so there is no base to publish it onto; rebase it onto origin/${base} by hand`,
+      );
+    }
     const commits = lines(
       await git(
         cwd,
@@ -338,7 +386,8 @@ export async function publish(options: {
     );
     return { mergeBase, commits };
   };
-  if ((await pending()).commits.length === 0) {
+  const local = await pending();
+  if (local.commits.length === 0) {
     throw new PublishError(
       `no commits on ${branch} past ${base}; commit your work first`,
     );
@@ -354,15 +403,25 @@ export async function publish(options: {
     }
     throw error;
   });
-  await refreshBase(cwd, call, base);
-  const { mergeBase, commits } = await pending();
-  // before anything is written, so a missing title costs no upload
+  // before the base is refreshed, so a missing title leaves the branch and the clone as they were
   const [existing] = await call<{ number: number; html_url: string }[]>(
     "GET",
     `/pulls?state=open&head=${encodeURIComponent(`${owner}:${branch}`)}`,
   );
   if (!existing && !options.title) {
     throw new PublishError("a title is needed to open the pull request");
+  }
+  await refreshBase(cwd, call, {
+    base,
+    branch,
+    mergeBase: local.mergeBase,
+  });
+  const { mergeBase, commits } = await pending();
+  // the rebase drops a commit whose change the base already holds
+  if (commits.length === 0) {
+    throw new PublishError(
+      `the changes on ${branch} are already on ${base} on GitHub, so there is nothing left to publish`,
+    );
   }
   const refPath = `heads/${branch.split("/").map(encodeURIComponent).join("/")}`;
   const treeOf = async (sha: string) =>
@@ -384,6 +443,9 @@ export async function publish(options: {
   const known = [mergeBase, ...commits];
   let start = 0;
   let parent = mergeBase;
+  // GitHub's head is one this branch held before it was rebased or amended here, so the rewritten
+  // history replaces it; a head this branch never held is someone else's, and is never overwritten
+  let rewritten = false;
   if (remote) {
     let at = known.indexOf(remote);
     if (at === -1) {
@@ -393,6 +455,19 @@ export async function publish(options: {
       );
       const trees = await Promise.all(known.map(treeOf));
       at = trees.lastIndexOf(tree.sha);
+      if (at === -1) {
+        const held = await git(
+          cwd,
+          "log",
+          "--walk-reflogs",
+          "--format=%H %T",
+          `refs/heads/${branch}`,
+        ).catch(() => "");
+        rewritten = lines(held).some((line) => {
+          const [sha, heldTree] = line.split(" ");
+          return sha === remote || heldTree === tree.sha;
+        });
+      }
     }
     if (at !== -1) {
       start = at;
@@ -467,6 +542,19 @@ export async function publish(options: {
       ref: `refs/heads/${branch}`,
       sha: parent,
     });
+  } else if (rewritten) {
+    // GitHub's ref update takes no expected old value: it is read again just before the forced
+    // update, so a write since the lookup above isn't overwritten
+    const now = await call<{ object: { sha: string } }>(
+      "GET",
+      `/git/ref/${refPath}`,
+    );
+    if (now.object.sha !== remote) {
+      throw new PublishError(
+        `${branch} moved on GitHub to ${now.object.sha} while this publish ran; nothing was overwritten, publish again`,
+      );
+    }
+    await call("PATCH", `/git/refs/${refPath}`, { sha: parent, force: true });
   } else if (remote !== parent) {
     await call("PATCH", `/git/refs/${refPath}`, {
       sha: parent,
@@ -474,7 +562,7 @@ export async function publish(options: {
     }).catch((error: unknown) => {
       if (error instanceof GatewayError && error.status === 422) {
         throw new PublishError(
-          `${branch} on GitHub isn't an ancestor of this branch: published commits were amended or rebased here, or someone pushed there; it can't be fast-forwarded (${error.message})`,
+          `${branch} on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten (${error.message})`,
         );
       }
       throw error;
