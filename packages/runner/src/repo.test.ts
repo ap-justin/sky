@@ -423,8 +423,9 @@ test("a rebase that fails other than on a conflict says what git said, not that 
   const failure = publishFrom(tree);
 
   await expect(failure).rejects.toThrow(/index\.lock/);
-  await expect(failure).rejects.not.toThrow(/rebase cleanly/);
+  await expect(failure).rejects.not.toThrow(/rebase cleanly|mid-rebase/);
   expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+  expect(rebaseInProgress(tree)).toBe(false);
 });
 
 test("a rebase git can't commit for want of a name says so in git's words", async () => {
@@ -476,7 +477,7 @@ test("a conflicting rebase names the files in conflict, not the command that ran
   const failure = publishFrom(tree);
 
   await expect(failure).rejects.toThrow(
-    /rebase it by hand and publish again \(conflict in README\.md\)$/,
+    /and publish again \(conflict in README\.md\)$/,
   );
   await expect(failure).rejects.not.toThrow(/Command failed/);
 });
@@ -618,9 +619,7 @@ test("a base that moved is fetched by commit and tree, recorded in a ref and reb
 
   expect(log).toContain(`GET /git/commits/${fresh}`);
   expect(log.some((r) => r.startsWith("GET /git/trees/"))).toBe(true);
-  expect(skyRefs(tree)).toContain(
-    `${fresh} commit\trefs/sky/rebased-onto/claude/agt_1`,
-  );
+  expect(skyRefs(tree)).toBe(`${fresh} commit\trefs/sky/bases/${fresh}`);
   expect(git(tree, "rev-parse", "HEAD")).not.toBe(mine);
   expect(git(tree, "reflog", "HEAD", "--format=%gs")).toMatch(/rebase/);
 });
@@ -688,14 +687,14 @@ test.each([
   },
 );
 
-test("a conflict on the second of two agent commits aborts the whole rebase: the branch stays checked out at its own head with nothing half-applied", async () => {
+test("a conflict on the second of two agent commits aborts the whole rebase: the branch stays checked out at its own head with nothing half-applied, and the fetched base is kept for a rebase by hand", async () => {
   const seen = fakeGitHub();
   const { tree } = await agentWorktree();
   writeFileSync(join(tree, "new.txt"), "agent work\n");
   commitAs(tree, "agent first", "2026-10-31T10:00:00+00:00");
   writeFileSync(join(tree, "README.md"), "agent's line\n");
   const mine = commitAs(tree, "agent second", "2026-10-31T10:30:00+00:00");
-  advanceRemote("README.md", "someone else's line\n");
+  const fresh = advanceRemote("README.md", "someone else's line\n");
 
   await expect(publishFrom(tree)).rejects.toThrow(
     /trunk moved on GitHub to [0-9a-f]{40}, and this branch's commits don't rebase onto it cleanly/,
@@ -709,8 +708,33 @@ test("a conflict on the second of two agent commits aborts the whole rebase: the
   expect(git(tree, "status", "--porcelain")).toBe("");
   expect(git(tree, "ls-files", "--unmerged")).toBe("");
   expect(rebaseInProgress(tree)).toBe(false);
-  expect(skyRefs(tree)).toBe("");
+  expect(skyRefs(tree)).toBe(`${fresh} commit\trefs/sky/bases/${fresh}`);
   expect(readFileSync(join(tree, "README.md"), "utf8")).toBe("agent's line\n");
+});
+
+test("a conflict whose rebase --abort fails says the worktree is left mid-rebase, and why, besides the conflict", async () => {
+  const seen = fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "README.md"), "agent's line\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("README.md", "someone else's line\n");
+  // stands in for another git process taking HEAD's lock while the rebase is stopped
+  writeFileSync(join(dir, ".git/info/attributes"), "README.md merge=lockit\n");
+  git(
+    dir,
+    "config",
+    "merge.lockit.driver",
+    'touch "$(git rev-parse --git-dir)/HEAD.lock"; exit 1',
+  );
+
+  const failure = publishFrom(tree);
+
+  await expect(failure).rejects.toThrow(/conflict in README\.md/);
+  await expect(failure).rejects.toThrow(
+    /`git rebase --abort` failed too, so the worktree is left mid-rebase.*HEAD\.lock/s,
+  );
+  expect(seen.commits).toEqual([]);
+  expect(rebaseInProgress(tree)).toBe(true);
 });
 
 test("with no git identity configured the rebase commits as sky-agent and keeps each commit's author", async () => {
@@ -1068,6 +1092,121 @@ test("a branch already rebased by a publish rebases again from that base when th
     onBase: 0,
   });
 });
+
+test("a branch rebased by hand onto a shallow base, as a conflict's message says to, then publishes", async () => {
+  fakeGitHub();
+  githubWrites();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "README.md"), "agent's line\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("one.txt", "1\n");
+  const fresh = advanceRemote("README.md", "someone else's line\n");
+  const failure = await publishFrom(tree).catch((error: Error) => error);
+  const advice = /`git (rebase [^`]+)`/.exec(String(failure))?.[1] ?? "";
+  expect(advice).not.toBe("");
+
+  spawnSync("git", advice.split(" "), { cwd: tree });
+  writeFileSync(join(tree, "README.md"), "both lines\n");
+  git(tree, "add", "README.md");
+  execFileSync("git", [...NO_SIGN, "rebase", "--continue"], {
+    cwd: tree,
+    env: { ...process.env, GIT_EDITOR: "true" },
+  });
+  await publishFrom(tree);
+
+  expect(onGitHub("claude/agt_1", fresh)).toEqual({
+    subjects: "agent change",
+    tree: git(tree, "rev-parse", "HEAD^{tree}"),
+    onBase: 0,
+  });
+});
+
+test("a branch sharing no commit with any base fails with advice that, followed, publishes it", async () => {
+  fakeGitHub();
+  githubWrites();
+  const { tree } = await agentWorktree();
+  git(tree, "switch", "-q", "--orphan", "claude/orphan");
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const failure = await publishFrom(tree).catch((error: Error) => error);
+  const advice = [...String(failure).matchAll(/`git ([^`]+)`/g)].map(
+    (match) => match[1] ?? "",
+  );
+  expect(advice).toHaveLength(2);
+
+  for (const step of advice) {
+    execFileSync("git", [...NO_SIGN, ...step.split(" ")], { cwd: tree });
+  }
+  await publishFrom(tree);
+
+  const branch = git(tree, "symbolic-ref", "--short", "HEAD");
+  expect(onGitHub(branch, headSha)).toEqual({
+    subjects: "agent change",
+    tree: git(tree, "rev-parse", "HEAD^{tree}"),
+    onBase: 0,
+  });
+});
+
+test("a branch reaching two bases that share no commit here fails naming both, with advice that, followed, publishes only its own commits", async () => {
+  fakeGitHub();
+  githubWrites();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("one.txt", "1\n");
+  const fresh = advanceRemote("two.txt", "2\n");
+  await publishFrom(tree);
+  // the shallow base and the clone's own share no history, so git merges them only when told to
+  git(tree, "merge", "-q", "--allow-unrelated-histories", "origin/trunk");
+  writeFileSync(join(tree, "more.txt"), "follow-up\n");
+  commitAs(tree, "follow-up", "2026-10-31T11:00:00+00:00");
+
+  const failure = await publishFrom(tree).catch((error: Error) => error);
+  expect(String(failure)).toContain(headSha);
+  expect(String(failure)).toContain(fresh);
+  const advice = [...String(failure).matchAll(/`git ([^`]+)`/g)].map(
+    (match) => match[1] ?? "",
+  );
+  expect(advice).toHaveLength(2);
+  for (const step of advice) {
+    execFileSync("git", [...NO_SIGN, ...step.split(" ")], { cwd: tree });
+  }
+  await publishFrom(tree);
+
+  const branch = git(tree, "symbolic-ref", "--short", "HEAD");
+  expect(onGitHub(branch, fresh)).toMatchObject({
+    subjects: "agent change\nfollow-up",
+    onBase: 0,
+  });
+});
+
+test.each([
+  ["cut from it", ["switch", "-q", "-c", "claude/followup"]],
+  ["renamed", ["branch", "-m", "claude/followup"]],
+])(
+  "a branch %s after a publish rebased it onto a shallow base still publishes from that base",
+  async (_, command) => {
+    fakeGitHub();
+    githubWrites();
+    const { tree } = await agentWorktree();
+    writeFileSync(join(tree, "new.txt"), "agent work\n");
+    commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+    advanceRemote("one.txt", "1\n");
+    const fresh = advanceRemote("two.txt", "2\n");
+    await publishFrom(tree);
+
+    git(tree, ...command);
+    writeFileSync(join(tree, "more.txt"), "follow-up\n");
+    commitAs(tree, "follow-up", "2026-10-31T11:00:00+00:00");
+    await publishFrom(tree);
+
+    expect(onGitHub("claude/followup", fresh)).toEqual({
+      subjects: "agent change\nfollow-up",
+      tree: git(tree, "rev-parse", "HEAD^{tree}"),
+      onBase: 0,
+    });
+  },
+);
 
 test.each([
   ["claude/agt_1", "claude/agt_2"],

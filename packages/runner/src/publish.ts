@@ -62,6 +62,10 @@ const lines = (output: string) => output.split("\n").filter(Boolean);
 const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
+/** A failed git command's own words, not execFile's "Command failed: …" wrapper. */
+const gitSaid = (error: unknown) =>
+  (error as { stderr?: string }).stderr?.trim() || messageOf(error);
+
 /** `owner/repo` from an https or ssh GitHub remote URL. */
 function parseOrigin(url: string): { owner: string; repo: string } {
   const match = /github\.com[:/]([^/]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url);
@@ -235,11 +239,14 @@ export function gateway(options: {
 }
 
 /**
- * The base commit this branch was last rebased onto by a publish. Kept per branch, not in
- * `origin/<base>`, which every agent's worktree in the clone shares: a base fetched over REST is
- * shallow, so moving the shared ref to it would cut every other branch off from its own base.
+ * Every base head a publish fetched into this clone, one ref per commit. A base fetched over REST
+ * is usually shallow, so a branch rebased onto it reaches no older base, `origin/<base>` included;
+ * these refs are what it is published from after that. Keyed by commit, not branch, they still
+ * find the base for a branch renamed or cut from a rebased one, and one rebased onto it by hand.
+ * `origin/<base>` stays where it is: every agent's worktree in the clone reads it, and moving it
+ * to a shallow commit would cut every other branch off from its own base.
  */
-const rebasedOnto = (branch: string) => `refs/sky/rebased-onto/${branch}`;
+const FETCHED_BASES = "refs/sky/bases/";
 
 const resolves = (cwd: string, ref: string) =>
   git(cwd, "rev-parse", "--verify", "--quiet", `${ref}^{commit}`).then(
@@ -270,7 +277,8 @@ async function rebaseInProgress(cwd: string): Promise<string | undefined> {
  * Rebases this branch's commits from `mergeBase` onto GitHub's current head of the base, which a
  * sandbox's clone, made once at provisioning, falls behind, so what is published sits on the base
  * as it is now, not as the clone saw it. The head commit is materialized from the REST API when it
- * isn't here, and recorded in `rebasedOnto(branch)`. A failed rebase is aborted and fails the
+ * isn't here, and recorded under `FETCHED_BASES` before the rebase starts, so a rebase that stops
+ * or is killed, or is redone by hand, leaves it known. A failed rebase is aborted and fails the
  * publish before anything is sent to GitHub: as a conflict where git stopped on one, else with
  * git's own message.
  */
@@ -293,7 +301,7 @@ async function refreshBase(
   });
   if (object.sha === mergeBase) return;
   await fetchCommit(repoGit(cwd), call, object.sha);
-  const recorded = await resolves(cwd, rebasedOnto(branch));
+  await git(cwd, "update-ref", `${FETCHED_BASES}${object.sha}`, object.sha);
   // the rebase commits as whoever git is configured as; a sandbox may have no identity of its own
   const identity = (await git(cwd, "config", "user.email").catch(() => ""))
     ? []
@@ -322,20 +330,24 @@ async function refreshBase(
         ),
       ),
     ];
-    await git(cwd, "rebase", "--abort").catch(() => {});
+    // a rebase refused before it began, as on a held index.lock, leaves nothing to abort
+    const stuck =
+      (await rebaseInProgress(cwd)) === undefined
+        ? ""
+        : await git(cwd, "rebase", "--abort").then(
+            () => "",
+            (abort: unknown) =>
+              `; \`git rebase --abort\` failed too, so the worktree is left mid-rebase with HEAD detached, and commits made now land on no branch; run it again once git allows, before anything else (${gitSaid(abort)})`,
+          );
     if (conflicted.length) {
       throw new PublishError(
-        `${base} moved on GitHub to ${object.sha}, and this branch's commits don't rebase onto it cleanly; rebase it by hand and publish again (conflict in ${conflicted.join(", ")})`,
+        `${base} moved on GitHub to ${object.sha}, and this branch's commits don't rebase onto it cleanly; rebase them by hand with \`git rebase --onto ${object.sha} ${mergeBase}\`, resolve the conflicts, and publish again (conflict in ${conflicted.join(", ")})${stuck}`,
       );
     }
-    const said =
-      (error as { stderr?: string }).stderr?.trim() || messageOf(error);
     throw new PublishError(
-      `rebasing ${branch} onto ${base} at ${object.sha} failed: ${said}`,
+      `rebasing ${branch} onto ${base} at ${object.sha} failed: ${gitSaid(error)}${stuck}`,
     );
   }
-  // the expected old value, empty for none, fails this if another publish of the branch moved it
-  await git(cwd, "update-ref", rebasedOnto(branch), object.sha, recorded);
 }
 
 /**
@@ -390,23 +402,34 @@ export async function publish(options: {
     (await git(cwd, "remote", "get-url", "origin")).trim(),
   );
   const pending = async () => {
-    // the newest of the clone's base and the one a publish last rebased this branch onto; a clone
-    // pulled through the connector holds only the default branch, so a branch cut from it is
-    // rebased from there onto GitHub's head of any other base
-    const known = (
-      await Promise.all([
-        resolves(cwd, `refs/remotes/origin/${base}`),
-        resolves(cwd, rebasedOnto(branch)),
-      ])
-    ).filter(Boolean);
-    const bases =
-      known.length > 0 ? known : [await resolves(cwd, "origin/HEAD")];
-    const mergeBase = (
-      await git(cwd, "merge-base", "HEAD", ...bases).catch(() => "")
-    ).trim();
-    if (!mergeBase) {
+    // the newest of the clone's base and every base a publish fetched; a clone pulled through the
+    // connector holds only the default branch, so a branch cut from it is rebased from there onto
+    // GitHub's head of any other base
+    const clonedRef = (await resolves(cwd, `refs/remotes/origin/${base}`))
+      ? `origin/${base}`
+      : "origin/HEAD";
+    const [cloned, fetched] = await Promise.all([
+      resolves(cwd, clonedRef),
+      git(cwd, "for-each-ref", "--format=%(objectname)", FETCHED_BASES),
+    ]);
+    const bases = [cloned, ...lines(fetched)].filter(Boolean);
+    const found = lines(
+      await git(cwd, "merge-base", "--all", "HEAD", ...bases).catch(() => ""),
+    );
+    if (found.length > 1) {
+      // without --all git outputs an unspecified one of these; from any one, the rebase and the
+      // commit list would take the others' history as this branch's own
+      const [newest] = lines(await git(cwd, "rev-list", "--no-walk", ...found));
       throw new PublishError(
-        `${branch} shares no commit here with ${base}, so there is no base to publish it onto; rebase it onto origin/${base} by hand`,
+        `${branch} has more than one merge base with ${base} here, none an ancestor of another (${found.join(", ")}), as after a merge of unrelated histories, so which commits are its own is ambiguous; move them onto a new branch with \`git switch -c ${branch}-on-${base} ${newest}\` and \`git cherry-pick --no-merges ${found.map((sha) => `^${sha}`).join(" ")} ${branch}\`, then publish that`,
+      );
+    }
+    const [mergeBase] = found;
+    if (!mergeBase) {
+      // a rebase onto the base would replay the branch's root commit, adding every file, and
+      // conflict wherever the base has one too
+      throw new PublishError(
+        `${branch} shares no commit here with ${base} or any base a publish fetched, so there is no base to publish it onto; move its commits onto a new branch from ${clonedRef} with \`git switch -c ${branch}-on-${base} ${clonedRef}\` and \`git cherry-pick ${clonedRef}..${branch}\`, then publish that`,
       );
     }
     const commits = lines(
