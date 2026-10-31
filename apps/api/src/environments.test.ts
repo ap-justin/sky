@@ -222,6 +222,8 @@ test("a label call that hangs is cut at the Sprites bound, logged once, and prov
     nudgeDeliveries: () => {},
   });
   wire.hangs = (call) => call.startsWith("label ");
+  // the SDK's update takes no signal, so the hung PUT outlives the bound; keep it inside this test
+  wire.hangMs = 2_000;
   const { id } = (await (await post(kru)).json()) as { id: string };
   const sprite = spriteNameFor(id);
   expect(await settled(id, 4_000)).toMatchObject({
@@ -232,6 +234,7 @@ test("a label call that hangs is cut at the Sprites bound, logged once, and prov
   expect(labelLines(logged)).toEqual([
     `sprite ${sprite} label: timed out after 1500ms`,
   ]);
+  await new Promise((r) => setTimeout(r, 2_100));
 });
 
 test("an existing sprite is relabeled when the repo changes, its url settings kept", async () => {

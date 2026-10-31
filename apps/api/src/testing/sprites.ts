@@ -135,6 +135,8 @@ export function stubSprites() {
      * pass, then a 503), as a Sprites API that hangs.
      */
     hangs: (_call: string): boolean => false,
+    /** How long a hung call waits before answering 503 when the client never aborts it. */
+    hangMs: 5_000,
     createStatus: 201,
     updateStatus: 200,
     writeStatus: 200,
@@ -147,7 +149,7 @@ export function stubSprites() {
       const answer = () =>
         resolve(HttpResponse.json({ error: "hung" }, { status: 503 }));
       request.signal.addEventListener("abort", answer, { once: true });
-      setTimeout(answer, 5_000).unref();
+      setTimeout(answer, wire.hangMs).unref();
     });
   const authorized = (request: Request) =>
     request.headers.get("authorization") === `Bearer ${spritesToken}`;
