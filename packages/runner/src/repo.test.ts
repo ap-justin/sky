@@ -1377,7 +1377,7 @@ test("a signed tip whose signed text doesn't hash to its sha fails the pull, say
     ),
   );
   await expect(pull(join(root, "repo"))).rejects.toThrow(
-    `commit ${tip.sha} is signed, but its signed text from GitHub's API doesn't hash to it`,
+    `commit ${tip.sha} is signed, but the signed commit rebuilt from GitHub's API doesn't hash to GitHub's sha`,
   );
 });
 
@@ -1405,7 +1405,7 @@ const rawTip = (headers: string[], signed: boolean) => {
   ];
   const message = "Merge pull request #1 from acme/feature\n\nShip it\n";
   const payload = `${lines.join("\n")}\n\n${message}`;
-  const gpgsig = `gpgsig ${SIGNATURE.replace(/\n$/, "").split("\n").join("\n ")}`;
+  const gpgsig = `gpgsig ${SIGNATURE.split("\n").join("\n ")}`;
   const text = signed
     ? `${[...lines, gpgsig].join("\n")}\n\n${message}`
     : payload;
@@ -1490,7 +1490,7 @@ test("a signed tip whose API gave a signature but no signed text fails the pull,
   expect(existsSync(join(root, "fresh"))).toBe(false);
 });
 
-test("rebuildCommit puts the signature at the end of signed text that has no blank line", () => {
+test("rebuildCommit puts a GitHub-style signature, trailing newline kept, at the end of signed text that has no blank line", () => {
   const body = [
     `tree ${bare("rev-parse", `${headSha}^{tree}`)}`,
     "author Ada L <ada@example.com> 1790000000 +0530",
@@ -1504,6 +1504,7 @@ test("rebuildCommit puts the signature at the end of signed text that has no bla
     " wsFcBAABCAAQBQJnAAAACRBK7hj4Ov3rIwAAdHIQAKw4Zm9vYmFy",
     " =abcd",
     " -----END PGP SIGNATURE-----",
+    " ",
     "",
   ].join("\n");
   const sha = execFileSync(
@@ -1514,6 +1515,32 @@ test("rebuildCommit puts the signature at the end of signed text that has no bla
   const commit = {
     ...apiCommit(headSha),
     verification: { signature: SIGNATURE, payload: body },
+  };
+  expect(rebuildCommit(sha, commit)).toBe(text);
+});
+
+test("rebuildCommit keeps a signature without a trailing newline as it is", () => {
+  const signature = SIGNATURE.replace(/\n$/, "");
+  const body = [
+    `tree ${bare("rev-parse", `${headSha}^{tree}`)}`,
+    "author Ada L <ada@example.com> 1790000000 +0530",
+    "committer GitHub <noreply@github.com> 1790000100 -0700",
+    "",
+    "Ship it",
+    "",
+  ].join("\n");
+  const text = body.replace(
+    "\n\n",
+    `\ngpgsig ${signature.split("\n").join("\n ")}\n\n`,
+  );
+  const sha = execFileSync(
+    "git",
+    ["hash-object", "-t", "commit", "--literally", "--stdin"],
+    { cwd: remote, input: text, encoding: "utf8" },
+  ).trim();
+  const commit = {
+    ...apiCommit(headSha),
+    verification: { signature, payload: body },
   };
   expect(rebuildCommit(sha, commit)).toBe(text);
 });
