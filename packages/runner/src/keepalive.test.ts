@@ -4,7 +4,7 @@ import { createServer, type Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
-import { afterEach, beforeEach, expect, test } from "vitest";
+import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { holdSprite } from "./keepalive.js";
 
 let dir: string;
@@ -179,5 +179,59 @@ test("a socket that refuses at first is retried quickly, and ready says once the
   // the third PUT held the sprite, long before the minute-long refresh would have tried again
   expect(calls).toEqual(["PUT", "PUT", "PUT"]);
   expect(warnings.some((w) => /not held/.test(w))).toBe(false);
+  await hold.release();
+});
+
+test("a stop during the first-hold retries settles ready unheld at once and puts no more", async () => {
+  const { calls, socketPath } = await spriteApi(500);
+  const stop = new AbortController();
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 60_000,
+    firstRetryMs: 1_000,
+    signal: stop.signal,
+    warn: () => {},
+  });
+  // the first PUT has failed, so the loop is in its retry sleep
+  await vi.waitFor(() => expect(calls).toHaveLength(1));
+  const stopped = Date.now();
+  stop.abort("SIGTERM");
+  await expect(hold.ready).resolves.toBe(false);
+  expect(Date.now() - stopped).toBeLessThan(250);
+  await hold.release();
+  expect(calls.map((c) => c.method)).toEqual(["PUT", "DELETE"]);
+});
+
+test("a stop abandons a first PUT the sprite API is stalling on", async () => {
+  let puts = 0;
+  api = createServer((req) => {
+    // never answers, as a sprite API that accepts and then stalls
+    req.resume();
+    puts++;
+  });
+  const socketPath = join(dir, "api.sock");
+  api.listen(socketPath);
+  await once(api, "listening");
+  const stop = new AbortController();
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 60_000,
+    signal: stop.signal,
+    warn: (m) => warnings.push(m),
+  });
+  await vi.waitFor(() => expect(puts).toBe(1));
+  const stopped = Date.now();
+  stop.abort("SIGTERM");
+  await expect(hold.ready).resolves.toBe(false);
+  expect(Date.now() - stopped).toBeLessThan(250);
+  expect(puts).toBe(1);
+  expect(warnings.some((w) => /aborted/i.test(w))).toBe(false);
+  // gone, so release's DELETE fails at once rather than stalling for its timeout
+  api.closeAllConnections();
+  api.close();
+  api = undefined;
   await hold.release();
 });

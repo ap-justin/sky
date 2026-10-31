@@ -23,7 +23,6 @@ const warn = (message: string) => {
     } catch {}
 };
 
-/** Runs one startup step, logging when it started and how long it took. */
 async function step<T>(name: string, task: () => Promise<T>): Promise<T> {
   const started = Date.now();
   warn(`runner: ${name} started`);
@@ -58,22 +57,14 @@ async function main(): Promise<void> {
   process.once("SIGHUP", onSignal);
   // first, so the sprite can't pause and freeze the run before it is held; held through waits for a
   // decision too: a paused sprite drops the long-poll and the event posts
-  const hold = holdSprite({ runId: config.runId, warn });
+  const hold = holdSprite({
+    runId: config.runId,
+    warn,
+    signal: controller.signal,
+  });
   await step("sprite hold", () => hold.ready);
-  // so a nested `claude -p` in the sandbox is logged in; a failure costs the Kru checks, not the run
-  await step("claude credentials", () =>
-    writeClaudeCredentials(process.env).catch((error: unknown) =>
-      warn(
-        `runner: nested claude login not set up: ${error instanceof Error ? error.message : String(error)}`,
-      ),
-    ),
-  );
-  // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
-  await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
-  // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails the run
-  await step("plugin refresh", () =>
-    refreshPlugins({ env: process.env, warn, signal: controller.signal }),
-  );
+  // a stop while the hold was landing skips setup; the session reports it as run.failed
+  if (!controller.signal.aborted) await setUpSession(controller.signal);
   warn("runner: session starting");
   try {
     process.exitCode = await runSession(config, {
@@ -92,6 +83,23 @@ async function main(): Promise<void> {
   }
   // die by the signal so the caller sees the process was stopped, not that it failed
   if (caught) process.kill(process.pid, caught);
+}
+
+async function setUpSession(signal: AbortSignal): Promise<void> {
+  // so a nested `claude -p` in the sandbox is logged in; a failure costs the Kru checks, not the run
+  await step("claude credentials", () =>
+    writeClaudeCredentials(process.env).catch((error: unknown) =>
+      warn(
+        `runner: nested claude login not set up: ${error instanceof Error ? error.message : String(error)}`,
+      ),
+    ),
+  );
+  // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
+  await step("store sync", () => syncStoreQuietly("pull", process.env, warn));
+  // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails the run
+  await step("plugin refresh", () =>
+    refreshPlugins({ env: process.env, warn, signal }),
+  );
 }
 
 const io = {

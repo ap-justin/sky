@@ -1582,7 +1582,7 @@ test("a run that never reports in is failed with launch_timeout past the launch 
   ).toEqual([]);
   expect(
     failUnlaunchedRuns(db, deadline, Date.now() + deadline + 1000),
-  ).toEqual([run.id]);
+  ).toEqual([{ runId: run.id, spriteName: spriteNameFor(envId) }]);
   expect((await getRun(agent.id, run.id)).body).toMatchObject({
     status: "failed",
     error: "launch_timeout",
