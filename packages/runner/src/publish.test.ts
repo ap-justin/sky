@@ -93,6 +93,8 @@ function fakeGitHub(
     blobs?: string[];
     /** Trees of commits GitHub holds that this clone doesn't, by commit sha. */
     commitTrees?: Record<string, string>;
+    /** Parents of those commits; a commit not listed sits directly on the base. */
+    commitParents?: Record<string, string[]>;
     /** Whether a PATCH to a pull is expected; otherwise GitHub refuses it and the test fails. */
     allowPullUpdates?: boolean;
   } = {},
@@ -137,7 +139,13 @@ function fakeGitHub(
       seen(request);
       const tree = options.commitTrees?.[String(params.sha)];
       return tree
-        ? HttpResponse.json({ sha: params.sha, tree: { sha: tree } })
+        ? HttpResponse.json({
+            sha: params.sha,
+            tree: { sha: tree },
+            parents: (
+              options.commitParents?.[String(params.sha)] ?? [baseSha]
+            ).map((sha) => ({ sha })),
+          })
         : HttpResponse.json({ message: "Not Found" }, { status: 404 });
     }),
     http.post(`${REPO}/git/blobs`, async ({ request }) => {
@@ -710,6 +718,24 @@ test("a re-publish whose earlier commits GitHub holds under other shas resumes f
   expect(gh.commits.map((c) => c.parents)).toEqual([["gh_first"]]);
   expect(gh.refWrites).toEqual([
     { method: "PATCH", body: { sha: "commit1", force: false } },
+  ]);
+});
+
+test("a head GitHub holds with this branch's tree but on a base that has since moved is replaced, not built upon, so no stale history stays under the new commits", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const firstTree = git(work, "rev-parse", `${first}^{tree}`);
+  const gh = fakeGitHub({
+    ref: "gh_stale",
+    commitTrees: { gh_stale: firstTree, gh_old_base: firstTree },
+    commitParents: { gh_stale: ["gh_old_base"], gh_old_base: [] },
+  });
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[baseSha]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: true } },
   ]);
 });
 

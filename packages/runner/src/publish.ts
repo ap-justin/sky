@@ -350,6 +350,25 @@ async function refreshBase(
   }
 }
 
+/** Whether GitHub's commit `sha` has `ancestor` on its first-parent line, within a bounded walk. */
+async function sitsOn(
+  call: ReturnType<typeof gateway>,
+  sha: string,
+  ancestor: string,
+): Promise<boolean> {
+  for (let steps = 0; steps < 500; steps++) {
+    if (sha === ancestor) return true;
+    const { parents } = await call<{ parents: { sha: string }[] }>(
+      "GET",
+      `/git/commits/${sha}`,
+    );
+    const next = parents[0]?.sha;
+    if (!next) return false;
+    sha = next;
+  }
+  return false;
+}
+
 /**
  * Publishes the worktree's branch through the GitHub gateway, which carries no git push: each
  * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
@@ -512,7 +531,12 @@ export async function publish(options: {
       );
       const trees = await Promise.all(known.map(treeOf));
       at = trees.lastIndexOf(tree.sha);
-      if (at === -1) {
+      // a tree this branch also has, on a history that doesn't pass through the base as it is now
+      // (published before the base moved), would keep that stale history under the new commits
+      if (at !== -1 && !(await sitsOn(call, remote, mergeBase))) {
+        at = -1;
+        rewritten = true;
+      } else if (at === -1) {
         const held = await git(
           cwd,
           "log",
