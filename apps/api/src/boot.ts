@@ -10,6 +10,7 @@ import { KnownSecrets } from "./redact.js";
 import {
   failAbandonedWaits,
   failStaleRuns,
+  failUnlaunchedRuns,
   pruneClaudeEvents,
 } from "./runs.js";
 import { purgeExpiredEnvVars } from "./secrets.js";
@@ -35,11 +36,13 @@ export function boot(config: Config, log: (line: string) => void) {
   const secrets = KnownSecrets.fromConfig(config);
   const sweep = () => {
     purgeExpiredEnvVars(db, secrets, new Date());
+    const late = failUnlaunchedRuns(db, config.launchDeadlineMs);
+    for (const id of late) log(`run ${id} failed: launch_timeout`);
     const stale = failStaleRuns(db, config.runTimeoutMs);
     for (const id of stale) log(`run ${id} failed: runner_timeout`);
     const abandoned = failAbandonedWaits(db, config.waitTimeoutMs);
     for (const id of abandoned) log(`run ${id} failed: waiting_timeout`);
-    if (stale.length + abandoned.length > 0) dispatcher.nudge();
+    if (late.length + stale.length + abandoned.length > 0) dispatcher.nudge();
     const pruned = pruneClaudeEvents(db);
     if (pruned > 0) log(`pruned ${pruned} claude.* events older than 7 days`);
   };

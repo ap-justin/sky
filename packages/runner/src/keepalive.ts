@@ -8,7 +8,16 @@ const EXPIRE = "5m";
 const REFRESH_MS = 60_000;
 const REQUEST_TIMEOUT_MS = 5_000;
 
-export type SpriteHold = { release: () => Promise<void> };
+// a sprite woken cold can answer on its socket a few seconds after the runner starts; until the
+// first hold lands the sprite may pause and freeze the run, so the first PUT retries quickly
+const FIRST_HOLD_RETRY_MS = 1_000;
+const FIRST_HOLD_ATTEMPTS = 30;
+
+export type SpriteHold = {
+  /** Settles once the first hold lands or its quick retries run out: true when the sprite is held. */
+  ready: Promise<boolean>;
+  release: () => Promise<void>;
+};
 
 /**
  * The run's task name, hashed into the lowercase letters, digits and hyphens the Sprites API takes
@@ -28,6 +37,8 @@ export function holdSprite(options: {
   warn: (message: string) => void;
   socketPath?: string;
   refreshMs?: number;
+  firstRetryMs?: number;
+  firstAttempts?: number;
 }): SpriteHold {
   const socketPath = options.socketPath ?? SPRITE_API_SOCKET;
   const path = `/v1/tasks/${taskNameFor(options.runId)}`;
@@ -35,9 +46,11 @@ export function holdSprite(options: {
   let stopped = false;
 
   let socketFound: boolean | undefined;
+  let held = false;
   const call = async (method: "PUT" | "DELETE", body?: string) => {
     try {
       await send(socketPath, method, path, body);
+      if (method === "PUT") held = true;
       return true;
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code;
@@ -63,9 +76,31 @@ export function holdSprite(options: {
         inFlight = refresh();
       }, options.refreshMs ?? REFRESH_MS).unref();
   };
-  let inFlight = refresh();
+  // the first hold, retried every `firstRetryMs` while the socket refuses; then the normal refresh takes over
+  const first = async (): Promise<boolean> => {
+    const attempts = options.firstAttempts ?? FIRST_HOLD_ATTEMPTS;
+    for (let attempt = 1; ; attempt++) {
+      socketFound = await call("PUT", JSON.stringify({ expire: EXPIRE }));
+      if (!socketFound || held || stopped || attempt >= attempts) break;
+      await new Promise((r) =>
+        setTimeout(r, options.firstRetryMs ?? FIRST_HOLD_RETRY_MS),
+      );
+    }
+    if (socketFound && !held)
+      options.warn(
+        "runner: sprite not held after the first retries; it may pause the run",
+      );
+    if (socketFound && !stopped)
+      timer = setTimeout(() => {
+        inFlight = refresh();
+      }, options.refreshMs ?? REFRESH_MS).unref();
+    return held;
+  };
+  const ready = first();
+  let inFlight: Promise<void> = ready.then(() => {});
 
   return {
+    ready,
     release: async () => {
       stopped = true;
       clearTimeout(timer);

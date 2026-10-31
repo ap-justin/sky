@@ -190,6 +190,39 @@ export function failStaleRuns(db: Db, timeoutMs: number, now = Date.now()) {
   );
 }
 
+/**
+ * Fails, with `launch_timeout`, every run still `starting` with no event since it was created over
+ * `deadlineMs` ago: its runner never reported in (a launch stuck on the sprite, or a sprite that paused
+ * before the runner held it), so the agent frees up for a follow-up instead of waiting out
+ * `runner_timeout`. Returns the ids it failed.
+ */
+export function failUnlaunchedRuns(
+  db: Db,
+  deadlineMs: number,
+  now = Date.now(),
+) {
+  const cutoff = new Date(now - deadlineMs).toISOString();
+  return db.transaction(
+    (tx) => {
+      const late = tx
+        .select({ id: runs.id })
+        .from(runs)
+        .where(
+          and(
+            eq(runs.status, "starting"),
+            sql`${runs.createdAt} < ${cutoff}`,
+            sql`not exists (select 1 from ${events} where ${events.runId} = ${runs.id})`,
+          ),
+        )
+        .all()
+        .map((r) => r.id);
+      for (const id of late) failRun(tx, id, "launch_timeout");
+      return late;
+    },
+    { behavior: "immediate" },
+  );
+}
+
 // past the runner's own wait timeout, so a live runner gives up first
 const WAIT_GRACE_MS = 5 * 60_000;
 

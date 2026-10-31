@@ -137,12 +137,47 @@ test("a refused refresh is one warning per failure, and the hold keeps trying", 
     runId: "run_1",
     socketPath,
     refreshMs: 20,
+    firstRetryMs: 5,
+    firstAttempts: 2,
     warn: (m) => warnings.push(m),
   });
+  await expect(hold.ready).resolves.toBe(false);
   await sleep(70);
   await hold.release();
   const puts = calls.filter((c) => c.method === "PUT").length;
-  expect(puts).toBeGreaterThanOrEqual(2);
-  expect(warnings.length).toBe(calls.length);
+  expect(puts).toBeGreaterThanOrEqual(3);
+  // one line per failed call, and one saying the quick first retries ran out
+  expect(warnings.filter((w) => /failed: HTTP 500/.test(w))).toHaveLength(
+    calls.length,
+  );
+  expect(warnings.filter((w) => /not held/.test(w))).toHaveLength(1);
   expect(warnings[0]).toMatch(/HTTP 500/);
+});
+
+test("a socket that refuses at first is retried quickly, and ready says once the hold lands", async () => {
+  let refusals = 2;
+  const calls: string[] = [];
+  api = createServer((req, res) => {
+    req.resume();
+    req.on("end", () => {
+      calls.push(req.method ?? "");
+      res.writeHead(refusals-- > 0 ? 503 : 200).end();
+    });
+  });
+  const socketPath = join(dir, "api.sock");
+  api.listen(socketPath);
+  await once(api, "listening");
+  const warnings: string[] = [];
+  const hold = holdSprite({
+    runId: "run_1",
+    socketPath,
+    refreshMs: 60_000,
+    firstRetryMs: 5,
+    warn: (m) => warnings.push(m),
+  });
+  await expect(hold.ready).resolves.toBe(true);
+  // the third PUT held the sprite, long before the minute-long refresh would have tried again
+  expect(calls).toEqual(["PUT", "PUT", "PUT"]);
+  expect(warnings.some((w) => /not held/.test(w))).toBe(false);
+  await hold.release();
 });
