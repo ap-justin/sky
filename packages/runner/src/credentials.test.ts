@@ -37,7 +37,7 @@ test("writes the subscription token where a nested claude looks, private to the 
   expect(statSync(path).mode & 0o777).toBe(0o600);
 });
 
-test("honours CLAUDE_CONFIG_DIR", async () => {
+test("honors CLAUDE_CONFIG_DIR", async () => {
   const dir = join(home, "cfg");
   const path = await writeClaudeCredentials(
     { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token", CLAUDE_CONFIG_DIR: dir },
@@ -46,7 +46,7 @@ test("honours CLAUDE_CONFIG_DIR", async () => {
   expect(path).toBe(join(dir, ".credentials.json"));
 });
 
-test("refuses to write without a token, and the error never holds a value", async () => {
+test("refuses to write without a token", async () => {
   await expect(writeClaudeCredentials({}, home)).rejects.toThrow(
     "CLAUDE_CODE_OAUTH_TOKEN is not set",
   );
@@ -117,7 +117,7 @@ test("tightens an existing file that others could read to 0600", async () => {
   expect(statSync(path).mode & 0o777).toBe(0o600);
 });
 
-test("keeps the other entries in the file under CLAUDE_CONFIG_DIR", async () => {
+test("keeps the other entries under CLAUDE_CONFIG_DIR and leaves ~/.claude alone", async () => {
   const dir = join(home, "cfg");
   const path = seed(dir, JSON.stringify({ designOauth: design }));
   await writeClaudeCredentials(

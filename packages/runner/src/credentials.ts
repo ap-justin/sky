@@ -5,8 +5,8 @@ import { join } from "node:path";
 
 /**
  * The entries already in the credential file, or none when it is missing or not a JSON object.
- * Any other read error throws: the rename below would otherwise replace a file it could not read
- * and drop every entry in it.
+ * Any other read error throws: `writeClaudeCredentials` would otherwise rename over a file it could
+ * not read and drop every entry in it.
  */
 async function readExisting(path: string): Promise<Record<string, unknown>> {
   const text = await readFile(path, "utf8").catch((error: unknown) => {
@@ -36,9 +36,9 @@ async function readExisting(path: string): Promise<Record<string, unknown>> {
  * interactive `/design-login` on the sprite, are kept so a run does not sign them out.
  *
  * Every agent on a sprite shares this file, so it is never rewritten in place: a runner or a nested
- * `claude` reading it mid-write would find it empty, and a runner would then drop the other entries.
- * The new content goes to a 0600 temp file that is renamed over it, which also replaces a symlink
- * at that path with a regular file.
+ * `claude` reading it mid-write could find it empty or half-written, and a runner would then drop the
+ * other entries. The new content goes to a 0600 temp file that is renamed over it, which also
+ * replaces a symlink at that path with a regular file.
  */
 export async function writeClaudeCredentials(
   env: NodeJS.ProcessEnv,
