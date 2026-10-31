@@ -154,6 +154,125 @@ test("--json prints the API object", async () => {
   expect(JSON.parse(r.stdout)).toEqual({ name: "TOKEN", kind: "value" });
 });
 
+// the API returns name and kind; the extra fields stand in for a server that ever sends more
+const listSecrets = http.get(
+  `${apiUrl}/v1/environments/:id/secrets`,
+  ({ params }) =>
+    params.id === "env_1"
+      ? HttpResponse.json({
+          data: [
+            {
+              name: "GITHUB_CONNECTOR",
+              kind: "connector",
+              connector: "conn-github-123",
+            },
+            { name: "NPM_TOKEN", kind: "value", value },
+          ],
+        })
+      : HttpResponse.json(
+          { error: { code: "not_found", message: "no such environment" } },
+          { status: 404 },
+        ),
+);
+
+test("secret list prints names and kinds, never values", async () => {
+  server.use(list, listSecrets);
+  const r = await runCli(["secret", "list", "web"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("GITHUB_CONNECTOR connector\nNPM_TOKEN value\n");
+  expect(r.stdout + r.stderr).not.toContain(value);
+  expect(r.stdout + r.stderr).not.toContain("conn-github-123");
+});
+
+test("secret list --json carries only name and kind", async () => {
+  server.use(listSecrets);
+  const r = await runCli(["secret", "list", "env_1", "--json"]);
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.stdout)).toEqual({
+    data: [
+      { name: "GITHUB_CONNECTOR", kind: "connector" },
+      { name: "NPM_TOKEN", kind: "value" },
+    ],
+  });
+  expect(r.stdout + r.stderr).not.toContain(value);
+});
+
+test("secret list with none leaves stdout empty", async () => {
+  server.use(
+    http.get(`${apiUrl}/v1/environments/:id/secrets`, () =>
+      HttpResponse.json({ data: [] }),
+    ),
+  );
+  const r = await runCli(["secret", "list", "env_1"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe("no secrets\n");
+});
+
+test("secret list of an unknown env exits 1", async () => {
+  server.use(list, listSecrets);
+  const byName = await runCli(["secret", "list", "nope"]);
+  expect(byName.code).toBe(1);
+  expect(byName.stderr).toBe("sky: no environment named nope\n");
+  const byId = await runCli(["secret", "list", "env_9"]);
+  expect(byId.code).toBe(1);
+  expect(byId.stderr).toBe("sky: no such environment (not_found)\n");
+});
+
+const secretDeletes: string[] = [];
+const deleteSecret = http.delete(
+  `${apiUrl}/v1/environments/:id/secrets/:name`,
+  ({ params }) => {
+    secretDeletes.push(`${params.id}/${params.name}`);
+    return params.name === "NPM_TOKEN"
+      ? new HttpResponse(null, { status: 204 })
+      : HttpResponse.json(
+          { error: { code: "not_found", message: "no such secret" } },
+          { status: 404 },
+        );
+  },
+);
+
+test("secret delete by env name deletes that secret", async () => {
+  secretDeletes.length = 0;
+  server.use(list, deleteSecret);
+  const r = await runCli(["secret", "delete", "web", "NPM_TOKEN"]);
+  expect(r.code).toBe(0);
+  expect(secretDeletes).toEqual(["env_1/NPM_TOKEN"]);
+  expect(r.stdout).toBe("deleted NPM_TOKEN\n");
+});
+
+test("secret delete --json prints an object naming the deleted secret", async () => {
+  server.use(deleteSecret);
+  const r = await runCli(["secret", "delete", "env_1", "NPM_TOKEN", "--json"]);
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.stdout)).toEqual({ name: "NPM_TOKEN", deleted: true });
+});
+
+test("secret delete of a missing secret exits 1", async () => {
+  server.use(deleteSecret);
+  const r = await runCli(["secret", "delete", "env_1", "NOPE"]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe("sky: no such secret (not_found)\n");
+});
+
+test("secret list and delete usage errors exit 2 without a request", async () => {
+  for (const argv of [
+    ["secret", "delete", "env_1"],
+    ["secret", "delete", "env_1", "NPM_TOKEN", value],
+    ["secret", "list"],
+    ["secret", "list", "env_1", "NPM_TOKEN"],
+    ["secret", "list", "env_1", "--connector=github"],
+  ]) {
+    const r = await runCli(argv);
+    expect(r.code, argv.join(" ")).toBe(2);
+    expect(r.stdout).toBe("");
+    expect(r.stderr).toMatch(/Run 'sky --help' for usage/);
+    expect(r.stderr).not.toContain(value);
+  }
+});
+
 test("a value on argv is a usage error", async () => {
   for (const argv of [
     ["secret", "set", "env_1", "TOKEN", value],

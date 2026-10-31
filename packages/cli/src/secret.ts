@@ -22,12 +22,47 @@ async function readValue(name: string, io: Io): Promise<string> {
 /** An id is used as given; anything else is looked up as a name. */
 export async function resolveEnvId(api: Api, ref: string, out: Output) {
   if (EnvironmentId.safeParse(ref).success) return ref;
-  const env = (await api.listEnvironments()).find((e) => e.name === ref);
+  const { envs } = await api.listEnvironments();
+  const env = envs.find((e) => e.name === ref);
   if (env === undefined) {
     out.fail("not_found", `no environment named ${ref}`);
     return undefined;
   }
   return env.id;
+}
+
+/** `--json` prints the parsed list, not the API's raw object, so a field beyond name and kind never passes through. */
+export async function secretList(
+  envRef: string,
+  api: Api,
+  out: Output,
+): Promise<number> {
+  const envId = await resolveEnvId(api, envRef, out);
+  if (envId === undefined) return 1;
+  const secrets = await api.listSecrets(envId);
+  if (secrets.length === 0 && !out.json) {
+    out.progress("no secrets");
+  } else {
+    out.result(
+      { data: secrets },
+      secrets.map((s) => `${s.name} ${s.kind}`).join("\n"),
+    );
+  }
+  return 0;
+}
+
+export async function secretDelete(
+  envRef: string,
+  name: string,
+  api: Api,
+  out: Output,
+): Promise<number> {
+  const envId = await resolveEnvId(api, envRef, out);
+  if (envId === undefined) return 1;
+  await api.deleteSecret(envId, name);
+  // the API answers 204, so --json gets an object of its own rather than nothing
+  out.result({ name, deleted: true }, `deleted ${name}`);
+  return 0;
 }
 
 export async function secretSet(
