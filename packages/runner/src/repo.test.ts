@@ -5,6 +5,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
   rmSync,
@@ -23,6 +24,12 @@ const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
 const REPO = `${GATEWAY}/${CONNECTOR}/repos/acme/private`;
 
+// a host with commit.gpgsign=true would sign every fixture commit and turn the file red
+const NO_SIGN = ["-c", "commit.gpgsign=false"];
+
+const initRepo = (dir: string) =>
+  execFileSync("git", [...NO_SIGN, "init", "-q", "-b", "trunk", dir]);
+
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
 
@@ -35,6 +42,7 @@ const commitAs = (cwd: string, message: string, date: string) => {
   execFileSync(
     "git",
     [
+      ...NO_SIGN,
       "-c",
       "user.name=Ada L",
       "-c",
@@ -60,7 +68,7 @@ beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "runner-repo-"));
   remote = join(root, "remote.git");
   const seed = join(root, "seed");
-  execFileSync("git", ["init", "-q", "-b", "trunk", seed]);
+  initRepo(seed);
   writeFileSync(join(seed, "README.md"), "private\n");
   commitAs(seed, "first", "2026-10-01T09:00:00+05:30");
   mkdirSync(join(seed, "src/deep"), { recursive: true });
@@ -284,7 +292,7 @@ test("a commit with no parent leaves no shallow file; one with parents is shallo
   expect(git(dir, "log", "--format=%H")).toBe(headSha);
 
   const solo = join(root, "solo");
-  execFileSync("git", ["init", "-q", "-b", "trunk", solo]);
+  initRepo(solo);
   writeFileSync(join(solo, "f"), "x\n");
   const only = commitAs(solo, "only", "2026-10-03T00:00:00+01:00");
   execFileSync("git", ["fetch", "-q", solo, "trunk:refs/heads/trunk", "-f"], {
@@ -395,6 +403,75 @@ test("a signed tip, as every web-UI merge is, checks out at GitHub's sha from th
   expect(git(dir, "status", "--porcelain")).toBe("");
 });
 
+/** The API's answer for a signed tip: its signature, and the text that was signed unless `payload` says otherwise. */
+const signedByApi = (payload: string | null) =>
+  server.use(
+    http.get(`${REPO}/git/commits/:sha`, ({ params }) =>
+      HttpResponse.json({
+        ...apiCommit(String(params.sha)),
+        verification: {
+          verified: true,
+          reason: "valid",
+          signature: SIGNATURE,
+          payload,
+        },
+      }),
+    ),
+  );
+
+test("a signed tip with no headers beyond the usual checks out at GitHub's sha", async () => {
+  fakeGitHub();
+  const tip = rawTip([], true);
+  signedByApi(tip.payload);
+  const dir = join(root, "repo");
+  expect(await pull(dir)).toEqual({ branch: "trunk", sha: tip.sha });
+  expect(git(dir, "rev-parse", "HEAD")).toBe(tip.sha);
+  expect(git(dir, "cat-file", "commit", tip.sha)).toContain(
+    "\ngpgsig -----BEGIN PGP SIGNATURE-----\n",
+  );
+});
+
+test("a signed tip whose API gave a signature but no signed text fails the pull, saying so, and creates nothing", async () => {
+  fakeGitHub();
+  const tip = rawTip([], true);
+  signedByApi(null);
+  const dir = join(root, "fresh/repo");
+  const failure = pull(dir);
+  await expect(failure).rejects.toThrow(
+    `commit ${tip.sha} is signed, but GitHub's API gave no signed text to rebuild it from`,
+  );
+  await expect(failure).rejects.toThrow("Move trunk to a commit");
+  expect(existsSync(join(root, "fresh"))).toBe(false);
+});
+
+test("rebuildCommit puts the signature at the end of signed text that has no blank line", () => {
+  const body = [
+    `tree ${bare("rev-parse", `${headSha}^{tree}`)}`,
+    "author Ada L <ada@example.com> 1790000000 +0530",
+    "committer GitHub <noreply@github.com> 1790000100 -0700",
+    "",
+  ].join("\n");
+  const text = [
+    body.replace(/\n$/, ""),
+    "gpgsig -----BEGIN PGP SIGNATURE-----",
+    " ",
+    " wsFcBAABCAAQBQJnAAAACRBK7hj4Ov3rIwAAdHIQAKw4Zm9vYmFy",
+    " =abcd",
+    " -----END PGP SIGNATURE-----",
+    "",
+  ].join("\n");
+  const sha = execFileSync(
+    "git",
+    ["hash-object", "-t", "commit", "--literally", "--stdin"],
+    { cwd: remote, input: text, encoding: "utf8" },
+  ).trim();
+  const commit = {
+    ...apiCommit(headSha),
+    verification: { signature: SIGNATURE, payload: body },
+  };
+  expect(rebuildCommit(sha, commit)).toBe(text);
+});
+
 test("rebuildCommit finds the zone the API dropped, and gives up on a sha it can't match", () => {
   const commit = apiCommit(headSha);
   expect(rebuildCommit(headSha, commit)).toBe(
@@ -482,6 +559,7 @@ test("repo-pull of a repo the connector can't see is a failed pull, exit 1, with
     "repo pull: failed: the connector in GITHUB_CONNECTOR can't see acme/private; check its connection id and the repos it grants",
   );
   expect(io.out).toBe("");
+  expect(existsSync(join(root, "y"))).toBe(false);
 });
 
 test("a relative dir is taken from the working directory, as a shell gives it", async () => {
@@ -501,7 +579,7 @@ test("a relative dir is taken from the working directory, as a shell gives it", 
 test("a re-run onto the checkout a killed run left behind, origin and all, finishes it", async () => {
   fakeGitHub();
   const dir = join(root, "repo");
-  execFileSync("git", ["init", "-q", "-b", "trunk", dir]);
+  initRepo(dir);
   git(dir, "remote", "add", "origin", "https://github.com/acme/private.git");
   writeFileSync(join(dir, ".git/shallow"), `${"e".repeat(40)}\n`);
   expect(await pull(dir)).toEqual({ branch: "trunk", sha: headSha });
@@ -510,6 +588,75 @@ test("a re-run onto the checkout a killed run left behind, origin and all, finis
     "+refs/heads/*:refs/remotes/origin/*",
   );
   expect(readFileSync(join(dir, ".git/shallow"), "utf8")).toBe(`${headSha}\n`);
+  expect(git(dir, "status", "--porcelain")).toBe("");
+});
+
+test("a re-run overwrites an origin a killed run left pointing elsewhere", async () => {
+  fakeGitHub();
+  const dir = join(root, "repo");
+  initRepo(dir);
+  git(dir, "remote", "add", "origin", "https://example.com/other.git");
+  await pull(dir);
+  expect(git(dir, "remote", "get-url", "origin")).toBe(
+    "https://github.com/acme/private.git",
+  );
+});
+
+test("a re-run finishes a run killed after its refs were set and before its working tree was written", async () => {
+  fakeGitHub();
+  const dir = join(root, "repo");
+  await pull(dir);
+  rmSync(join(dir, ".git/index"));
+  for (const entry of readdirSync(dir)) {
+    if (entry !== ".git") rmSync(join(dir, entry), { recursive: true });
+  }
+  expect(await pull(dir)).toEqual({ branch: "trunk", sha: headSha });
+  expect(git(dir, "status", "--porcelain")).toBe("");
+  expect(readFileSync(join(dir, "README.md"), "utf8")).toBe("private\n");
+  expect(readlinkSync(join(dir, "link"))).toBe("README.md");
+});
+
+test("a re-run finishes a run killed while building its index, and leaves no index file behind", async () => {
+  fakeGitHub();
+  const dir = join(root, "repo");
+  await pull(dir);
+  const stale = join(dir, ".git/sky-pull-index");
+  execFileSync(
+    "git",
+    [
+      "update-index",
+      "--add",
+      "--cacheinfo",
+      `100644,${bare("rev-parse", `${headSha}:README.md`)},README.md`,
+    ],
+    { cwd: dir, env: { ...process.env, GIT_INDEX_FILE: stale } },
+  );
+  expect(existsSync(stale)).toBe(true);
+  expect(await pull(dir)).toEqual({ branch: "trunk", sha: headSha });
+  expect(existsSync(stale)).toBe(false);
+  expect(git(dir, "status", "--porcelain")).toBe("");
+});
+
+test("a pull that fails onto an existing checkout keeps it, and a later run finishes it", async () => {
+  fakeGitHub();
+  const dir = join(root, "repo");
+  await pull(dir);
+  const tip = advanceTrunk((work) =>
+    writeFileSync(join(work, "new.txt"), "n\n"),
+  );
+  server.use(
+    http.get(`${REPO}/git/blobs/:sha`, () =>
+      HttpResponse.json({ message: "Server Error" }, { status: 500 }),
+    ),
+  );
+  await expect(pull(dir)).rejects.toThrow("returned 500");
+  expect(git(dir, "rev-parse", "HEAD")).toBe(headSha);
+  expect(git(dir, "status", "--porcelain")).toBe("");
+
+  fakeGitHub();
+  expect(await pull(dir)).toEqual({ branch: "trunk", sha: tip });
+  expect(git(dir, "rev-parse", "HEAD")).toBe(tip);
+  expect(readFileSync(join(dir, "new.txt"), "utf8")).toBe("n\n");
   expect(git(dir, "status", "--porcelain")).toBe("");
 });
 
@@ -543,9 +690,11 @@ test("an empty repo fails the pull saying it's empty, not with the gateway's 409
       ),
     ),
   );
-  await expect(pull(join(root, "repo"))).rejects.toThrow(
+  const dir = join(root, "repo");
+  await expect(pull(dir)).rejects.toThrow(
     "acme/private is empty: its default branch has no commit to check out; push one first",
   );
+  expect(existsSync(dir)).toBe(false);
 });
 
 /** Pushes a new commit on trunk after `edit` changes a clone of it; returns the new tip. */
@@ -619,7 +768,7 @@ test("a submodule's gitlink entry is kept in the tree as a gitlink, with no fetc
   const tip = advanceTrunk((work) => {
     const sub = join(work, "vendor/sub");
     mkdirSync(sub, { recursive: true });
-    execFileSync("git", ["init", "-q", sub]);
+    execFileSync("git", [...NO_SIGN, "init", "-q", sub]);
     writeFileSync(join(sub, "f"), "x\n");
     linked = commitAs(sub, "sub", "2026-10-04T00:00:00+00:00");
   });

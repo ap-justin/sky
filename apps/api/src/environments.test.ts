@@ -163,6 +163,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     setupCall(sprite, "pnpm install"),
     pluginsCall(sprite),
+    `exec ${sprite} - ${ENV_FILES_RM}`,
     `checkpoint ${sprite}`,
   ]);
 });
@@ -909,12 +910,15 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     setupCall(sprite, "pnpm install --frozen-lockfile"),
     pluginsCall(sprite),
+    `exec ${sprite} - ${ENV_FILES_RM}`,
     `checkpoint ${sprite}`,
   ]);
 });
 
 const STORE_ENV_FILE = "/tmp/sky-kru-store.env";
 const REPO_ENV_FILE = "/tmp/sky-repo.env";
+/** The removal of both env files that every provision runs before its checkpoint. */
+const ENV_FILES_RM = `rm -f ${REPO_ENV_FILE} ${STORE_ENV_FILE}`;
 /** The variables provisioning's store pull sources. */
 const storeEnv = () => envFileOf(wire, { env: { ENV_FILE: STORE_ENV_FILE } });
 
@@ -993,6 +997,7 @@ test("with a connector, provisioning checks the Kru store out through the runner
       ),
     ),
     `exec ${sprite} - rm -f ${STORE_ENV_FILE}`,
+    `exec ${sprite} - ${ENV_FILES_RM}`,
     `checkpoint ${sprite}`,
   ]);
   // like a run's, the pull's env rides in a file only the sprite user reads, never in the exec URL
@@ -1085,7 +1090,7 @@ test("a repo env file that won't remove after a failed pull keeps the pull's fai
           return { exitCode: 1, stderr: "repo pull: failed: 404 Not Found" };
         }
         if (argv[0] === "rm" && argv[2] === REPO_ENV_FILE) {
-          return { exitCode: 1, stderr: "rm: Read-only file system" };
+          return { exitCode: 1, stderr: "rm: VPpb7x Read-only file system" };
         }
         return { exitCode: 0 };
       };
@@ -1148,7 +1153,7 @@ const failedPullEchoing = (gateway: string) =>
     },
   );
 
-test("a failed repo pull whose output carries the gateway URL stores it nowhere, and the log of a file left behind scrubs the gateway URL and connector id", async () => {
+test("a failed repo pull whose output carries the gateway URL and connector id stores neither, and the log of a file left behind scrubs the gateway URL and connector id", async () => {
   const gateway = "https://gw.example/github";
   const { env, logged } = await failedPullEchoing(gateway);
   expect(env).toMatchObject({
@@ -1158,13 +1163,9 @@ test("a failed repo pull whose output carries the gateway URL stores it nowhere,
   const logs = logged.join("\n");
   expect(logs).toContain("kept");
   expect(JSON.stringify(env)).not.toContain(gateway);
+  expect(JSON.stringify(env)).not.toContain("VPpb7x");
   expect(logs).not.toContain(gateway);
   expect(logs).not.toContain("VPpb7x");
-});
-
-test("a failed repo pull whose output carries the connector id stores it nowhere", async () => {
-  const { env } = await failedPullEchoing("https://gw.example/github");
-  expect(JSON.stringify(env)).not.toContain("VPpb7x");
 });
 
 test("provisioning's store steps see the env's own gateway and KRU_HOME, as a run does, and a KRU_STORE_REPO secret overrides nothing", async () => {
@@ -1210,7 +1211,8 @@ test("an env that stores KRU_NO_STORE_SYNC, which turns a run's sync off, gets n
   });
   expect(env).toMatchObject({ status: "ready", failure: null });
   const sprite = spriteNameFor(id);
-  expect(wire.calls.at(-2)).toEqual(pluginsCall(sprite));
+  expect(wire.calls.at(-3)).toEqual(pluginsCall(sprite));
+  expect(wire.calls.at(-2)).toBe(`exec ${sprite} - ${ENV_FILES_RM}`);
   expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
 });
 
@@ -1220,7 +1222,8 @@ test("a GITHUB_CONNECTOR stored as a value, not a connector, triggers no store p
   });
   expect(env).toMatchObject({ status: "ready", failure: null });
   const sprite = spriteNameFor(id);
-  expect(wire.calls.at(-2)).toEqual(pluginsCall(sprite));
+  expect(wire.calls.at(-3)).toEqual(pluginsCall(sprite));
+  expect(wire.calls.at(-2)).toBe(`exec ${sprite} - ${ENV_FILES_RM}`);
   expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
 });
 
@@ -1287,8 +1290,70 @@ test("a Kru store setup.sh that fails is logged and still leaves provisioning re
   expect(logged.join("\n")).toContain("checking out the Kru store");
   expect(logged.join("\n")).toContain("npm exploded");
   const sprite = spriteNameFor(id);
-  expect(wire.calls.at(-2)).toBe(`exec ${sprite} - rm -f ${STORE_ENV_FILE}`);
+  expect(wire.calls.at(-3)).toBe(`exec ${sprite} - rm -f ${STORE_ENV_FILE}`);
+  expect(wire.calls.at(-2)).toBe(`exec ${sprite} - ${ENV_FILES_RM}`);
   expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
+});
+
+test("both env files are removed right before the checkpoint, so it never keeps one left behind", async () => {
+  const { id, env } = await reprovisionWith(githubConnector);
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  const sprite = spriteNameFor(id);
+  expect(wire.calls.slice(-2)).toEqual([
+    `exec ${sprite} - ${ENV_FILES_RM}`,
+    `checkpoint ${sprite}`,
+  ]);
+});
+
+test("env files that won't remove before the checkpoint end failed at the checkpoint step naming them, with nothing checkpointed and no secret stored", async () => {
+  // a secret only the Kru store's env file carries
+  const token = "store-only-t0ken";
+  const { env } = await reprovisionWith(
+    { ...githubConnector, TOKEN: { value: token } },
+    "// runner",
+    () => {
+      wire.exec = (argv) =>
+        argv.join(" ") === ENV_FILES_RM
+          ? { exitCode: 1, stderr: `rm: Read-only file system ${token}` }
+          : { exitCode: 0 };
+    },
+  );
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "checkpoint",
+      stderr: expect.stringContaining(
+        `could not remove ${REPO_ENV_FILE} ${STORE_ENV_FILE}: rm: Read-only file system`,
+      ),
+    },
+  });
+  expect(JSON.stringify(env)).not.toContain(token);
+  expect(wire.calls.some((c) => c.startsWith("checkpoint"))).toBe(false);
+});
+
+test("a removal before the checkpoint that errors ends failed at the checkpoint step naming the env files, with nothing checkpointed", async () => {
+  const { env } = await reprovisionWith(githubConnector, "// runner", () => {
+    server.use(
+      http.post(
+        "https://api.sprites.dev/v1/sprites/:name/exec",
+        ({ request }) => {
+          const argv = new URL(request.url).searchParams.getAll("cmd");
+          if (argv.join(" ") !== ENV_FILES_RM) return;
+          return HttpResponse.json({ error: "upstream down" }, { status: 500 });
+        },
+      ),
+    );
+  });
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "checkpoint",
+      stderr: expect.stringContaining(
+        `could not remove ${REPO_ENV_FILE} ${STORE_ENV_FILE}:`,
+      ),
+    },
+  });
+  expect(wire.calls.some((c) => c.startsWith("checkpoint"))).toBe(false);
 });
 
 test("PATCH that changes repo re-clones from the new remote", async () => {
@@ -1540,6 +1605,7 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     setupCall(sprite, "pnpm install"),
     pluginsCall(sprite),
+    `exec ${sprite} - ${ENV_FILES_RM}`,
     `checkpoint ${sprite}`,
   ]);
 });

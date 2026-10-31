@@ -206,6 +206,20 @@ export function createProvisioner({
         throw new StepFailed(out.tail || `exited with code ${out.exitCode}`);
       }
     };
+    // the checkpoint must not keep the env's secrets, so a file that stays fails the step
+    const removeEnvFiles = async (paths: string[], op: string) => {
+      const failed = (detail: string) =>
+        new StepFailed(`could not remove ${paths.join(" ")}: ${detail}`);
+      const out = await execInSprite(sprites, name, ["rm", "-f", ...paths], {
+        op,
+        known: stepSecrets,
+      }).catch((err: unknown) => {
+        throw failed(err instanceof Error ? err.message : String(err));
+      });
+      if (out.exitCode !== 0) {
+        throw failed(out.stderr || `exited with code ${out.exitCode}`);
+      }
+    };
     /**
      * The sprite reaches GitHub only through its connector, which carries REST and no git
      * transport, so the Kru store (private) is checked out by the runner's `store-sync pull`, then
@@ -282,20 +296,8 @@ export function createProvisioner({
       ]);
       const known = [...pulled.values()];
       stepSecrets.push(...known);
-      // the checkpoint must not keep the env's secrets, so a file that stays fails the step
-      const removeEnvFile = async () => {
-        const out = await execInSprite(
-          sprites,
-          name,
-          ["rm", "-f", REPO_ENV_FILE],
-          { op: "rm-repo-env", known },
-        );
-        if (out.exitCode !== 0) {
-          throw new StepFailed(
-            `could not remove ${REPO_ENV_FILE}: ${out.stderr || `exited with code ${out.exitCode}`}`,
-          );
-        }
-      };
+      const removeEnvFile = () =>
+        removeEnvFiles([REPO_ENV_FILE], "rm-repo-env");
       await ensureBundle(name, `provision-${env.id}`);
       try {
         // in the try: a write that errors client-side may still have landed
@@ -359,6 +361,8 @@ export function createProvisioner({
       );
       await checkoutKruStore(env.id, name);
       begin("checkpoint");
+      // a write that landed after its timeout, or a removal that only got logged, can leave either
+      await removeEnvFiles([REPO_ENV_FILE, STORE_ENV_FILE], "rm-env-files");
       const checkpointId = await checkpointSprite(sprites, name, "sky setup");
       db.update(environments)
         .set({ status: "ready", checkpointId, failureStep: null })
