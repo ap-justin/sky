@@ -1,4 +1,11 @@
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, expect, test } from "vitest";
@@ -40,4 +47,44 @@ test("refuses to write without a token, and the error never holds a value", asyn
   await expect(writeClaudeCredentials({}, home)).rejects.toThrow(
     "CLAUDE_CODE_OAUTH_TOKEN is not set",
   );
+});
+
+test("replaces only the subscription entry and keeps the others, private to the user", async () => {
+  const dir = join(home, ".claude");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, ".credentials.json");
+  const design = {
+    accessToken: "design-access",
+    refreshToken: "design-refresh",
+  };
+  writeFileSync(
+    path,
+    JSON.stringify({
+      claudeAiOauth: { accessToken: "stale" },
+      designOauth: design,
+    }),
+    { mode: 0o644 },
+  );
+  await writeClaudeCredentials(
+    { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
+    home,
+  );
+  const written = JSON.parse(readFileSync(path, "utf8"));
+  expect(written.designOauth).toEqual(design);
+  expect(written.claudeAiOauth.accessToken).toBe("oauth-secret-token");
+  expect(statSync(path).mode & 0o777).toBe(0o600);
+});
+
+test("starts over when the existing file is not a JSON object", async () => {
+  const dir = join(home, ".claude");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, ".credentials.json");
+  writeFileSync(path, "not json");
+  await writeClaudeCredentials(
+    { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
+    home,
+  );
+  expect(Object.keys(JSON.parse(readFileSync(path, "utf8")))).toEqual([
+    "claudeAiOauth",
+  ]);
 });
