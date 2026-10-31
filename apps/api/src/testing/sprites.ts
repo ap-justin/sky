@@ -93,10 +93,8 @@ export function stubSprites() {
     calls: [] as string[],
     /** The body of each sprite's last update, by name. */
     updates: new Map<string, { labels?: string[]; url_settings?: unknown }>(),
-    /** Each sprite's labels and url settings as the API holds them; an update replaces both, as the live PUT does. */
+    /** Each sprite's labels and url settings as the API holds them; an update keeps the fields its body omits. */
     stored: new Map<string, { labels: string[]; url_settings?: unknown }>(),
-    /** When set, a create's response omits `url_settings`, so only a GET reveals them. */
-    createOmitsUrlSettings: false,
     sessions: [] as Session[],
     /** WebSocket exec connections the client has not closed. */
     openSockets: 0,
@@ -137,6 +135,9 @@ export function stubSprites() {
     hangs: (_call: string): boolean => false,
     /** How long a hung call waits before answering 503 when the client never aborts it. */
     hangMs: 5_000,
+    /** Resolves once every call `hangs` caught has been answered, whether the client aborted it or not. */
+    hangsSettled: (): Promise<void> =>
+      Promise.all(inflightHangs).then(() => undefined),
     createStatus: 201,
     updateStatus: 200,
     writeStatus: 200,
@@ -144,13 +145,20 @@ export function stubSprites() {
     deleteStatus: 204,
   };
   let checkpoints = 0;
-  const hang = (request: Request) =>
-    new Promise<Response>((resolve) => {
+  const inflightHangs = new Set<Promise<Response>>();
+  const hang = (request: Request) => {
+    const answered = new Promise<Response>((resolve) => {
       const answer = () =>
         resolve(HttpResponse.json({ error: "hung" }, { status: 503 }));
       request.signal.addEventListener("abort", answer, { once: true });
       setTimeout(answer, wire.hangMs).unref();
     });
+    inflightHangs.add(answered);
+    return answered;
+  };
+  // a sprite the test seeded straight into `sprites` has the default settings
+  const storedOf = (name: string) =>
+    wire.stored.get(name) ?? { labels: [], url_settings: { auth: "sprite" } };
   const authorized = (request: Request) =>
     request.headers.get("authorization") === `Bearer ${spritesToken}`;
 
@@ -175,9 +183,7 @@ export function stubSprites() {
           id: `spr_${name}`,
           name,
           status: "cold",
-          ...(wire.createOmitsUrlSettings
-            ? {}
-            : { url_settings: { auth: "sprite" } }),
+          url_settings: { auth: "sprite" },
           labels: [],
         },
         { status: 201 },
@@ -336,11 +342,7 @@ export function stubSprites() {
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
-      // a sprite the test seeded straight into `sprites` has the default settings
-      const { labels, url_settings } = wire.stored.get(name) ?? {
-        labels: [],
-        url_settings: { auth: "sprite" },
-      };
+      const { labels, url_settings } = storedOf(name);
       return HttpResponse.json({
         id: `spr_${name}`,
         name,
@@ -368,15 +370,17 @@ export function stubSprites() {
         url_settings?: unknown;
       };
       wire.updates.set(name, body);
-      wire.stored.set(name, {
-        labels: body.labels ?? [],
-        url_settings: body.url_settings,
-      });
+      const before = storedOf(name);
+      const after = {
+        labels: body.labels ?? before.labels,
+        url_settings: body.url_settings ?? before.url_settings,
+      };
+      wire.stored.set(name, after);
       return HttpResponse.json({
         id: `spr_${name}`,
         name,
         status: "cold",
-        ...body,
+        ...after,
       });
     }),
     http.delete(`${SPRITES}/:name`, ({ request, params }) => {

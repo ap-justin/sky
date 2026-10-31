@@ -112,8 +112,8 @@ export function spriteExists(ops: SpriteOps, name: string): Promise<boolean> {
 }
 
 /**
- * The labels on an environment's base sprite. Agents run as worktrees on it, so no sprite is
- * created per agent and none carries `role:agent`.
+ * The labels on an environment's base sprite. Agents run as worktrees on it rather than on
+ * sprites of their own, so `role:base` is the only role a sky sprite carries.
  */
 export const baseSpriteLabels = (envId: string, repo: string) => [
   "sky",
@@ -125,25 +125,23 @@ export const baseSpriteLabels = (envId: string, repo: string) => [
 /**
  * Creates the sprite unless it exists, so a rerun after any interruption starts from one, then
  * sets `labels` on it, new or existing: the update writes the full list, so a changed repo or a
- * sprite whose earlier label call never landed is brought up to date on the next provision.
+ * sprite whose earlier label call never landed is brought up to date on the next provision. Only
+ * `labels` is sent; the update leaves the fields it omits, url settings included, as they stand.
  */
 export async function ensureSprite(
   ops: SpriteOps,
   name: string,
   labels: string[],
 ): Promise<void> {
-  const created = (await spriteExists(ops, name))
-    ? undefined
-    : await spriteCall(ops, name, { op: "create" }, () =>
-        ops.client.createSprite(name),
-      );
+  if (!(await spriteExists(ops, name))) {
+    await spriteCall(ops, name, { op: "create" }, () =>
+      ops.client.createSprite(name),
+    );
+  }
   // best-effort: a sprite without labels still works, so a failure is logged by `spriteCall` and not thrown
-  await spriteCall(ops, name, { op: "label" }, async () => {
-    // the update replaces the settings with what it is sent, so they are sent back as they stand
-    const urlSettings =
-      created?.urlSettings ?? (await ops.client.getSprite(name)).urlSettings;
-    await ops.client.updateSprite(name, { labels, urlSettings });
-  }).catch(() => {});
+  await spriteCall(ops, name, { op: "label" }, () =>
+    ops.client.updateSprite(name, { labels }),
+  ).catch(() => {});
 }
 
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
