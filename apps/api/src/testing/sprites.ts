@@ -88,9 +88,15 @@ export function stubSprites() {
      * One line per call, in order: `create <name>`, `exec <name> <dir> <argv…>` (`… &> <log>` for an
      * `execLogged` wrapper, its inner argv shown), `write <name> <path>`,
      * `session <name> <dir> <argv…>`, `checkpoint <name>`, `get <name>`, `read <name> <path>`,
-     * `delete <name>`.
+     * `delete <name>`, `label <name>` (the PUT that sets labels).
      */
     calls: [] as string[],
+    /** The body of each sprite's last update, by name. */
+    updates: new Map<string, { labels?: string[]; url_settings?: unknown }>(),
+    /** Each sprite's labels and url settings as the API holds them; an update replaces both, as the live PUT does. */
+    stored: new Map<string, { labels: string[]; url_settings?: unknown }>(),
+    /** When set, a create's response omits `url_settings`, so only a GET reveals them. */
+    createOmitsUrlSettings: false,
     sessions: [] as Session[],
     /** WebSocket exec connections the client has not closed. */
     openSockets: 0,
@@ -130,6 +136,7 @@ export function stubSprites() {
      */
     hangs: (_call: string): boolean => false,
     createStatus: 201,
+    updateStatus: 200,
     writeStatus: 200,
     checkpointLines: undefined as object[] | undefined,
     deleteStatus: 204,
@@ -160,8 +167,17 @@ export function stubSprites() {
         );
       }
       wire.sprites.add(name);
+      wire.stored.set(name, { labels: [], url_settings: { auth: "sprite" } });
       return HttpResponse.json(
-        { id: `spr_${name}`, name, status: "cold" },
+        {
+          id: `spr_${name}`,
+          name,
+          status: "cold",
+          ...(wire.createOmitsUrlSettings
+            ? {}
+            : { url_settings: { auth: "sprite" } }),
+          labels: [],
+        },
         { status: 201 },
       );
     }),
@@ -318,7 +334,48 @@ export function stubSprites() {
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
-      return HttpResponse.json({ id: `spr_${name}`, name, status: "warm" });
+      // a sprite the test seeded straight into `sprites` has the default settings
+      const { labels, url_settings } = wire.stored.get(name) ?? {
+        labels: [],
+        url_settings: { auth: "sprite" },
+      };
+      return HttpResponse.json({
+        id: `spr_${name}`,
+        name,
+        status: "warm",
+        labels,
+        url_settings,
+      });
+    }),
+    http.put(`${SPRITES}/:name`, async ({ request, params }) => {
+      if (!authorized(request)) return new HttpResponse(null, { status: 401 });
+      const name = String(params.name);
+      wire.calls.push(`label ${name}`);
+      if (wire.hangs(`label ${name}`)) return hang(request);
+      if (!wire.sprites.has(name)) {
+        return HttpResponse.json({ error: "not found" }, { status: 404 });
+      }
+      if (wire.updateStatus !== 200) {
+        return HttpResponse.json(
+          { error: "update failed" },
+          { status: wire.updateStatus },
+        );
+      }
+      const body = (await request.json()) as {
+        labels?: string[];
+        url_settings?: unknown;
+      };
+      wire.updates.set(name, body);
+      wire.stored.set(name, {
+        labels: body.labels ?? [],
+        url_settings: body.url_settings,
+      });
+      return HttpResponse.json({
+        id: `spr_${name}`,
+        name,
+        status: "cold",
+        ...body,
+      });
     }),
     http.delete(`${SPRITES}/:name`, ({ request, params }) => {
       if (!authorized(request)) return new HttpResponse(null, { status: 401 });

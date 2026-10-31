@@ -6,6 +6,7 @@ import { cloneUrl } from "./remote.js";
 import type { BundleInstaller } from "./runner-bundle.js";
 import { hasConnectorSecret, openEnvSecrets } from "./secrets.js";
 import {
+  baseSpriteLabels,
   checkpointSprite,
   ensureSprite,
   execInSprite,
@@ -335,7 +336,7 @@ export function createProvisioner({
     };
     try {
       begin("create");
-      await ensureSprite(sprites, name);
+      await ensureSprite(sprites, name, baseSpriteLabels(env.id, env.repo));
       // before the clone: the runner imports the SDK at load, and the connector's repo-pull runs it
       begin("setup");
       await execNoisy(

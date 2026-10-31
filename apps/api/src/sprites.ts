@@ -111,15 +111,39 @@ export function spriteExists(ops: SpriteOps, name: string): Promise<boolean> {
   );
 }
 
-/** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
+/**
+ * The labels on an environment's base sprite. Agents run as worktrees on it, so no sprite is
+ * created per agent and none carries `role:agent`.
+ */
+export const baseSpriteLabels = (envId: string, repo: string) => [
+  "sky",
+  `env:${envId}`,
+  `repo:${repo}`,
+  "role:base",
+];
+
+/**
+ * Creates the sprite unless it exists, so a rerun after any interruption starts from one, then
+ * sets `labels` on it, new or existing: the update writes the full list, so a changed repo or a
+ * sprite whose earlier label call never landed is brought up to date on the next provision.
+ */
 export async function ensureSprite(
   ops: SpriteOps,
   name: string,
+  labels: string[],
 ): Promise<void> {
-  if (await spriteExists(ops, name)) return;
-  await spriteCall(ops, name, { op: "create" }, () =>
-    ops.client.createSprite(name),
-  );
+  const created = (await spriteExists(ops, name))
+    ? undefined
+    : await spriteCall(ops, name, { op: "create" }, () =>
+        ops.client.createSprite(name),
+      );
+  // best-effort: a sprite without labels still works, so a failure is logged by `spriteCall` and not thrown
+  await spriteCall(ops, name, { op: "label" }, async () => {
+    // the update replaces the settings with what it is sent, so they are sent back as they stand
+    const urlSettings =
+      created?.urlSettings ?? (await ops.client.getSprite(name)).urlSettings;
+    await ops.client.updateSprite(name, { labels, urlSettings });
+  }).catch(() => {});
 }
 
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
