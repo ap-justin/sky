@@ -21,17 +21,25 @@ It prints `<id> <status> <repo> <name>` per environment, the name last because i
 
 ## Environments and secrets
 
-An agent runs in an environment that `sky apply` created. Before starting one, a bot can check that its environment is `ready`:
+An agent runs in an environment that `sky apply` created. Before starting one, a bot can check that its environment is `ready`. `sky env show` exits 0 whatever the status, so read the status itself:
 
 ```
-sky env show web       # the env's line; a failed one adds its step and stderr
-sky env retry web      # provision a failed env again
-sky env delete web     # destroy its sandbox, agents, runs and events
-sky secret list web    # "<NAME> value" or "<NAME> connector" per secret
+test "$(sky env show web --json | jq -r .status)" = ready
+```
+
+The status is `provisioning`, `ready` or `failed`.
+
+```
+sky env show web          # the env's line; a failed one adds its step and stderr
+sky env retry web         # provision a failed env again
+sky env delete web --yes  # destroy its sandbox, agents, runs and events
+sky secret list web       # "<NAME> value" or "<NAME> connector" per secret
 sky secret delete web NPM_TOKEN
 ```
 
-`<env>` is a name or an id everywhere. `sky secret list` never prints a value, in either mode: `--json` gives `{"data": [{"name": …, "kind": …}]}`. The deletes answer `deleted <id or NAME>`, or `{"id"|"name": …, "deleted": true}` under `--json`. An unknown environment or secret exits 1 with `not_found`; `env delete` while a run is active and `env retry` on an env that hasn't failed exit 1 too, with the API's reason.
+A bot must pass `--yes` to `env delete`: without a terminal to ask on, with `CI` set, or with `--json`, it otherwise makes no request and exits 2 (`refusing to delete web without --yes`). Nothing undoes the delete.
+
+`<env>` is a name or an id everywhere, and a name that looks like an id (`env_prod`) still works. `sky secret list` never prints a value, in either mode: `--json` gives `{"data": [{"name": …, "kind": …}]}`. The deletes answer `deleted <id or NAME>`, or `{"id"|"name": …, "deleted": true}` under `--json`. An unknown environment or secret exits 1 with `not_found`; `env delete` while a run is active or the env is provisioning, and `env retry` on an env that hasn't failed, exit 1 too, with the API's reason.
 
 ## 1. Start
 

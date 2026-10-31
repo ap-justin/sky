@@ -96,7 +96,8 @@ sky secret delete web NPM_TOKEN
 sky env list                    # id, status, repo and name per environment
 sky env show web                # one env; a failed one shows its step and stderr
 sky env retry web               # provision a failed env again
-sky env delete web              # destroy its sandbox, agents, runs and events
+sky env delete web              # destroy its sandbox, agents, runs and events; asks first
+sky env delete web --yes        # the same without asking; required off a terminal and with --json
 ```
 
 `<env>` is an environment's name or id.

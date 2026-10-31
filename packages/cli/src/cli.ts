@@ -20,6 +20,8 @@ export interface Io {
     readAll(): Promise<string>;
     /** Reads one line from the terminal without echoing it; the prompt goes to stderr. */
     promptHidden(prompt: string): Promise<string>;
+    /** Reads one echoed line from the terminal, "" at end of input; the prompt goes to stderr. */
+    prompt(prompt: string): Promise<string>;
   };
   sleep(ms: number): Promise<void>;
   now(): number;
@@ -45,9 +47,11 @@ const help = (io: Io) => `Usage:
   sky env show <env> [options]
       Print the same line for one environment (<env> is its id or name);
       a failed one adds the step it failed at and that step's stderr.
-  sky env delete <env> [options]
+  sky env delete <env> [--yes] [options]
       Destroy the environment's sandbox and delete it with all its agents,
       runs and events. Refused while a run is active or it is provisioning.
+      Asks to confirm on a terminal; anywhere else, or with --json, it
+      needs --yes.
   sky env retry <env> [options]
       Provision a failed environment again. Prints its line, now
       provisioning; sky env show reports when it's ready.
@@ -269,13 +273,14 @@ async function runCommand(
     io.stdout(help(io));
     return 0;
   }
-  // every agent option is a string; parseArgs types a spread option set as string | boolean
+  // parseArgs types a spread option set as string | boolean
   const text = (v: string | boolean | undefined) =>
     typeof v === "string" ? v : undefined;
   const action = spec.prepare(positionals, {
     prompt: text(values.prompt),
     timeout: text(values.timeout),
     reason: text(values.reason),
+    yes: values.yes === true,
   });
   return await withApi(values, io, (api, out) => action(api, io, out));
 }

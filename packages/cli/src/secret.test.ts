@@ -6,8 +6,11 @@ import { apiKey, apiUrl, runCli } from "./testing.js";
 const value = "s3cr3t-value-do-not-print";
 const puts: { path: string; body: unknown }[] = [];
 
+const secretDeletes: string[] = [];
+
 beforeEach(() => {
   puts.length = 0;
+  secretDeletes.length = 0;
 });
 
 const putSecret = (response: Record<string, unknown>) =>
@@ -24,28 +27,25 @@ const putSecret = (response: Record<string, unknown>) =>
       return HttpResponse.json(response);
     },
   );
+const envRow = {
+  id: "env_1",
+  name: "web",
+  repo: "acme/web",
+  setup: "",
+  status: "ready",
+  spriteName: "s",
+  checkpointId: null,
+  concurrency: 3,
+  approvalPolicy: [],
+  autoApprove: { defaults: true, commands: [] },
+  failure: null,
+};
 const list = http.get(`${apiUrl}/v1/environments`, () =>
-  HttpResponse.json({
-    data: [
-      {
-        id: "env_1",
-        name: "web",
-        repo: "acme/web",
-        setup: "",
-        status: "ready",
-        spriteName: "s",
-        checkpointId: null,
-        concurrency: 3,
-        approvalPolicy: [],
-        autoApprove: { defaults: true, commands: [] },
-        failure: null,
-      },
-    ],
-  }),
+  HttpResponse.json({ data: [envRow] }),
 );
 
 test("a piped value is sent and never printed", async () => {
-  server.use(putSecret({ name: "TOKEN", kind: "value" }));
+  server.use(list, putSecret({ name: "TOKEN", kind: "value" }));
   const r = await runCli(["secret", "set", "env_1", "TOKEN"], {
     stdin: { readAll: async () => `${value}\n` },
   });
@@ -71,11 +71,15 @@ test("an unknown env name exits 1", async () => {
     stdin: { readAll: async () => value },
   });
   expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
   expect(r.stderr).toMatch(/no environment named nope/);
 });
 
 test("--connector sets a connector secret without reading stdin", async () => {
-  server.use(putSecret({ name: "GH", kind: "connector", connector: "github" }));
+  server.use(
+    list,
+    putSecret({ name: "GH", kind: "connector", connector: "github" }),
+  );
   const r = await runCli(
     ["secret", "set", "env_1", "GH", "--connector=github"],
     {
@@ -92,7 +96,7 @@ test("--connector sets a connector secret without reading stdin", async () => {
 });
 
 test("on a terminal the value comes from a hidden prompt", async () => {
-  server.use(putSecret({ name: "TOKEN", kind: "value" }));
+  server.use(list, putSecret({ name: "TOKEN", kind: "value" }));
   const prompts: string[] = [];
   const r = await runCli(["secret", "set", "env_1", "TOKEN"], {
     stderrIsTTY: true,
@@ -130,6 +134,7 @@ test("an empty value exits 2 without a request", async () => {
 
 test("the API's rejection exits 1", async () => {
   server.use(
+    list,
     http.put(`${apiUrl}/v1/environments/:id/secrets/:name`, () =>
       HttpResponse.json(
         { error: { code: "invalid_name", message: "bad name" } },
@@ -146,7 +151,7 @@ test("the API's rejection exits 1", async () => {
 });
 
 test("--json prints the API object", async () => {
-  server.use(putSecret({ name: "TOKEN", kind: "value" }));
+  server.use(list, putSecret({ name: "TOKEN", kind: "value" }));
   const r = await runCli(["secret", "set", "--json", "env_1", "TOKEN"], {
     stdin: { readAll: async () => value },
   });
@@ -185,7 +190,7 @@ test("secret list prints names and kinds, never values", async () => {
 });
 
 test("secret list --json carries only name and kind", async () => {
-  server.use(listSecrets);
+  server.use(list, listSecrets);
   const r = await runCli(["secret", "list", "env_1", "--json"]);
   expect(r.code).toBe(0);
   expect(JSON.parse(r.stdout)).toEqual({
@@ -199,6 +204,7 @@ test("secret list --json carries only name and kind", async () => {
 
 test("secret list with none leaves stdout empty", async () => {
   server.use(
+    list,
     http.get(`${apiUrl}/v1/environments/:id/secrets`, () =>
       HttpResponse.json({ data: [] }),
     ),
@@ -206,7 +212,21 @@ test("secret list with none leaves stdout empty", async () => {
   const r = await runCli(["secret", "list", "env_1"]);
   expect(r.code).toBe(0);
   expect(r.stdout).toBe("");
-  expect(r.stderr).toBe("no secrets\n");
+  expect(r.stderr).toBe(
+    "no secrets on env_1; add one with sky secret set env_1 <NAME>\n",
+  );
+});
+
+test("secret list --json with none prints the empty list object", async () => {
+  server.use(
+    list,
+    http.get(`${apiUrl}/v1/environments/:id/secrets`, () =>
+      HttpResponse.json({ data: [] }),
+    ),
+  );
+  const r = await runCli(["secret", "list", "env_1", "--json"]);
+  expect(r.code).toBe(0);
+  expect(JSON.parse(r.stdout)).toEqual({ data: [] });
 });
 
 test("secret list of an unknown env exits 1", async () => {
@@ -216,10 +236,25 @@ test("secret list of an unknown env exits 1", async () => {
   expect(byName.stderr).toBe("sky: no environment named nope\n");
   const byId = await runCli(["secret", "list", "env_9"]);
   expect(byId.code).toBe(1);
-  expect(byId.stderr).toBe("sky: no such environment (not_found)\n");
+  expect(byId.stderr).toBe("sky: no environment env_9\n");
 });
 
-const secretDeletes: string[] = [];
+test("secret list of a name shaped like an id resolves it by name", async () => {
+  server.use(
+    http.get(`${apiUrl}/v1/environments`, () =>
+      HttpResponse.json({
+        data: [{ ...envRow, id: "env_7", name: "env_1" }],
+      }),
+    ),
+    http.get(`${apiUrl}/v1/environments/env_7/secrets`, () =>
+      HttpResponse.json({ data: [{ name: "NPM_TOKEN", kind: "value" }] }),
+    ),
+  );
+  const r = await runCli(["secret", "list", "env_1"]);
+  expect(r.code).toBe(0);
+  expect(r.stdout).toBe("NPM_TOKEN value\n");
+});
+
 const deleteSecret = http.delete(
   `${apiUrl}/v1/environments/:id/secrets/:name`,
   ({ params }) => {
@@ -234,7 +269,6 @@ const deleteSecret = http.delete(
 );
 
 test("secret delete by env name deletes that secret", async () => {
-  secretDeletes.length = 0;
   server.use(list, deleteSecret);
   const r = await runCli(["secret", "delete", "web", "NPM_TOKEN"]);
   expect(r.code).toBe(0);
@@ -243,18 +277,28 @@ test("secret delete by env name deletes that secret", async () => {
 });
 
 test("secret delete --json prints an object naming the deleted secret", async () => {
-  server.use(deleteSecret);
+  server.use(list, deleteSecret);
   const r = await runCli(["secret", "delete", "env_1", "NPM_TOKEN", "--json"]);
   expect(r.code).toBe(0);
   expect(JSON.parse(r.stdout)).toEqual({ name: "NPM_TOKEN", deleted: true });
 });
 
 test("secret delete of a missing secret exits 1", async () => {
-  server.use(deleteSecret);
+  server.use(list, deleteSecret);
   const r = await runCli(["secret", "delete", "env_1", "NOPE"]);
   expect(r.code).toBe(1);
   expect(r.stdout).toBe("");
   expect(r.stderr).toBe("sky: no such secret (not_found)\n");
+});
+
+// deleteSecret records every request, so an empty log proves none was sent
+test("secret delete in an unknown env exits 1 without a request", async () => {
+  server.use(list, deleteSecret);
+  const r = await runCli(["secret", "delete", "nope", "NPM_TOKEN"]);
+  expect(r.code).toBe(1);
+  expect(r.stdout).toBe("");
+  expect(r.stderr).toBe("sky: no environment named nope\n");
+  expect(secretDeletes).toEqual([]);
 });
 
 test("secret list and delete usage errors exit 2 without a request", async () => {
