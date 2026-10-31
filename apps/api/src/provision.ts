@@ -123,6 +123,9 @@ export const envFile = (vars: Iterable<readonly [string, string]>) =>
 // the store steps' env, as a run's, rides in a file: an exec's argv and env reach the sprite as URL
 // query params
 const STORE_ENV_FILE = "/tmp/sky-kru-store.env";
+// the repo pull's env, the connector and gateway only, rides in a file for the same reason
+const REPO_ENV_FILE = "/tmp/sky-repo.env";
+const PULL_REPO = `. "$1" && exec node ${RUNNER} repo-pull "$2" "$3"`;
 const PULL_STORE = `. "$1" && exec node ${RUNNER} store-sync pull`;
 // the store's root as Kru resolves it under the env a run has (its plugin is installed by now),
 // then the store's own setup script when it has one; the root falls back to Kru's default when the
@@ -255,6 +258,48 @@ export function createProvisioner({
         );
       }
     };
+    /**
+     * Puts the env's repo at `REPO_DIR`. With a connector secret the runner's `repo-pull` fetches it
+     * through the gateway, so a private repo works; the checkout holds GitHub's own commit, which
+     * the agents' worktrees branch from and their publishes build on. Without one, a plain clone
+     * of a public repo.
+     */
+    const cloneRepo = async (): Promise<void> => {
+      if (!hasConnectorSecret(db, env.id, "GITHUB_CONNECTOR")) {
+        await execNoisy(
+          ["git", "clone", cloneUrl(env.repo), REPO_DIR],
+          "clone",
+          "/tmp/sky-clone.log",
+        );
+        return;
+      }
+      // only these two are read, so an unrelated secret that won't decrypt can't fail the clone
+      const pulled = openEnvSecrets(db, secretEncryptionKey, env.id, [
+        "GITHUB_CONNECTOR",
+        "GITHUB_GATEWAY_URL",
+      ]);
+      const known = [...pulled.values()];
+      await ensureBundle(name, `provision-${env.id}`);
+      await writeSpriteFile(sprites, name, REPO_ENV_FILE, envFile(pulled), {
+        op: "write-repo-env",
+        mode: 0o600,
+        known,
+      });
+      try {
+        await execNoisy(
+          ["sh", "-c", PULL_REPO, "sh", REPO_ENV_FILE, env.repo, REPO_DIR],
+          "clone",
+          "/tmp/sky-clone.log",
+          { known },
+        );
+      } finally {
+        // the checkpoint must not keep the env's secrets
+        await execInSprite(sprites, name, ["rm", "-f", REPO_ENV_FILE], {
+          op: "rm-repo-env",
+          known,
+        });
+      }
+    };
     let step: (typeof environmentFailureSteps)[number] = "create";
     // the step in progress is stored as it starts, so a restart can name where it stopped
     const begin = (next: typeof step) => {
@@ -269,11 +314,7 @@ export function createProvisioner({
       await ensureSprite(sprites, name);
       begin("clone");
       await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR], "rm-repo");
-      await execNoisy(
-        ["git", "clone", cloneUrl(env.repo), REPO_DIR],
-        "clone",
-        "/tmp/sky-clone.log",
-      );
+      await cloneRepo();
       begin("setup");
       await execNoisy(
         ["sh", "-c", installRunnerSdk],

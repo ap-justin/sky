@@ -82,14 +82,21 @@ const sealedOf = (row: {
 
 /**
  * The env's secrets as the runner gets them: a value secret decrypted, a connector secret as its
- * Sprites connection id, which a call through the sprite's connector gateway names.
+ * Sprites connection id, which a call through the sprite's connector gateway names. `only` limits
+ * it to those names, so a step that needs two never decrypts the rest.
  */
 export function openEnvSecrets(
   db: Db,
   key: Buffer,
   envId: EnvironmentId,
+  only?: readonly string[],
 ): Map<string, string> {
-  const rows = db.select().from(secrets).where(eq(secrets.envId, envId)).all();
+  const rows = db
+    .select()
+    .from(secrets)
+    .where(eq(secrets.envId, envId))
+    .all()
+    .filter((row) => !only || only.includes(row.name));
   return new Map(
     rows.map((row) => [
       row.name,

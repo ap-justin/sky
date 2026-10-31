@@ -46,7 +46,7 @@ const ATTRIBUTES = [
   "management/*/TODOS.md merge=kru-lines",
 ];
 
-const messageOf = (error: unknown) =>
+export const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
 
 /** The store's remote moved between the pull and the push. */
@@ -86,7 +86,7 @@ const gitBytes =
       child.stdin.end(options.input);
     });
 
-const git =
+export const git =
   (home: string) =>
   async (args: string[], options: GitOptions = {}): Promise<string> =>
     (await gitBytes(home)(args, options)).toString().trim();
@@ -129,9 +129,14 @@ type StoreOptions = {
   progress?: Progress;
 };
 
-type Progress = (line: string) => void;
+export type Progress = (line: string) => void;
 
-type TreeItem = { path: string; mode: string; type: string; sha: string };
+export type TreeItem = {
+  path: string;
+  mode: string;
+  type: string;
+  sha: string;
+};
 
 /** Makes `home` a git repo that knows the store's local-only files and merge driver; safe to repeat. */
 async function ensureRepo(home: string): Promise<void> {
@@ -189,7 +194,7 @@ async function anchor(g: ReturnType<typeof git>): Promise<void> {
 }
 
 /** The commit of `repo`'s default branch on GitHub, and the branch's name. */
-async function remoteHead(call: ReturnType<typeof gateway>) {
+export async function remoteHead(call: ReturnType<typeof gateway>) {
   const { default_branch: branch } = await call<{ default_branch: string }>(
     "GET",
     "",
@@ -275,17 +280,18 @@ async function missingObjects(
  * Downloads every blob of `items` the object store lacks, `BLOB_FETCH_CONCURRENCY` at a time, and checks
  * each one hashes to the sha GitHub listed it under.
  */
-async function fetchMissing(
+export async function fetchMissing(
   g: ReturnType<typeof git>,
   call: ReturnType<typeof gateway>,
   items: TreeItem[],
   progress: Progress,
+  label = "store sync",
 ): Promise<void> {
   const listed = [...new Set(items.map((item) => item.sha))];
   const missing = await missingObjects(g, listed);
   if (!missing.length) return;
   const total = missing.length;
-  progress(`store sync: fetching ${total} of ${listed.length} blobs`);
+  progress(`${label}: fetching ${total} of ${listed.length} blobs`);
   let fetched = 0;
   await eachLimited(missing, BLOB_FETCH_CONCURRENCY, async (sha) => {
     const blob = await call<{ content: string }>("GET", `/git/blobs/${sha}`);
@@ -293,7 +299,7 @@ async function fetchMissing(
     if (written !== sha) throw new Error(`blob ${sha} arrived as ${written}`);
     fetched++;
     if (fetched % PROGRESS_EVERY === 0 || fetched === total)
-      progress(`store sync: fetched ${fetched}/${total} blobs`);
+      progress(`${label}: fetched ${fetched}/${total} blobs`);
   });
 }
 

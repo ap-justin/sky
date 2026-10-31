@@ -901,6 +901,7 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
 });
 
 const STORE_ENV_FILE = "/tmp/sky-kru-store.env";
+const REPO_ENV_FILE = "/tmp/sky-repo.env";
 /** The variables provisioning's store pull sources. */
 const storeEnv = () => envFileOf(wire, { env: { ENV_FILE: STORE_ENV_FILE } });
 
@@ -952,13 +953,20 @@ test("with a connector, provisioning checks the Kru store out through the runner
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
-    `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
+    `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
+    `write ${sprite} /opt/sky/runner.mjs.provision-${id}`,
+    `exec ${sprite} - mv -f /opt/sky/runner.mjs.provision-${id} /opt/sky/runner.mjs`,
+    `write ${sprite} ${REPO_ENV_FILE}`,
+    expect.stringMatching(
+      new RegExp(
+        `^exec ${sprite} - sh -c .*node /opt/sky/runner\\.mjs repo-pull "\\$2" "\\$3" sh ${REPO_ENV_FILE} acme/kru /workspace/repo &> /tmp/sky-clone\\.log$`,
+      ),
+    ),
+    `exec ${sprite} - rm -f ${REPO_ENV_FILE}`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     setupCall(sprite, "pnpm install --frozen-lockfile"),
     pluginsCall(sprite),
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
-    `write ${sprite} /opt/sky/runner.mjs.provision-${id}`,
-    `exec ${sprite} - mv -f /opt/sky/runner.mjs.provision-${id} /opt/sky/runner.mjs`,
     `write ${sprite} ${STORE_ENV_FILE}`,
     expect.stringMatching(
       new RegExp(
@@ -980,6 +988,62 @@ test("with a connector, provisioning checks the Kru store out through the runner
     KRU_STORE_REPO: "ap-justin/kru-store",
   });
   expect(wire.execUrls.join("\n")).not.toContain("VPpb7x");
+  // the repo pull's env is only the connector, in a 0600 file, and no git clone is attempted
+  expect(wire.modes.get(REPO_ENV_FILE)).toBe("0600");
+  expect(wire.calls.some((c) => c.includes("git clone"))).toBe(false);
+});
+
+test("with a connector, the repo is pulled through the runner with only the connector and gateway env, and an unrelated secret that won't decrypt doesn't fail it", async () => {
+  const { env } = await reprovisionWith(
+    {
+      ...githubConnector,
+      GITHUB_GATEWAY_URL: { value: "https://gw.example/github" },
+      TOKEN: { value: "t0ken" },
+    },
+    "// runner",
+    () => {
+      db.$client
+        .prepare(
+          "UPDATE secrets SET ciphertext = zeroblob(16) WHERE name = 'TOKEN'",
+        )
+        .run();
+    },
+  );
+  expect(env).toMatchObject({ status: "ready", failure: null });
+  // the Kru store step still reads every secret, fails on that one and only logs it
+  expect(envFileOf(wire, { env: { ENV_FILE: REPO_ENV_FILE } })).toEqual({
+    GITHUB_CONNECTOR: "VPpb7x",
+    GITHUB_GATEWAY_URL: "https://gw.example/github",
+  });
+});
+
+test("a failed repo pull ends failed at the clone step with the runner's output, and the env file is removed", async () => {
+  const { id, env } = await reprovisionWith(
+    githubConnector,
+    "// runner",
+    () => {
+      wire.exec = (argv) =>
+        argv.join(" ").includes("repo-pull")
+          ? { exitCode: 1, stderr: "repo pull: failed: 404 Not Found" }
+          : { exitCode: 0 };
+    },
+  );
+  expect(env).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "clone",
+      stderr: expect.stringContaining("repo pull: failed: 404 Not Found"),
+    },
+  });
+  expect(wire.calls).toContain(
+    `exec ${spriteNameFor(id)} - rm -f ${REPO_ENV_FILE}`,
+  );
+});
+
+test("with a connector but no runner bundle to upload, the clone step fails naming the bundle", async () => {
+  const { env } = await reprovisionWith(githubConnector, null);
+  expect(env).toMatchObject({ status: "failed", failure: { step: "clone" } });
+  expect(wire.calls.some((c) => c.includes("git clone"))).toBe(false);
 });
 
 test("provisioning's store steps see the env's own gateway and KRU_HOME, as a run does, and a KRU_STORE_REPO secret overrides nothing", async () => {
@@ -1087,16 +1151,20 @@ test("env secrets that fail to decrypt for the store step are logged and never f
   expect(logged.join("\n")).toContain("checking out the Kru store");
 });
 
-test("with a connector but no runner bundle to upload, provisioning still ends ready", async () => {
-  const { env, logged } = await reprovisionWith(githubConnector, null);
+test("env secrets that fail to decrypt for the store step are logged and never fail provisioning", async () => {
+  const { env, logged } = await reprovisionWith(
+    { ...githubConnector, TOKEN: { value: "t0ken" } },
+    "// runner",
+    () => {
+      db.$client
+        .prepare(
+          "UPDATE secrets SET ciphertext = zeroblob(16) WHERE name = 'TOKEN'",
+        )
+        .run();
+    },
+  );
   expect(env).toMatchObject({ status: "ready", failure: null });
   expect(logged.join("\n")).toContain("checking out the Kru store");
-  // the pull is skipped, not attempted: no env file written, nothing exec'd with the runner
-  expect(
-    wire.calls.filter(
-      (c) => c.includes("store-sync") || c.includes(STORE_ENV_FILE),
-    ),
-  ).toEqual([]);
 });
 
 test("a Kru store setup.sh that fails is logged and still leaves provisioning ready, with the env file removed", async () => {

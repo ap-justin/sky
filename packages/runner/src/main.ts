@@ -4,6 +4,7 @@ import { writeClaudeCredentials } from "./credentials.js";
 import { createPoster } from "./events.js";
 import { holdSprite } from "./keepalive.js";
 import { publishMain } from "./publish.js";
+import { repoPullMain } from "./repo.js";
 import { createDecisionWaiter } from "./requests.js";
 import { runSession } from "./session.js";
 import { storeSyncMain, syncStoreQuietly } from "./store.js";
@@ -66,8 +67,8 @@ const io = {
   stdout: (s: string) => process.stdout.write(s),
   stderr: (s: string) => process.stderr.write(s),
 };
-// `runner.mjs publish …` is the agent's own command, run from its worktree; `store-sync` is the
-// API's, at provisioning; anything else is a run
+// `runner.mjs publish …` is the agent's own command, run from its worktree; `store-sync` and `repo-pull` are
+// the API's, at provisioning; anything else is a run
 const entry =
   process.argv[2] === "publish"
     ? publishMain(process.argv.slice(3), process.env, {
@@ -80,7 +81,11 @@ const entry =
       ? storeSyncMain(process.argv.slice(3), process.env, io).then((code) => {
           process.exitCode = code;
         })
-      : main();
+      : process.argv[2] === "repo-pull"
+        ? repoPullMain(process.argv.slice(3), process.env, io).then((code) => {
+            process.exitCode = code;
+          })
+        : main();
 
 entry.catch((error: unknown) => {
   warn(`runner: ${error instanceof Error ? error.message : String(error)}`);
