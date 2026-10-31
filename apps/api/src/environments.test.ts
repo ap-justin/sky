@@ -1916,8 +1916,6 @@ test("a rename another writer raced to is still 409 name_taken", async () => {
   });
 });
 
-// ---- base profiles
-
 const acme = BaseProfile.parse({
   marketplaces: ["acme/plugins"],
   plugins: ["review@plugins"],

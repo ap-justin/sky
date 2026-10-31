@@ -376,7 +376,7 @@ export function createProvisioner({
         if (!profile?.storeRepo) return;
         if (!hasConnectorSecret(db, envId, "GITHUB_CONNECTOR")) return;
         stored = openEnvSecrets(db, secretEncryptionKey, envId);
-        // the runner's own off switches (the first name predates its generic one), read from the same env on every run
+        // the runner's own off switches, `KRU_NO_STORE_SYNC` being the earlier name, read from the same env on every run
         if (
           stored.get("SKY_NO_STORE_SYNC") ||
           stored.get("KRU_NO_STORE_SYNC")

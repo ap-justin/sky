@@ -84,6 +84,22 @@ setup: |
 
 Provisioning fails at the setup step, naming the plugin and its marketplace, if a plugin's marketplace is neither declared nor added.
 
+```
+sky secret set web NPM_TOKEN < token.txt
+```
+
+Stores a secret on an environment; on a terminal it prompts without echo. `sky --help` lists the options, the config file location, and exit codes.
+
+```
+sky agent start web --prompt=@task.md
+sky wait <agent>      # until it needs an answer or approval, or ends
+sky inbox <agent>     # the pending question or approval
+sky approve <agent> <requestId>   # or deny --reason=…, or answer -- <text>
+sky status <agent>    # status, summary, error and compare link
+```
+
+[Driving agents](docs/driving-agents.md) walks a bot through an agent end to end: start, wait, answer or approve, follow up, read the result, archive.
+
 ### Base profiles
 
 A base profile is what every sprite gets before its own `setup`, defined once on the server so no client's tooling lives in Sky's code. The API reads them from `SKY_BASE_PROFILES`, a JSON object of profiles by name, empty by default; an environment picks one with `base: <name>`. A `base` the server doesn't have is rejected, and changing `base` rebuilds the sprite like changing `setup` (so it is refused with `agents_exist` while unarchived agents exist). With no `base`, an environment gets no plugins or MCP servers beyond its repo's, no store sync and no check instructions.
@@ -122,22 +138,6 @@ Provisioning applies the profile after the clone and before `setup`, so `setup` 
 ```
 
 Here `DOCS_API_KEY` on the left is the variable the server sees, and on the right the env secret that fills it; the `SEARCH_AUTH` secret holds `Bearer <token>`. [`docs/examples/base-profile.kru.json`](docs/examples/base-profile.kru.json) is a full profile with a store layout. Set it with `fly secrets set SKY_BASE_PROFILES="$(jq -c . profiles.json)"`. A bad value stops the API at boot, naming the field.
-
-```
-sky secret set web NPM_TOKEN < token.txt
-```
-
-Stores a secret on an environment; on a terminal it prompts without echo. `sky --help` lists the options, the config file location, and exit codes.
-
-```
-sky agent start web --prompt=@task.md
-sky wait <agent>      # until it needs an answer or approval, or ends
-sky inbox <agent>     # the pending question or approval
-sky approve <agent> <requestId>   # or deny --reason=…, or answer -- <text>
-sky status <agent>    # status, summary, error and compare link
-```
-
-[Driving agents](docs/driving-agents.md) walks a bot through an agent end to end: start, wait, answer or approve, follow up, read the result, archive.
 
 ### Approvals
 
