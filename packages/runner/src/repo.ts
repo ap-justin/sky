@@ -59,7 +59,7 @@ const objectId = (body: string) => {
  * git writes it, so headers the API has no field for (`mergetag`, `encoding`) come back verbatim.
  */
 function signedText(payload: string, signature: string): string {
-  const gpgsig = `gpgsig ${signature.replace(/\n$/, "").split("\n").join("\n ")}\n`;
+  const gpgsig = `gpgsig ${signature.split("\n").join("\n ")}\n`;
   const blank = payload.indexOf("\n\n");
   const at = blank === -1 ? payload.length : blank + 1;
   return `${payload.slice(0, at)}${gpgsig}${payload.slice(at)}`;
@@ -82,7 +82,7 @@ export function rebuildCommit(sha: string, commit: ApiCommit): string {
     const text = signedText(payload, signature);
     if (objectId(text) === sha) return text;
     throw new Error(
-      `commit ${sha} is signed, but its signed text from GitHub's API doesn't hash to it, as when its message isn't UTF-8`,
+      `commit ${sha} is signed, but the signed commit rebuilt from GitHub's API doesn't hash to GitHub's sha`,
     );
   }
   const head = [
