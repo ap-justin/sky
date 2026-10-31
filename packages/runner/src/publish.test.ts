@@ -123,9 +123,10 @@ function fakeGitHub(
       return HttpResponse.json({ full_name: "acme/widgets" });
     }),
     // the base is as the clone has it: nothing to refresh
-    http.get(`${REPO}/git/ref/heads/main`, () =>
-      HttpResponse.json({ object: { sha: baseSha } }),
-    ),
+    http.get(`${REPO}/git/ref/heads/main`, ({ request }) => {
+      seen(request);
+      return HttpResponse.json({ object: { sha: baseSha } });
+    }),
     http.get(`${REPO}/git/blobs/:sha`, ({ request, params }) => {
       seen(request);
       return options.blobs?.includes(String(params.sha))
@@ -600,6 +601,33 @@ test("a branch with no commits past its base, or with uncommitted changes, publi
   await expect(run()).rejects.toThrow(/no commits on claude\/agt_1 past main/);
   writeFileSync(join(work, "a.txt"), "draft\n");
   await expect(run()).rejects.toThrow(/uncommitted changes/);
+});
+
+test("a rebase left in progress by a killed run is named with its way out, not as a detached HEAD", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "README"), "mine\n");
+  const mine = commit("Edit README");
+  git(work, "checkout", "-q", "-b", "elsewhere", baseSha);
+  writeFileSync(join(work, "README"), "theirs\n");
+  const theirs = commit("Edit README too");
+  git(work, "checkout", "-q", "claude/agt_1");
+  // stops on the conflict with HEAD detached, as a run killed mid-rebase leaves it
+  expect(() =>
+    execFileSync("git", ["rebase", "--quiet", theirs], {
+      cwd: work,
+      stdio: "pipe",
+    }),
+  ).toThrow();
+
+  const failure = run();
+
+  await expect(failure).rejects.toThrow(
+    /a rebase of claude\/agt_1 is in progress here.*git rebase --abort/,
+  );
+  await expect(failure).rejects.not.toThrow(/detached/);
+  expect(gh.authorization).toEqual([]);
+  git(work, "rebase", "--abort");
+  expect(git(work, "rev-parse", "HEAD")).toBe(mine);
 });
 
 test("the publish command prints the PR URL, and without a connector exits 2 naming the secret to set", async () => {

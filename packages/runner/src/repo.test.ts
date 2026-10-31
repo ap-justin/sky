@@ -17,7 +17,7 @@ import { join } from "node:path";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
-import { DEFAULT_GATEWAY_URL, publish } from "./publish.js";
+import { DEFAULT_GATEWAY_URL, PublishError, publish } from "./publish.js";
 import { pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
 
 const GATEWAY = "https://gateway.test/v1/gateway/github";
@@ -427,6 +427,142 @@ test("a rebase that fails other than on a conflict says what git said, not that 
   expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
 });
 
+test("a rebase git can't commit for want of a name says so in git's words", async () => {
+  fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("other.txt", "someone else\n");
+  git(dir, "config", "user.email", "agent@example.com");
+  git(dir, "config", "user.name", "");
+  // the committer git falls back on would otherwise come from the host's env
+  for (const key of ["GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"]) {
+    vi.stubEnv(key, undefined);
+  }
+  try {
+    const failure = publishFrom(tree);
+
+    await expect(failure).rejects.toThrow(/empty ident name/);
+    await expect(failure).rejects.not.toThrow(/rebase cleanly|Command failed/);
+    expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+    expect(rebaseInProgress(tree)).toBe(false);
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("a rebase refused by the repo's rebase config says what git objected to", async () => {
+  fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("other.txt", "someone else\n");
+  git(dir, "config", "rebase.autoSquash", "maybe");
+
+  const failure = publishFrom(tree);
+
+  await expect(failure).rejects.toThrow(/rebase\.autosquash/i);
+  await expect(failure).rejects.not.toThrow(/rebase cleanly|Command failed/);
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+});
+
+test("a conflicting rebase names the files in conflict, not the command that ran", async () => {
+  fakeGitHub();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "README.md"), "agent's line\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("README.md", "someone else's line\n");
+
+  const failure = publishFrom(tree);
+
+  await expect(failure).rejects.toThrow(
+    /rebase it by hand and publish again \(conflict in README\.md\)$/,
+  );
+  await expect(failure).rejects.not.toThrow(/Command failed/);
+});
+
+test("a base whose tree GitHub truncates fails the publish naming the commit, as a plain error, and leaves the branch and worktree as they were", async () => {
+  fakeGitHub();
+  const { tree } = await agentWorktree();
+  const log = logRequests();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = advanceRemote("other.txt", "someone else\n");
+  server.use(
+    http.get(`${REPO}/git/trees/:sha`, () =>
+      HttpResponse.json({ truncated: true, tree: [] }),
+    ),
+  );
+
+  const failure = publishFrom(tree);
+
+  await expect(failure).rejects.toThrow(
+    `the tree of commit ${fresh} is too large to fetch`,
+  );
+  // not a PublishError: the CLI wrapper gets a bare Error here
+  await expect(failure).rejects.not.toBeInstanceOf(PublishError);
+  expect(log.filter((r) => r.startsWith("POST"))).toEqual([]);
+  expect(skyRefs(tree)).toBe("");
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+  expect(rebaseInProgress(tree)).toBe(false);
+});
+
+test("a base that advanced one commit arrives with its parent in the clone, so it is not listed as shallow", async () => {
+  fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = advanceRemote("other.txt", "someone else\n");
+
+  await publishFrom(tree);
+
+  expect(git(tree, "rev-parse", "HEAD~1")).toBe(fresh);
+  expect(git(tree, "rev-parse", `${fresh}^`)).toBe(headSha);
+  expect(shallowLines(dir)).toEqual([headSha]);
+});
+
+test("two agents fetching the same base tip leave one shallow line for it", async () => {
+  fakeGitHub();
+  githubWrites();
+  const dir = join(root, "repo");
+  await pull(dir);
+  advanceRemote("one.txt", "1\n");
+  const fresh = advanceRemote("two.txt", "2\n");
+  for (const branch of ["claude/agt_1", "claude/agt_2"]) {
+    const tree = join(root, branch.replace("/", "-"));
+    git(dir, "worktree", "add", "-b", branch, tree, "origin/HEAD");
+    writeFileSync(join(tree, `${branch.slice(-1)}.txt`), "work\n");
+    commitAs(tree, `work ${branch}`, "2026-10-31T10:00:00+00:00");
+    await publishFrom(tree);
+  }
+
+  expect(shallowLines(dir).filter((line) => line === fresh)).toHaveLength(1);
+});
+
+test("a re-publish with the base where the last publish rebased onto it fetches nothing and leaves HEAD alone", async () => {
+  fakeGitHub();
+  githubWrites();
+  const { tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const fresh = advanceRemote("other.txt", "someone else\n");
+  await publishFrom(tree);
+  const rebased = git(tree, "rev-parse", "HEAD");
+  const reflog = git(tree, "reflog", "HEAD", "--format=%gs");
+  const log = logRequests();
+
+  await publishFrom(tree);
+
+  expect(rebased).not.toBe(headSha);
+  expect(git(tree, "rev-parse", "HEAD~1")).toBe(fresh);
+  expect(log).toContain("GET /git/ref/heads/trunk");
+  expect(log.filter((r) => /\/git\/(commits|trees)\/\w{40}$/.test(r))).toEqual(
+    [],
+  );
+  expect(git(tree, "rev-parse", "HEAD")).toBe(rebased);
+  expect(git(tree, "reflog", "HEAD", "--format=%gs")).toBe(reflog);
+});
+
 const gitDirOf = (tree: string) => git(tree, "rev-parse", "--absolute-git-dir");
 
 const rebaseInProgress = (tree: string) =>
@@ -435,6 +571,9 @@ const rebaseInProgress = (tree: string) =>
   );
 
 const skyRefs = (tree: string) => git(tree, "for-each-ref", "refs/sky");
+
+const shallowLines = (dir: string) =>
+  readFileSync(join(dir, ".git/shallow"), "utf8").split("\n").filter(Boolean);
 
 /** The requests publish makes, as `METHOD path` under the repo, in order. */
 const logRequests = () => {

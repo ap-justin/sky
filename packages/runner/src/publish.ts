@@ -1,4 +1,7 @@
 import { execFile } from "node:child_process";
+import { existsSync } from "node:fs";
+import { readFile } from "node:fs/promises";
+import { join } from "node:path";
 import { parseArgs, promisify } from "node:util";
 import { fetchCommit } from "./repo.js";
 import { git as repoGit } from "./store.js";
@@ -245,6 +248,25 @@ const resolves = (cwd: string, ref: string) =>
   );
 
 /**
+ * The branch a rebase stopped in this worktree is rewriting, "" when git didn't record one, or
+ * undefined when no rebase is in progress. `rebase-merge` is the merge backend's state directory,
+ * `rebase-apply` the apply backend's, and `git am`'s too, marked by an `applying` file.
+ */
+async function rebaseInProgress(cwd: string): Promise<string | undefined> {
+  for (const dir of ["rebase-merge", "rebase-apply"]) {
+    const path = (
+      await git(cwd, "rev-parse", "--path-format=absolute", "--git-path", dir)
+    ).trim();
+    if (!existsSync(path) || existsSync(join(path, "applying"))) continue;
+    const head = await readFile(join(path, "head-name"), "utf8").catch(
+      () => "",
+    );
+    return head.trim().replace(/^refs\/heads\//, "");
+  }
+  return undefined;
+}
+
+/**
  * Rebases this branch's commits from `mergeBase` onto GitHub's current head of the base, which a
  * sandbox's clone, made once at provisioning, falls behind, so what is published sits on the base
  * as it is now, not as the clone saw it. The head commit is materialized from the REST API when it
@@ -292,13 +314,18 @@ async function refreshBase(
       mergeBase,
     );
   } catch (error) {
-    const conflicted = (
-      await git(cwd, "ls-files", "--unmerged").catch(() => "")
-    ).trim();
+    // one line per stage of each unmerged path: "<mode> <sha> <stage>\t<path>"
+    const conflicted = [
+      ...new Set(
+        lines(await git(cwd, "ls-files", "--unmerged").catch(() => "")).map(
+          (line) => line.slice(line.indexOf("\t") + 1),
+        ),
+      ),
+    ];
     await git(cwd, "rebase", "--abort").catch(() => {});
-    if (conflicted) {
+    if (conflicted.length) {
       throw new PublishError(
-        `${base} moved on GitHub to ${object.sha}, and this branch's commits don't rebase onto it cleanly; rebase it by hand and publish again (${messageOf(error).split("\n")[0]})`,
+        `${base} moved on GitHub to ${object.sha}, and this branch's commits don't rebase onto it cleanly; rebase it by hand and publish again (conflict in ${conflicted.join(", ")})`,
       );
     }
     const said =
@@ -338,6 +365,13 @@ export async function publish(options: {
   base?: string;
 }): Promise<PublishResult> {
   const { cwd } = options;
+  const rebasing = await rebaseInProgress(cwd);
+  if (rebasing !== undefined) {
+    // a rebase detaches HEAD until it finishes, so this is checked before the branch is read
+    throw new PublishError(
+      `a rebase${rebasing ? ` of ${rebasing}` : ""} is in progress here, left by an earlier run that stopped mid-way; run \`git rebase --abort\` to return the branch to where it was, then publish again`,
+    );
+  }
   const branch = (
     await git(cwd, "symbolic-ref", "--quiet", "--short", "HEAD").catch(() => "")
   ).trim();
