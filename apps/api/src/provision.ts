@@ -123,6 +123,9 @@ export const envFile = (vars: Iterable<readonly [string, string]>) =>
 // the store steps' env, as a run's, rides in a file: an exec's argv and env reach the sprite as URL
 // query params
 const STORE_ENV_FILE = "/tmp/sky-kru-store.env";
+// the repo pull's env, the connector and gateway only, rides in a file for the same reason
+const REPO_ENV_FILE = "/tmp/sky-repo.env";
+const PULL_REPO = `. "$1" && exec node ${RUNNER} repo-pull "$2" "$3"`;
 const PULL_STORE = `. "$1" && exec node ${RUNNER} store-sync pull`;
 // the store's root as Kru resolves it under the env a run has (its plugin is installed by now),
 // then the store's own setup script when it has one; the root falls back to Kru's default when the
@@ -176,6 +179,8 @@ export function createProvisioner({
 }: Deps) {
   async function run(env: Target): Promise<void> {
     const name = spriteNameFor(env.id);
+    // env secret values a step handed to the sprite, which its output may echo into the stored failure
+    const stepSecrets: string[] = [];
     const exec = async (argv: [string, ...string[]], op: string) => {
       const out = await execInSprite(sprites, name, argv, { op });
       if (out.exitCode !== 0) {
@@ -199,6 +204,20 @@ export function createProvisioner({
       });
       if (out.exitCode !== 0) {
         throw new StepFailed(out.tail || `exited with code ${out.exitCode}`);
+      }
+    };
+    // the checkpoint must not keep the env's secrets, so a file that stays fails the step
+    const removeEnvFiles = async (paths: string[], op: string) => {
+      const failed = (detail: string) =>
+        new StepFailed(`could not remove ${paths.join(" ")}: ${detail}`);
+      const out = await execInSprite(sprites, name, ["rm", "-f", ...paths], {
+        op,
+        known: stepSecrets,
+      }).catch((err: unknown) => {
+        throw failed(err instanceof Error ? err.message : String(err));
+      });
+      if (out.exitCode !== 0) {
+        throw failed(out.stderr || `exited with code ${out.exitCode}`);
       }
     };
     /**
@@ -255,6 +274,56 @@ export function createProvisioner({
         );
       }
     };
+    /**
+     * Puts the env's repo at `REPO_DIR`. With a connector secret the runner's `repo-pull` fetches it
+     * through the gateway, so a private repo works; the checkout holds GitHub's own commit, which
+     * the agents' worktrees branch from and their publishes build on. Without one, a plain clone
+     * of a public repo.
+     */
+    const cloneRepo = async (): Promise<void> => {
+      if (!hasConnectorSecret(db, env.id, "GITHUB_CONNECTOR")) {
+        await execNoisy(
+          ["git", "clone", cloneUrl(env.repo), REPO_DIR],
+          "clone",
+          "/tmp/sky-clone.log",
+        );
+        return;
+      }
+      // only these two are read, so an unrelated secret that won't decrypt can't fail the clone
+      const pulled = openEnvSecrets(db, secretEncryptionKey, env.id, [
+        "GITHUB_CONNECTOR",
+        "GITHUB_GATEWAY_URL",
+      ]);
+      const known = [...pulled.values()];
+      stepSecrets.push(...known);
+      const removeEnvFile = () =>
+        removeEnvFiles([REPO_ENV_FILE], "rm-repo-env");
+      await ensureBundle(name, `provision-${env.id}`);
+      try {
+        // in the try: a write that errors client-side may still have landed
+        await writeSpriteFile(sprites, name, REPO_ENV_FILE, envFile(pulled), {
+          op: "write-repo-env",
+          mode: 0o600,
+          known,
+        });
+        await execNoisy(
+          ["sh", "-c", PULL_REPO, "sh", REPO_ENV_FILE, env.repo, REPO_DIR],
+          "clone",
+          "/tmp/sky-clone.log",
+          { known },
+        );
+      } catch (err) {
+        // the pull's failure is the one recorded; a file left behind is only logged
+        await removeEnvFile().catch((rmErr: unknown) => {
+          const detail = rmErr instanceof Error ? rmErr.message : String(rmErr);
+          log(
+            `sprite ${name} kept ${REPO_ENV_FILE} after a failed clone: ${redact(detail, [...secrets.values(), ...known])}`,
+          );
+        });
+        throw err;
+      }
+      await removeEnvFile();
+    };
     let step: (typeof environmentFailureSteps)[number] = "create";
     // the step in progress is stored as it starts, so a restart can name where it stopped
     const begin = (next: typeof step) => {
@@ -267,19 +336,17 @@ export function createProvisioner({
     try {
       begin("create");
       await ensureSprite(sprites, name);
-      begin("clone");
-      await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR], "rm-repo");
-      await execNoisy(
-        ["git", "clone", cloneUrl(env.repo), REPO_DIR],
-        "clone",
-        "/tmp/sky-clone.log",
-      );
+      // before the clone: the runner imports the SDK at load, and the connector's repo-pull runs it
       begin("setup");
       await execNoisy(
         ["sh", "-c", installRunnerSdk],
         "install-sdk",
         "/tmp/sky-sdk.log",
       );
+      begin("clone");
+      await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR], "rm-repo");
+      await cloneRepo();
+      begin("setup");
       await execNoisy(
         ["sh", "-c", PREPARE_SETUP, "sh", "bash", "-c", env.setup],
         "setup",
@@ -294,6 +361,8 @@ export function createProvisioner({
       );
       await checkoutKruStore(env.id, name);
       begin("checkpoint");
+      // a write that landed after its timeout, or a removal that only got logged, can leave either
+      await removeEnvFiles([REPO_ENV_FILE, STORE_ENV_FILE], "rm-env-files");
       const checkpointId = await checkpointSprite(sprites, name, "sky setup");
       db.update(environments)
         .set({ status: "ready", checkpointId, failureStep: null })
@@ -305,7 +374,10 @@ export function createProvisioner({
         .set({
           status: "failed",
           failureStep: step,
-          failureStderr: redact(detail, secrets.values()).slice(-TAIL_CHARS),
+          failureStderr: redact(detail, [
+            ...secrets.values(),
+            ...stepSecrets,
+          ]).slice(-TAIL_CHARS),
         })
         .where(eq(environments.id, env.id))
         .run();

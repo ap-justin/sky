@@ -93,6 +93,8 @@ function fakeGitHub(
     blobs?: string[];
     /** Trees of commits GitHub holds that this clone doesn't, by commit sha. */
     commitTrees?: Record<string, string>;
+    /** Parents of those commits; a commit not listed sits directly on the base. */
+    commitParents?: Record<string, string[]>;
     /** Whether a PATCH to a pull is expected; otherwise GitHub refuses it and the test fails. */
     allowPullUpdates?: boolean;
   } = {},
@@ -122,6 +124,11 @@ function fakeGitHub(
       seen(request);
       return HttpResponse.json({ full_name: "acme/widgets" });
     }),
+    // the base is as the clone has it: nothing to refresh
+    http.get(`${REPO}/git/ref/heads/main`, ({ request }) => {
+      seen(request);
+      return HttpResponse.json({ object: { sha: baseSha } });
+    }),
     http.get(`${REPO}/git/blobs/:sha`, ({ request, params }) => {
       seen(request);
       return options.blobs?.includes(String(params.sha))
@@ -132,7 +139,13 @@ function fakeGitHub(
       seen(request);
       const tree = options.commitTrees?.[String(params.sha)];
       return tree
-        ? HttpResponse.json({ sha: params.sha, tree: { sha: tree } })
+        ? HttpResponse.json({
+            sha: params.sha,
+            tree: { sha: tree },
+            parents: (
+              options.commitParents?.[String(params.sha)] ?? [baseSha]
+            ).map((sha) => ({ sha })),
+          })
         : HttpResponse.json({ message: "Not Found" }, { status: 404 });
     }),
     http.post(`${REPO}/git/blobs`, async ({ request }) => {
@@ -598,6 +611,33 @@ test("a branch with no commits past its base, or with uncommitted changes, publi
   await expect(run()).rejects.toThrow(/uncommitted changes/);
 });
 
+test("a rebase left in progress by a killed run is named with its way out, not as a detached HEAD", async () => {
+  const gh = fakeGitHub();
+  writeFileSync(join(work, "README"), "mine\n");
+  const mine = commit("Edit README");
+  git(work, "checkout", "-q", "-b", "elsewhere", baseSha);
+  writeFileSync(join(work, "README"), "theirs\n");
+  const theirs = commit("Edit README too");
+  git(work, "checkout", "-q", "claude/agt_1");
+  // stops on the conflict with HEAD detached, as a run killed mid-rebase leaves it
+  expect(() =>
+    execFileSync("git", ["rebase", "--quiet", theirs], {
+      cwd: work,
+      stdio: "pipe",
+    }),
+  ).toThrow();
+
+  const failure = run();
+
+  await expect(failure).rejects.toThrow(
+    /a rebase of claude\/agt_1 is in progress here.*git rebase --abort/,
+  );
+  await expect(failure).rejects.not.toThrow(/detached/);
+  expect(gh.authorization).toEqual([]);
+  git(work, "rebase", "--abort");
+  expect(git(work, "rev-parse", "HEAD")).toBe(mine);
+});
+
 test("the publish command prints the PR URL, and without a connector exits 2 naming the secret to set", async () => {
   fakeGitHub();
   writeFileSync(join(work, "a.txt"), "first\n");
@@ -681,6 +721,24 @@ test("a re-publish whose earlier commits GitHub holds under other shas resumes f
   ]);
 });
 
+test("a head GitHub holds with this branch's tree but on a base that has since moved is replaced, not built upon, so no stale history stays under the new commits", async () => {
+  writeFileSync(join(work, "a.txt"), "first\n");
+  const first = commit("Add a");
+  const firstTree = git(work, "rev-parse", `${first}^{tree}`);
+  const gh = fakeGitHub({
+    ref: "gh_stale",
+    commitTrees: { gh_stale: firstTree, gh_old_base: firstTree },
+    commitParents: { gh_stale: ["gh_old_base"], gh_old_base: [] },
+  });
+
+  await run();
+
+  expect(gh.commits.map((c) => c.parents)).toEqual([[baseSha]]);
+  expect(gh.refWrites).toEqual([
+    { method: "PATCH", body: { sha: "commit1", force: true } },
+  ]);
+});
+
 test("a blob GitHub already holds is not uploaded again", async () => {
   writeFileSync(join(work, "a.txt"), "first\n");
   writeFileSync(join(work, "b.txt"), "second\n");
@@ -736,7 +794,7 @@ test("a ref GitHub refuses to fast-forward says the history was rewritten", asyn
   );
 
   await expect(run()).rejects.toThrow(
-    "claude/agt_1 on GitHub isn't an ancestor of this branch: published commits were amended or rebased here, or someone pushed there; it can't be fast-forwarded (GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 422: Update is not a fast forward)",
+    "claude/agt_1 on GitHub isn't an ancestor of this branch and holds a commit this branch never had, as when someone pushed there; it can't be fast-forwarded and isn't overwritten (GitHub gateway: PATCH /repos/acme/widgets/git/refs/heads/claude/agt_1 returned 422: Update is not a fast forward)",
   );
 });
 
