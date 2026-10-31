@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
-import { mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import {
   CONNECTOR_ENV,
@@ -184,27 +184,25 @@ export async function pullRepo(options: {
 }
 
 /**
- * Writes the fetched commit into `dir` as a checkout of it. Each step converges on a repo an
- * earlier, killed run left, so a re-run finishes it.
+ * Writes the commit, its tree and every blob into the repo `g` runs in as git objects, so
+ * `remote.sha` resolves there; the checkout and refs are the caller's.
  */
-async function writeCheckout(
-  dir: string,
-  repo: string,
-  remote: { branch: string; sha: string },
+async function writeObjects(
+  g: ReturnType<typeof git>,
+  gitDir: string,
+  sha: string,
   commit: ApiCommit,
   tree: TreeItem[],
   raw: string,
   source: { call: ReturnType<typeof gateway>; progress: Progress },
 ): Promise<void> {
-  const g = git(dir);
-  await g(["init", "-q", "-b", remote.branch]);
   const blobs = tree.filter((item) => item.type === "blob");
   await fetchMissing(g, source.call, blobs, source.progress, "repo pull");
   // a submodule is a gitlink: a commit sha in the tree with nothing behind it here
   const entries = tree.filter(
     (item) => item.type === "blob" || item.type === "commit",
   );
-  const index = join(dir, ".git", "sky-pull-index");
+  const index = join(gitDir, "sky-pull-index");
   const env = { GIT_INDEX_FILE: index };
   try {
     await g(["update-index", "-z", "--add", "--index-info"], {
@@ -223,9 +221,77 @@ async function writeCheckout(
   const written = await g(["hash-object", "-t", "commit", "-w", "--stdin"], {
     input: raw,
   });
-  if (written !== remote.sha) {
-    throw new Error(`commit ${remote.sha} arrived as ${written}`);
+  if (written !== sha) throw new Error(`commit ${sha} arrived as ${written}`);
+}
+
+/**
+ * Makes GitHub's commit `sha` resolvable in the repo `g` runs in, with its tree and blobs, and
+ * treats it as shallow when its parents aren't here: its ancestors stay on GitHub.
+ */
+export async function fetchCommit(
+  g: ReturnType<typeof git>,
+  call: ReturnType<typeof gateway>,
+  sha: string,
+  progress: Progress = () => {},
+): Promise<void> {
+  const commit = await call<ApiCommit>("GET", `/git/commits/${sha}`);
+  const listing = await call<{ tree: TreeItem[]; truncated: boolean }>(
+    "GET",
+    `/git/trees/${commit.tree.sha}?recursive=1`,
+  );
+  if (listing.truncated) {
+    throw new Error(`the tree of commit ${sha} is too large to fetch`);
   }
+  const raw = rebuildCommit(sha, commit);
+  const gitDir = await g(["rev-parse", "--absolute-git-dir"]);
+  await writeObjects(g, gitDir, sha, commit, listing.tree, raw, {
+    call,
+    progress,
+  });
+  const here = async (parent: string) =>
+    g(["cat-file", "-e", `${parent}^{commit}`]).then(
+      () => true,
+      () => false,
+    );
+  const parents = await Promise.all(commit.parents.map((p) => here(p.sha)));
+  if (parents.includes(false)) {
+    const shallow = await g([
+      "rev-parse",
+      "--path-format=absolute",
+      "--git-path",
+      "shallow",
+    ]);
+    const held = existsSync(shallow) ? await readFile(shallow, "utf8") : "";
+    if (!held.split("\n").includes(sha)) {
+      await writeFile(shallow, `${held}${sha}\n`);
+    }
+  }
+}
+
+/**
+ * Writes the fetched commit into `dir` as a checkout of it. Each step converges on a repo an
+ * earlier, killed run left, so a re-run finishes it.
+ */
+async function writeCheckout(
+  dir: string,
+  repo: string,
+  remote: { branch: string; sha: string },
+  commit: ApiCommit,
+  tree: TreeItem[],
+  raw: string,
+  source: { call: ReturnType<typeof gateway>; progress: Progress },
+): Promise<void> {
+  const g = git(dir);
+  await g(["init", "-q", "-b", remote.branch]);
+  await writeObjects(
+    g,
+    join(dir, ".git"),
+    remote.sha,
+    commit,
+    tree,
+    raw,
+    source,
+  );
   const shallow = join(dir, ".git", "shallow");
   if (commit.parents.length > 0) await writeFile(shallow, `${remote.sha}\n`);
   else await rm(shallow, { force: true });

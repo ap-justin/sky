@@ -265,6 +265,82 @@ test("publishing a branch from the checkout builds its first commit on GitHub's 
   ]);
 });
 
+/** A commit on GitHub's default branch that the sandbox's clone doesn't have. */
+const advanceRemote = (file: string, content: string) => {
+  const seed = join(root, "seed");
+  writeFileSync(join(seed, file), content);
+  const sha = commitAs(seed, `edit ${file}`, "2026-10-31T08:00:00+00:00");
+  git(seed, "push", "-q", remote, "trunk");
+  return sha;
+};
+
+const agentWorktree = async () => {
+  const dir = join(root, "repo");
+  await pull(dir);
+  const tree = join(root, "wt");
+  git(dir, "worktree", "add", "-b", "claude/agt_1", tree, "origin/HEAD");
+  return { dir, tree };
+};
+
+const publishFrom = (tree: string) =>
+  publish({
+    cwd: tree,
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    title: "Agent change",
+  });
+
+test("a stale clone publishes on GitHub's current head: it is fetched over REST and the agent's commits are rebased onto it", async () => {
+  const seen = fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "new.txt"), "agent work\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  const author = git(tree, "log", "-1", "--format=%an <%ae> %aI|%s", mine);
+  const fresh = advanceRemote("other.txt", "someone else\n");
+
+  await publishFrom(tree);
+
+  expect(seen.commits).toHaveLength(1);
+  expect(seen.commits[0]?.parents).toEqual([fresh]);
+  expect(seen.refs).toEqual([
+    { ref: "refs/heads/claude/agt_1", sha: "d".repeat(40) },
+  ]);
+  expect(git(dir, "rev-parse", "origin/HEAD")).toBe(fresh);
+  expect(git(tree, "rev-parse", "HEAD~1")).toBe(fresh);
+  expect(git(tree, "log", "-1", "--format=%an <%ae> %aI|%s")).toBe(author);
+  expect(readFileSync(join(tree, "other.txt"), "utf8")).toBe("someone else\n");
+  expect(readFileSync(join(tree, "new.txt"), "utf8")).toBe("agent work\n");
+  expect(
+    spawnSync("git", ["fsck", "--no-dangling", "--no-progress"], {
+      cwd: tree,
+      encoding: "utf8",
+    }).status,
+  ).toBe(0);
+});
+
+test("a base that moved onto a change the agent also made fails with a clear error, sends nothing, and leaves the branch as it was", async () => {
+  const seen = fakeGitHub();
+  const { dir, tree } = await agentWorktree();
+  writeFileSync(join(tree, "README.md"), "agent's line\n");
+  const mine = commitAs(tree, "agent change", "2026-10-31T10:00:00+00:00");
+  advanceRemote("README.md", "someone else's line\n");
+
+  await expect(publishFrom(tree)).rejects.toThrow(
+    /trunk moved on GitHub to [0-9a-f]{40}, and this branch's commits don't rebase onto it cleanly/,
+  );
+
+  expect(seen.commits).toEqual([]);
+  expect(seen.refs).toEqual([]);
+  expect(git(tree, "rev-parse", "HEAD")).toBe(mine);
+  expect(git(tree, "status", "--porcelain")).toBe("");
+  expect(
+    existsSync(
+      join(git(tree, "rev-parse", "--absolute-git-dir"), "rebase-merge"),
+    ),
+  ).toBe(false);
+  expect(git(dir, "rev-parse", "origin/HEAD")).toBe(headSha);
+});
+
 test("nothing outside the repo's REST endpoints is called, and no request carries a credential", async () => {
   fakeGitHub();
   const requests: { url: string; auth: string | null }[] = [];

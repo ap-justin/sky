@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
 import { parseArgs, promisify } from "node:util";
+import { fetchCommit } from "./repo.js";
+import { git as repoGit } from "./store.js";
 
 const run = promisify(execFile);
 
@@ -230,6 +232,58 @@ export function gateway(options: {
 }
 
 /**
+ * Brings the clone's `origin/<base>` up to GitHub's current head of the base, which a sandbox's
+ * clone, made once at provisioning, falls behind. The head commit is materialized from the REST API
+ * when it isn't here, and this branch's commits are rebased onto it, so what is published sits on
+ * the base as it is now, not as the clone saw it. A conflict aborts the rebase, restores
+ * `origin/<base>`, and fails without a word sent to GitHub.
+ */
+async function refreshBase(
+  cwd: string,
+  call: ReturnType<typeof gateway>,
+  base: string,
+): Promise<void> {
+  const ref = `refs/remotes/origin/${base}`;
+  const { object } = await call<{ object: { sha: string } }>(
+    "GET",
+    `/git/ref/heads/${base.split("/").map(encodeURIComponent).join("/")}`,
+  ).catch((error: unknown) => {
+    if (error instanceof GatewayError && error.status === 404) {
+      throw new PublishError(
+        `${base} doesn't exist on GitHub, so there is nothing to open a pull request into (${error.message})`,
+      );
+    }
+    throw error;
+  });
+  const old = (await git(cwd, "rev-parse", ref)).trim();
+  if (object.sha === old) return;
+  await fetchCommit(repoGit(cwd), call, object.sha);
+  const oldBase = (await git(cwd, "merge-base", old, "HEAD")).trim();
+  await git(cwd, "update-ref", ref, object.sha);
+  // the rebase commits as whoever git is configured as; a sandbox may have no identity of its own
+  const identity = (await git(cwd, "config", "user.email").catch(() => ""))
+    ? []
+    : ["-c", "user.name=sky-agent", "-c", "user.email=agent@sky.local"];
+  try {
+    await git(
+      cwd,
+      ...identity,
+      "rebase",
+      "--quiet",
+      "--onto",
+      object.sha,
+      oldBase,
+    );
+  } catch (error) {
+    await git(cwd, "rebase", "--abort").catch(() => {});
+    await git(cwd, "update-ref", ref, old);
+    throw new PublishError(
+      `${base} moved on GitHub to ${object.sha}, and this branch's commits don't rebase onto it cleanly; rebase it by hand and publish again (${messageOf(error).split("\n")[0]})`,
+    );
+  }
+}
+
+/**
  * Publishes the worktree's branch through the GitHub gateway, which carries no git push: each
  * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
  * the commit with its own message and identities), then the branch ref is created or fast-forwarded
@@ -237,7 +291,8 @@ export function gateway(options: {
  * Code's attribution is stripped from each commit message and the pull request's body, never its
  * title. Only first-parent history is replayed, so a merge commit arrives as a plain commit with
  * the same content, and a merge from the base shows the base's changes in the pull request's diff
- * as the branch's own.
+ * as the branch's own. The base is first refreshed to GitHub's current head, with the branch's
+ * commits rebased onto it when it moved (`refreshBase`).
  */
 export async function publish(options: {
   cwd: string;
@@ -268,19 +323,22 @@ export async function publish(options: {
   const { owner, repo } = parseOrigin(
     (await git(cwd, "remote", "get-url", "origin")).trim(),
   );
-  const mergeBase = (
-    await git(cwd, "merge-base", `origin/${base}`, "HEAD")
-  ).trim();
-  const commits = lines(
-    await git(
-      cwd,
-      "rev-list",
-      "--reverse",
-      "--first-parent",
-      `${mergeBase}..HEAD`,
-    ),
-  );
-  if (commits.length === 0) {
+  const pending = async () => {
+    const mergeBase = (
+      await git(cwd, "merge-base", `origin/${base}`, "HEAD")
+    ).trim();
+    const commits = lines(
+      await git(
+        cwd,
+        "rev-list",
+        "--reverse",
+        "--first-parent",
+        `${mergeBase}..HEAD`,
+      ),
+    );
+    return { mergeBase, commits };
+  };
+  if ((await pending()).commits.length === 0) {
     throw new PublishError(
       `no commits on ${branch} past ${base}; commit your work first`,
     );
@@ -296,6 +354,8 @@ export async function publish(options: {
     }
     throw error;
   });
+  await refreshBase(cwd, call, base);
+  const { mergeBase, commits } = await pending();
   // before anything is written, so a missing title costs no upload
   const [existing] = await call<{ number: number; html_url: string }[]>(
     "GET",

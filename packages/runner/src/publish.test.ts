@@ -122,6 +122,10 @@ function fakeGitHub(
       seen(request);
       return HttpResponse.json({ full_name: "acme/widgets" });
     }),
+    // the base is as the clone has it: nothing to refresh
+    http.get(`${REPO}/git/ref/heads/main`, () =>
+      HttpResponse.json({ object: { sha: baseSha } }),
+    ),
     http.get(`${REPO}/git/blobs/:sha`, ({ request, params }) => {
       seen(request);
       return options.blobs?.includes(String(params.sha))
