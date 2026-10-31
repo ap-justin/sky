@@ -353,7 +353,7 @@ async function refreshBase(
 /**
  * Publishes the worktree's branch through the GitHub gateway, which carries no git push: each
  * commit past the base is recreated with GitHub's git data API (blobs, a tree on its parent's tree,
- * the commit with its own message and identities), then the branch ref is created or fast-forwarded
+ * the commit with its own message and identities), then the branch ref is created or moved
  * and a pull request into the base opened, or the open one given the new title and body. Claude
  * Code's attribution is stripped from each commit message and the pull request's body, never its
  * title. The base is first refreshed to GitHub's current head, with the branch's commits rebased
@@ -361,9 +361,9 @@ async function refreshBase(
  * and the commits it brought in are replayed one by one. Where the base hasn't moved, only
  * first-parent history is replayed, so a merge commit arrives as a plain commit with the same
  * content, and a merge from the base shows the base's changes in the pull request's diff as the
- * branch's own. A branch on GitHub whose head this branch
- * held before a rebase or amend here is force-updated to the rewritten history; one holding a
- * commit this branch never had is only ever fast-forwarded.
+ * branch's own. A branch on GitHub whose head this branch held before a rebase or amend here is
+ * force-updated to the rewritten history; one holding a commit this branch never had is only ever
+ * fast-forwarded.
  */
 export async function publish(options: {
   cwd: string;
