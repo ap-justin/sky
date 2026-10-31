@@ -30,8 +30,18 @@ const NO_SIGN = ["-c", "commit.gpgsign=false"];
 const initRepo = (dir: string) =>
   execFileSync("git", [...NO_SIGN, "init", "-q", "-b", "trunk", dir]);
 
+// rebases and merges in the fixtures commit, which needs an identity a CI runner doesn't configure
+const IDENTITY = {
+  GIT_AUTHOR_NAME: "Ada L",
+  GIT_AUTHOR_EMAIL: "ada@example.com",
+  GIT_COMMITTER_NAME: "Ada L",
+  GIT_COMMITTER_EMAIL: "ada@example.com",
+  GIT_EDITOR: "true",
+};
+const gitEnv = { ...process.env, ...IDENTITY };
+
 const git = (cwd: string, ...args: string[]) =>
-  execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
+  execFileSync("git", args, { cwd, encoding: "utf8", env: gitEnv }).trim();
 
 let root: string;
 let remote: string;
@@ -1105,12 +1115,12 @@ test("a branch rebased by hand onto a shallow base, as a conflict's message says
   const advice = /`git (rebase [^`]+)`/.exec(String(failure))?.[1] ?? "";
   expect(advice).not.toBe("");
 
-  spawnSync("git", advice.split(" "), { cwd: tree });
+  spawnSync("git", advice.split(" "), { cwd: tree, env: gitEnv });
   writeFileSync(join(tree, "README.md"), "both lines\n");
   git(tree, "add", "README.md");
   execFileSync("git", [...NO_SIGN, "rebase", "--continue"], {
     cwd: tree,
-    env: { ...process.env, GIT_EDITOR: "true" },
+    env: gitEnv,
   });
   await publishFrom(tree);
 
@@ -1135,7 +1145,10 @@ test("a branch sharing no commit with any base fails with advice that, followed,
   expect(advice).toHaveLength(2);
 
   for (const step of advice) {
-    execFileSync("git", [...NO_SIGN, ...step.split(" ")], { cwd: tree });
+    execFileSync("git", [...NO_SIGN, ...step.split(" ")], {
+      cwd: tree,
+      env: gitEnv,
+    });
   }
   await publishFrom(tree);
 
@@ -1169,7 +1182,10 @@ test("a branch reaching two bases that share no commit here fails naming both, w
   );
   expect(advice).toHaveLength(2);
   for (const step of advice) {
-    execFileSync("git", [...NO_SIGN, ...step.split(" ")], { cwd: tree });
+    execFileSync("git", [...NO_SIGN, ...step.split(" ")], {
+      cwd: tree,
+      env: gitEnv,
+    });
   }
   await publishFrom(tree);
 
