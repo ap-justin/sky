@@ -67,8 +67,8 @@ const io = {
   stdout: (s: string) => process.stdout.write(s),
   stderr: (s: string) => process.stderr.write(s),
 };
-// `runner.mjs publish …` is the agent's own command, run from its worktree; `store-sync` and `repo-pull` are
-// the API's, at provisioning; anything else is a run
+// `runner.mjs publish …` is the agent's own command, run from its worktree; `store-sync` and
+// `repo-pull` are the API's, at provisioning; anything else is a run
 const entry =
   process.argv[2] === "publish"
     ? publishMain(process.argv.slice(3), process.env, {
