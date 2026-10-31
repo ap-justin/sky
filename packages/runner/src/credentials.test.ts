@@ -1,6 +1,9 @@
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -49,42 +52,116 @@ test("refuses to write without a token, and the error never holds a value", asyn
   );
 });
 
-test("replaces only the subscription entry and keeps the others, private to the user", async () => {
-  const dir = join(home, ".claude");
+const fresh = {
+  accessToken: "oauth-secret-token",
+  refreshToken: null,
+  expiresAt: null,
+  scopes: ["user:inference"],
+};
+const design = {
+  accessToken: "design-access",
+  refreshToken: "design-refresh",
+};
+
+/** Seeds `<dir>/.credentials.json` and returns its path. */
+function seed(dir: string, content: string): string {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, ".credentials.json");
-  const design = {
-    accessToken: "design-access",
-    refreshToken: "design-refresh",
-  };
-  writeFileSync(
-    path,
-    JSON.stringify({
-      claudeAiOauth: { accessToken: "stale" },
-      designOauth: design,
-    }),
-    { mode: 0o644 },
+  writeFileSync(path, content);
+  return path;
+}
+
+test("keeps the other entries when writing the token", async () => {
+  const path = seed(
+    join(home, ".claude"),
+    JSON.stringify({ designOauth: design }),
   );
   await writeClaudeCredentials(
     { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
     home,
   );
-  const written = JSON.parse(readFileSync(path, "utf8"));
-  expect(written.designOauth).toEqual(design);
-  expect(written.claudeAiOauth.accessToken).toBe("oauth-secret-token");
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    designOauth: design,
+    claudeAiOauth: fresh,
+  });
+});
+
+test("replaces the whole subscription entry, dropping stale fields", async () => {
+  const path = seed(
+    join(home, ".claude"),
+    JSON.stringify({
+      claudeAiOauth: {
+        accessToken: "stale",
+        refreshToken: "stale-refresh",
+        expiresAt: 1,
+        organizationUuid: "stale-org",
+      },
+    }),
+  );
+  await writeClaudeCredentials(
+    { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
+    home,
+  );
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    claudeAiOauth: fresh,
+  });
+});
+
+test("tightens an existing file that others could read to 0600", async () => {
+  const path = seed(join(home, ".claude"), "{}");
+  chmodSync(path, 0o644);
+  await writeClaudeCredentials(
+    { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
+    home,
+  );
   expect(statSync(path).mode & 0o777).toBe(0o600);
 });
 
-test("starts over when the existing file is not a JSON object", async () => {
-  const dir = join(home, ".claude");
-  mkdirSync(dir, { recursive: true });
-  const path = join(dir, ".credentials.json");
-  writeFileSync(path, "not json");
+test("keeps the other entries in the file under CLAUDE_CONFIG_DIR", async () => {
+  const dir = join(home, "cfg");
+  const path = seed(dir, JSON.stringify({ designOauth: design }));
+  await writeClaudeCredentials(
+    { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token", CLAUDE_CONFIG_DIR: dir },
+    home,
+  );
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    designOauth: design,
+    claudeAiOauth: fresh,
+  });
+  expect(existsSync(join(home, ".claude"))).toBe(false);
+});
+
+test.each([
+  ["not JSON", "not json"],
+  ["an array", "[1,2]"],
+  ["a string", '"abc"'],
+])("starts over when the existing file is %s", async (_, content) => {
+  const path = seed(join(home, ".claude"), content);
   await writeClaudeCredentials(
     { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
     home,
   );
-  expect(Object.keys(JSON.parse(readFileSync(path, "utf8")))).toEqual([
-    "claudeAiOauth",
-  ]);
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    claudeAiOauth: fresh,
+  });
+});
+
+test("refuses to replace a credential path it cannot read", async () => {
+  const path = join(home, ".claude", ".credentials.json");
+  mkdirSync(path, { recursive: true });
+  await expect(
+    writeClaudeCredentials(
+      { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
+      home,
+    ),
+  ).rejects.toThrow(/EISDIR/);
+  expect(statSync(path).isDirectory()).toBe(true);
+});
+
+test("leaves no temp file beside the credentials", async () => {
+  await writeClaudeCredentials(
+    { CLAUDE_CODE_OAUTH_TOKEN: "oauth-secret-token" },
+    home,
+  );
+  expect(readdirSync(join(home, ".claude"))).toEqual([".credentials.json"]);
 });
