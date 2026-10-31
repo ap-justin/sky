@@ -461,16 +461,17 @@ test("an env with no base gets no store, session variables or checks, connector 
   for (const name of BASE_ENV_NAMES) expect(file).not.toHaveProperty(name);
 });
 
-test("an env whose base profile is no longer configured runs without it, and the log says so", async () => {
+test("an env whose base profile is no longer configured fails the run at launch, naming it, and starts no runner", async () => {
   const envId = readyEnv({ base: "gone" });
   await connect(envId);
-  await launched(envId);
-  await sessionOpened();
-  const file = envFileOf(wire, wire.sessions[0]);
-  for (const name of BASE_ENV_NAMES) expect(file).not.toHaveProperty(name);
-  expect(logs.join("\n")).toContain(
-    `base profile gone of ${envId} is not configured`,
+  const { agent, run } = await launched(envId);
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining('base profile "gone"'),
+    }),
   );
+  expect(wire.sessions).toEqual([]);
 });
 
 test("a runner session that fails to open fails the run and deletes the env file it would have sourced", async () => {

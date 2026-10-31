@@ -183,9 +183,10 @@ export function createLauncher({
       .where(eq(environments.id, envId))
       .get();
     const profile = row?.base ? config.baseProfiles[row.base] : undefined;
+    // a run without its profile would skip the env's checks and store sync unnoticed
     if (row?.base && !profile) {
-      log(
-        `base profile ${row.base} of ${envId} is not configured; running without it`,
+      throw new Error(
+        `base profile ${JSON.stringify(row.base)} of ${envId} is not configured on this server`,
       );
     }
     return profile && !connector
