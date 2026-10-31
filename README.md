@@ -73,6 +73,16 @@ autoApprove: # optional: Bash commands that skip approvalPolicy
   commands: [make check] # added to the built-ins (or all there is, with defaults: false)
 ```
 
+`setup` runs in the clone with bash, with pnpm and yarn on `PATH` and `SKY_CLAUDE` set to the `claude` binary agents run. After it, Sky installs the plugins the repo's `.claude/settings.json` enables in `enabledPlugins`, from the marketplaces its `extraKnownMarketplaces` declares. If a plugin comes from a marketplace that isn't declared there, add the marketplace in `setup`:
+
+```yaml
+setup: |
+  pnpm install
+  "$SKY_CLAUDE" plugin marketplace add owner/marketplace-repo
+```
+
+Provisioning fails at the setup step, naming the plugin and its marketplace, if a plugin's marketplace is neither declared nor added.
+
 ```
 sky secret set web NPM_TOKEN < token.txt
 ```

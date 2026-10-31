@@ -25,6 +25,8 @@ const configSchema = z.object({
   RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
   /** How long a runner waits on a question or approval before giving up; the runner gets it at launch. */
   WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
+  /** The bound on a sprite's clone, installs, setup script, Kru store steps and checkpoint. */
+  SPRITES_LONG_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
   /** HMAC key every outbound webhook delivery is signed with. */
   WEBHOOK_SIGNING_KEY: z.string().min(32),
   /** AES-256 key, base64, that env secrets and run envVars are encrypted under. */
@@ -46,6 +48,7 @@ export type Config = {
   cliBundlePath: string;
   runTimeoutMs: number;
   waitTimeoutMs: number;
+  spritesLongTimeoutMs: number;
   webhookSigningKey: string;
   secretEncryptionKey: Buffer;
 };
@@ -72,6 +75,7 @@ export function loadConfig(
         cliBundlePath: e.CLI_BUNDLE_PATH,
         runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
         waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
+        spritesLongTimeoutMs: e.SPRITES_LONG_TIMEOUT_MINUTES * 60_000,
         webhookSigningKey: e.WEBHOOK_SIGNING_KEY,
         secretEncryptionKey: Buffer.from(e.SECRET_ENCRYPTION_KEY, "base64"),
       },

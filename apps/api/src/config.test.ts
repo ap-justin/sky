@@ -28,18 +28,20 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
       runTimeoutMs: 30 * 60_000,
       waitTimeoutMs: 120 * 60_000,
+      spritesLongTimeoutMs: 30 * 60_000,
       webhookSigningKey: "w".repeat(32),
       secretEncryptionKey: Buffer.alloc(32, 7),
     },
   });
 });
 
-test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES and WAIT_TIMEOUT_MINUTES override their defaults", () => {
+test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES, WAIT_TIMEOUT_MINUTES and SPRITES_LONG_TIMEOUT_MINUTES override their defaults", () => {
   const result = loadConfig({
     ...required,
     RUNNER_BUNDLE_PATH: "/opt/api/runner.mjs",
     RUN_TIMEOUT_MINUTES: "5",
     WAIT_TIMEOUT_MINUTES: "15",
+    SPRITES_LONG_TIMEOUT_MINUTES: "45",
   });
   expect(result).toMatchObject({
     ok: true,
@@ -47,7 +49,16 @@ test("RUNNER_BUNDLE_PATH, RUN_TIMEOUT_MINUTES and WAIT_TIMEOUT_MINUTES override 
       runnerBundlePath: "/opt/api/runner.mjs",
       runTimeoutMs: 300_000,
       waitTimeoutMs: 900_000,
+      spritesLongTimeoutMs: 2_700_000,
     },
+  });
+});
+
+test("a SPRITES_LONG_TIMEOUT_MINUTES that isn't a positive number is rejected", () => {
+  const result = loadConfig({ ...required, SPRITES_LONG_TIMEOUT_MINUTES: "0" });
+  expect(result).toEqual({
+    ok: false,
+    message: expect.stringContaining("SPRITES_LONG_TIMEOUT_MINUTES is invalid"),
   });
 });
 

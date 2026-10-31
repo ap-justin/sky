@@ -32,6 +32,9 @@ const LOCK_WAIT_S = 600;
 // `--locked` child only ever exits 0, 1 or 2
 const LOCK_TIMED_OUT = 75;
 const PUSH_ATTEMPTS = 4;
+// blob downloads in flight at once through the connector gateway during a pull
+const BLOB_FETCH_CONCURRENCY = 8;
+const PROGRESS_EVERY = 100;
 // `git hash-object -t tree /dev/null`
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
 // session-lived hook state and our lock stay out of the store, as kru's own defaults keep them
@@ -122,7 +125,11 @@ type StoreOptions = {
   connectorId: string;
   /** The commit message for what this call pushes. */
   message: string;
+  /** Gets a line (no trailing newline) as a pull downloads blobs; silent when none are missing. */
+  progress?: Progress;
 };
+
+type Progress = (line: string) => void;
 
 type TreeItem = { path: string; mode: string; type: string; sha: string };
 
@@ -200,6 +207,7 @@ async function pull(
   call: ReturnType<typeof gateway>,
   home: string,
   message: string,
+  progress: Progress = () => {},
 ): Promise<{ sha: string; branch: string }> {
   await anchor(g);
   await commitLocal(g, message);
@@ -218,26 +226,10 @@ async function pull(
   if (listing.truncated)
     throw new Error("the store's tree is too large to sync");
   const index = join(home, ".git", "sky-sync-index");
-  const lines: string[] = [];
+  const blobs = listing.tree.filter((item) => item.type === "blob");
+  const lines = blobs.map((item) => `${item.mode} ${item.sha}\t${item.path}\0`);
   try {
-    for (const item of listing.tree) {
-      if (item.type !== "blob") continue;
-      const present = await g(["cat-file", "-e", item.sha]).then(
-        () => true,
-        () => false,
-      );
-      if (!present) {
-        const blob = await call<{ content: string }>(
-          "GET",
-          `/git/blobs/${item.sha}`,
-        );
-        const written = await writeBlob(g, Buffer.from(blob.content, "base64"));
-        if (written !== item.sha) {
-          throw new Error(`blob ${item.sha} arrived as ${written}`);
-        }
-      }
-      lines.push(`${item.mode} ${item.sha}\t${item.path}\0`);
-    }
+    await fetchMissing(g, call, blobs, progress);
     const env = { GIT_INDEX_FILE: index };
     await rm(index, { force: true });
     // -z takes each path literally; without it a path starting with `"` would be unquoted
@@ -262,6 +254,74 @@ async function pull(
     await rm(index, { force: true });
   }
   return remote;
+}
+
+/** The shas among `shas` the object store lacks, asked of one `cat-file` rather than one per sha. */
+async function missingObjects(
+  g: ReturnType<typeof git>,
+  shas: string[],
+): Promise<string[]> {
+  if (!shas.length) return [];
+  const answers = await g(["cat-file", "--batch-check"], {
+    input: `${shas.join("\n")}\n`,
+  });
+  return answers
+    .split("\n")
+    .filter((line) => line.endsWith(" missing"))
+    .map((line) => line.slice(0, -" missing".length));
+}
+
+/**
+ * Downloads every blob of `items` the object store lacks, `BLOB_FETCH_CONCURRENCY` at a time, and checks
+ * each one hashes to the sha GitHub listed it under.
+ */
+async function fetchMissing(
+  g: ReturnType<typeof git>,
+  call: ReturnType<typeof gateway>,
+  items: TreeItem[],
+  progress: Progress,
+): Promise<void> {
+  const listed = [...new Set(items.map((item) => item.sha))];
+  const missing = await missingObjects(g, listed);
+  if (!missing.length) return;
+  const total = missing.length;
+  progress(`store sync: fetching ${total} of ${listed.length} blobs`);
+  let fetched = 0;
+  await eachLimited(missing, BLOB_FETCH_CONCURRENCY, async (sha) => {
+    const blob = await call<{ content: string }>("GET", `/git/blobs/${sha}`);
+    const written = await writeBlob(g, Buffer.from(blob.content, "base64"));
+    if (written !== sha) throw new Error(`blob ${sha} arrived as ${written}`);
+    fetched++;
+    if (fetched % PROGRESS_EVERY === 0 || fetched === total)
+      progress(`store sync: fetched ${fetched}/${total} blobs`);
+  });
+}
+
+/**
+ * Runs `task` over `items`, at most `limit` at once. After the first rejection no new task starts;
+ * the running ones settle, then this rejects with that first error.
+ */
+async function eachLimited<T>(
+  items: readonly T[],
+  limit: number,
+  task: (item: T) => Promise<void>,
+): Promise<void> {
+  let next = 0;
+  let failure: { error: unknown } | undefined;
+  const worker = async () => {
+    while (!failure && next < items.length) {
+      const item = items[next++] as T;
+      try {
+        await task(item);
+      } catch (error) {
+        failure ??= { error };
+      }
+    }
+  };
+  await Promise.all(
+    Array.from({ length: Math.min(limit, items.length) }, worker),
+  );
+  if (failure) throw failure.error;
 }
 
 /** Writes the blob through `hash-object` so its sha is git's own, whatever GitHub said it was. */
@@ -447,7 +507,13 @@ async function push(
 export async function pullStore(options: StoreOptions): Promise<void> {
   await ensureRepo(options.home);
   const g = git(options.home);
-  await pull(g, callFor(options), options.home, options.message);
+  await pull(
+    g,
+    callFor(options),
+    options.home,
+    options.message,
+    options.progress,
+  );
 }
 
 /**
@@ -459,7 +525,13 @@ export async function pushStore(options: StoreOptions): Promise<boolean> {
   const g = git(options.home);
   const call = callFor(options);
   for (let attempt = 1; ; attempt++) {
-    const remote = await pull(g, call, options.home, options.message);
+    const remote = await pull(
+      g,
+      call,
+      options.home,
+      options.message,
+      options.progress,
+    );
     try {
       return await push(g, options.home, call, remote, options.message);
     } catch (error) {
@@ -586,6 +658,7 @@ export async function storeSyncMain(
     message: env.RUN_ID
       ? `agent ${env.AGENT_ID ?? "?"} run ${env.RUN_ID}`
       : "sky: sync the store",
+    progress: (line) => io.stderr(`${line}\n`),
   };
   try {
     if (mode === "pull") {

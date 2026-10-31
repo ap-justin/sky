@@ -161,8 +161,8 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    pluginsCall(sprite),
     setupCall(sprite, "pnpm install"),
+    pluginsCall(sprite),
     `checkpoint ${sprite}`,
   ]);
 });
@@ -206,9 +206,21 @@ test("a corepack that can't enable its shims ends failed at the setup step with 
 const isPluginInstall = (argv: string[]) =>
   argv[0] === "node" && argv[1] === "-e";
 
+// logs its argv; `marketplace add` makes a marketplace known under its source's last path segment,
+// and `marketplace list --json` prints the known ones
+const CLAUDE_STAND_IN = `#!/bin/sh
+echo "$*" >>"$HOME/claude-runs"
+if [ "$1 $2 $3" = "plugin marketplace add" ]; then n=\${4%%#*}; n=\${n##*/}; echo "\${n%.git}" >>"$HOME/known"; fi
+if [ "$1 $2 $3" = "plugin marketplace list" ]; then
+  printf '['; sep=
+  [ -f "$HOME/known" ] && while read -r n; do printf '%s{"name":"%s"}' "$sep" "$n"; sep=,; done <"$HOME/known"
+  echo ']'
+fi
+`;
+
 /**
  * Runs the plugin step in a real local node, as a sprite would: the clone carries `settings`, and
- * the runner dir holds the SDK's bundled `claude` as a script that logs its argv.
+ * the runner dir holds the SDK's bundled `claude` (by default {@link CLAUDE_STAND_IN}).
  */
 function runPluginsLocally(home: string, settings: unknown, claude?: string) {
   const repo = join(home, "repo");
@@ -225,11 +237,9 @@ function runPluginsLocally(home: string, settings: unknown, claude?: string) {
     "node_modules/@anthropic-ai/claude-agent-sdk-linux-x64",
   );
   mkdirSync(sdkPlatform, { recursive: true });
-  writeFileSync(
-    join(sdkPlatform, "claude"),
-    claude ?? '#!/bin/sh\necho "$*" >>"$HOME/claude-runs"\n',
-    { mode: 0o755 },
-  );
+  writeFileSync(join(sdkPlatform, "claude"), claude ?? CLAUDE_STAND_IN, {
+    mode: 0o755,
+  });
   wire.exec = (argv) => {
     if (!isPluginInstall(argv)) return { exitCode: 0 };
     const out = spawnSync(
@@ -281,7 +291,7 @@ const kruSettings = {
   },
 };
 
-test("the plugins the clone's .claude/settings.json enables are installed for the user and brought to their marketplace's latest, after their marketplaces are added and refreshed, before the setup", async () => {
+test("the plugins the clone's .claude/settings.json enables are installed for the user and brought to their marketplace's latest, after their marketplaces are added and refreshed", async () => {
   const home = mkdtempSync(join(tmpdir(), "sky-home-"));
   const claudeRuns = runPluginsLocally(home, kruSettings);
   try {
@@ -291,6 +301,7 @@ test("the plugins the clone's .claude/settings.json enables are installed for th
       [
         "plugin marketplace add ap-justin/kru#v2 --sparse .claude-plugin plugins",
         "plugin marketplace add https://example.com/tools.git#main",
+        "plugin marketplace list --json",
         "plugin marketplace update",
         "plugin install kru@kru --scope user",
         "plugin install lint@tools --scope user",
@@ -319,12 +330,15 @@ test.each([
   }
 });
 
-test("a plugin that fails to install ends failed at the setup step with claude's output, and the setup never runs", async () => {
+test("a plugin that fails to install ends failed at the setup step with claude's output, and nothing is checkpointed", async () => {
   const home = mkdtempSync(join(tmpdir(), "sky-home-"));
   runPluginsLocally(
     home,
     kruSettings,
-    '#!/bin/sh\n[ "$2" = install ] || exit 0\necho "Plugin not found in marketplace" >&2\nexit 1\n',
+    CLAUDE_STAND_IN.replace(
+      "\n",
+      '\n[ "$2" = install ] && { echo "network unreachable" >&2; exit 1; }\n',
+    ),
   );
   try {
     const { id } = (await (await post(kru)).json()) as { id: string };
@@ -332,10 +346,83 @@ test("a plugin that fails to install ends failed at the setup step with claude's
       status: "failed",
       failure: {
         step: "setup",
-        stderr: expect.stringContaining("Plugin not found in marketplace"),
+        stderr: expect.stringContaining("network unreachable"),
       },
     });
-    expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
+    expect(wire.calls.some((c) => c.startsWith("checkpoint"))).toBe(false);
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a plugin whose marketplace is neither declared nor added by the setup ends failed at the setup step naming the marketplace, before any install", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const claudeRuns = runPluginsLocally(home, {
+    ...kruSettings,
+    enabledPlugins: { ...kruSettings.enabledPlugins, "turso@turso": true },
+  });
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({
+      status: "failed",
+      failure: {
+        step: "setup",
+        stderr: expect.stringContaining(
+          'plugin "turso@turso" in .claude/settings.json: marketplace "turso" is not known; declare it in extraKnownMarketplaces, or add it in the setup with "$SKY_CLAUDE" plugin marketplace add <source>',
+        ),
+      },
+    });
+    expect(claudeRuns()).not.toContain("plugin install");
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("a setup can add a marketplace with $SKY_CLAUDE, the SDK's bundled claude, and the plugin step installs from it", async () => {
+  const home = mkdtempSync(join(tmpdir(), "sky-home-"));
+  const claudeRuns = runPluginsLocally(home, {
+    enabledPlugins: { "turso@turso": true },
+  });
+  const installPlugins = wire.exec;
+  const nodeBin = join(home, "node-bin");
+  mkdirSync(nodeBin);
+  writeFileSync(join(nodeBin, "corepack"), COREPACK_STAND_IN, { mode: 0o755 });
+  // the setup runs in a real local shell, with the runner dir where the sprite's would be
+  wire.exec = (argv) => {
+    if (!isSetup(argv)) return installPlugins(argv);
+    const out = spawnSync(
+      argv[0] ?? "",
+      argv.slice(1).map((a) => a.replaceAll("/opt/sky", join(home, "runner"))),
+      {
+        cwd: home,
+        env: { HOME: home, PATH: `${nodeBin}:/usr/bin:/bin` },
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+    return {
+      exitCode: out.status ?? 1,
+      stdout: out.stdout,
+      stderr: out.stderr,
+    };
+  };
+  try {
+    const { id } = (await (
+      await post({
+        ...kru,
+        setup: '"$SKY_CLAUDE" plugin marketplace add acme/turso',
+      })
+    ).json()) as { id: string };
+    expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+    expect(claudeRuns()).toContain(
+      [
+        "plugin marketplace add acme/turso",
+        "plugin marketplace list --json",
+        "plugin marketplace update",
+        "plugin install turso@turso --scope user",
+        "",
+      ].join("\n"),
+    );
   } finally {
     rmSync(home, { recursive: true, force: true });
   }
@@ -401,7 +488,7 @@ test.each([
   ],
   ["no source", {}, "no source"],
 ])(
-  "a used marketplace with %s ends failed at the setup step naming it, before claude or the setup runs",
+  "a used marketplace with %s ends failed at the setup step naming it, before claude runs",
   async (_, tools, reason) => {
     const home = mkdtempSync(join(tmpdir(), "sky-home-"));
     const claudeRuns = runPluginsLocally(home, {
@@ -422,7 +509,6 @@ test.each([
         },
       });
       expect(claudeRuns()).toBe("");
-      expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }
@@ -499,6 +585,29 @@ test("a runner SDK install that fails ends failed at the setup step", async () =
     failure: { step: "setup", stderr: "npm ERR! network\n" },
   });
   expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
+});
+
+test("a clone that hangs past the long bound ends failed at the clone step with the timeout, and logs it", async () => {
+  const logged: string[] = [];
+  app = createApp({
+    db,
+    config: testConfig({ spritesLongTimeoutMs: 100 }),
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logged.push(line),
+    nudgeDeliveries: () => {},
+  });
+  wire.hangs = (call) => call.includes("git clone");
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  const sprite = spriteNameFor(id);
+  expect(await settled(id)).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "clone",
+      stderr: `sprite ${sprite}: clone timed out after 100 ms`,
+    },
+  });
+  expect(logged).toContain(`sprite ${sprite} clone: timed out after 100ms`);
+  expect(wire.calls.some((c) => c.startsWith(`checkpoint`))).toBe(false);
 });
 
 test("a setup that fails with no stderr names its exit code", async () => {
@@ -785,8 +894,8 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    pluginsCall(sprite),
     setupCall(sprite, "pnpm install --frozen-lockfile"),
+    pluginsCall(sprite),
     `checkpoint ${sprite}`,
   ]);
 });
@@ -845,8 +954,8 @@ test("with a connector, provisioning checks the Kru store out through the runner
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    pluginsCall(sprite),
     setupCall(sprite, "pnpm install --frozen-lockfile"),
+    pluginsCall(sprite),
     `exec ${sprite} - sha256sum /opt/sky/runner.mjs`,
     `write ${sprite} /opt/sky/runner.mjs.provision-${id}`,
     `exec ${sprite} - mv -f /opt/sky/runner.mjs.provision-${id} /opt/sky/runner.mjs`,
@@ -916,9 +1025,7 @@ test("an env that stores KRU_NO_STORE_SYNC, which turns a run's sync off, gets n
   });
   expect(env).toMatchObject({ status: "ready", failure: null });
   const sprite = spriteNameFor(id);
-  expect(wire.calls.at(-2)).toEqual(
-    setupCall(sprite, "pnpm install --frozen-lockfile"),
-  );
+  expect(wire.calls.at(-2)).toEqual(pluginsCall(sprite));
   expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
 });
 
@@ -928,9 +1035,7 @@ test("a GITHUB_CONNECTOR stored as a value, not a connector, triggers no store p
   });
   expect(env).toMatchObject({ status: "ready", failure: null });
   const sprite = spriteNameFor(id);
-  expect(wire.calls.at(-2)).toEqual(
-    setupCall(sprite, "pnpm install --frozen-lockfile"),
-  );
+  expect(wire.calls.at(-2)).toEqual(pluginsCall(sprite));
   expect(wire.calls.at(-1)).toBe(`checkpoint ${sprite}`);
 });
 
@@ -1260,8 +1365,8 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
-    pluginsCall(sprite),
     setupCall(sprite, "pnpm install"),
+    pluginsCall(sprite),
     `checkpoint ${sprite}`,
   ]);
 });

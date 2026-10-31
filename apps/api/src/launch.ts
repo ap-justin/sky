@@ -1,4 +1,3 @@
-import type { SpritesClient } from "@fly/sprites";
 import { type Db, environments, runs } from "@sky/db";
 import type { AgentId, AutoApprove, EnvironmentId, RunId } from "@sky/shared";
 import { and, eq } from "drizzle-orm";
@@ -23,6 +22,7 @@ import {
 } from "./secrets.js";
 import {
   execInSprite,
+  type SpriteOps,
   spriteExists,
   startDetached,
   writeSpriteFile,
@@ -46,18 +46,18 @@ export const runnerPattern = (runId: RunId) =>
  * is logged, not thrown; a runner already gone counts as signalled.
  */
 export async function signalRunner(
-  sprites: SpritesClient,
+  sprites: SpriteOps,
   spriteName: string,
   runId: RunId,
   log: (line: string) => void,
 ): Promise<void> {
   try {
-    const out = await execInSprite(sprites, spriteName, [
-      "pkill",
-      "-TERM",
-      "-f",
-      runnerPattern(runId),
-    ]);
+    const out = await execInSprite(
+      sprites,
+      spriteName,
+      ["pkill", "-TERM", "-f", runnerPattern(runId)],
+      { op: "pkill" },
+    );
     // pkill exits 1 when nothing matched
     if (out.exitCode > 1) {
       log(`signalling the runner of ${runId} failed: ${out.stderr.trim()}`);
@@ -67,7 +67,8 @@ export async function signalRunner(
   }
 }
 
-// exit 0 once nothing matches, 1 while a runner still does after 30 s; pgrep's own errors exit 2
+// exit 0 once nothing matches, 1 while a runner still does after 30 s; pgrep's own errors exit 2.
+// The wait stays well under `sprites.timeoutMs`, which bounds the exec
 const AWAIT_EXIT_OR_REPORT = `for _ in $(seq 30); do pgrep -f "$1" >/dev/null; case $? in 1) exit 0;; 0) sleep 1;; *) exit 2;; esac; done; exit 1`;
 
 /**
@@ -75,23 +76,23 @@ const AWAIT_EXIT_OR_REPORT = `for _ in $(seq 30); do pgrep -f "$1" >/dev/null; c
  * Throws when the sprite can't answer.
  */
 export async function awaitRunnerExit(
-  sprites: SpritesClient,
+  sprites: SpriteOps,
   spriteName: string,
   runId: RunId,
 ): Promise<boolean> {
-  const out = await execInSprite(sprites, spriteName, [
-    "bash",
-    "-c",
-    AWAIT_EXIT_OR_REPORT,
-    "_",
-    runnerPattern(runId),
-  ]);
+  const out = await execInSprite(
+    sprites,
+    spriteName,
+    ["bash", "-c", AWAIT_EXIT_OR_REPORT, "_", runnerPattern(runId)],
+    { op: "await-exit" },
+  );
   if (out.exitCode === 0) return true;
   if (out.exitCode === 1) return false;
   throw new Error(`exit ${out.exitCode}: ${out.stderr.trim()}`);
 }
 
-// bounded: a runner that outlives the wait loses whatever its commit hadn't written
+// bounded: a runner that outlives the wait loses whatever its commit hadn't written; the 30 s stays
+// well under `sprites.timeoutMs`, which bounds the exec
 const AWAIT_RUNNER_EXIT = `for _ in $(seq 30); do pgrep -f "$2" >/dev/null || break; sleep 1; done; `;
 // a worktree the runner never created (or whose directory is gone) counts as removed
 const REMOVE_WORKTREE = `git worktree remove --force "$1" || ! test -e "$1"`;
@@ -101,7 +102,7 @@ const REMOVE_WORKTREE = `git worktree remove --force "$1" || ! test -e "$1"`;
  * runner to exit, so the commit it makes on SIGTERM lands. Throws when the removal fails.
  */
 export async function removeWorktree(
-  sprites: SpritesClient,
+  sprites: SpriteOps,
   spriteName: string,
   agentId: AgentId,
   stoppedRunId: RunId | null,
@@ -117,7 +118,10 @@ export async function removeWorktree(
         runnerPattern(stoppedRunId),
       ]
     : ["bash", "-c", REMOVE_WORKTREE, "_", path];
-  const out = await execInSprite(sprites, spriteName, argv, { cwd: REPO_DIR });
+  const out = await execInSprite(sprites, spriteName, argv, {
+    op: "rm-worktree",
+    cwd: REPO_DIR,
+  });
   if (out.exitCode !== 0) {
     throw new Error(`exit ${out.exitCode}: ${out.stderr.trim()}`);
   }
@@ -127,7 +131,7 @@ type Deps = {
   db: Db;
   config: Config;
   secrets: KnownSecrets;
-  sprites: SpritesClient;
+  sprites: SpriteOps;
   ensureBundle: BundleInstaller;
   log: (line: string) => void;
   nudgeDeliveries: () => void;
@@ -163,6 +167,7 @@ export function createLauncher({
   watchMs,
 }: Deps) {
   async function run(launch: Launch, agentToken: string): Promise<void> {
+    const known = [agentToken];
     await ensureBundle(launch.spriteName, launch.runId);
     const promptFile = `/workspace/runs/${launch.runId}.prompt`;
     await writeSpriteFile(
@@ -170,6 +175,7 @@ export function createLauncher({
       launch.spriteName,
       promptFile,
       launch.prompt,
+      { op: "write-prompt", known },
     );
     // a stop that landed mid-launch found no runner to signal
     const current = db
@@ -222,7 +228,7 @@ export function createLauncher({
         ["CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken],
         ["AGENT_TOKEN", agentToken],
       ]),
-      { mode: 0o600 },
+      { op: "write-env-file", mode: 0o600, known },
     );
     await startDetached(
       sprites,
@@ -244,14 +250,20 @@ export function createLauncher({
           ...(launch.sessionId ? { SESSION_ID: launch.sessionId } : {}),
         },
         watchMs,
+        op: "start-runner",
+        known,
       },
     ).catch(async (err: unknown) => {
       // the runner never started, so nothing else deletes the file its secrets sit in
-      await execInSprite(sprites, launch.spriteName, [
-        "rm",
-        "-f",
-        envFilePath,
-      ]).catch(() => {});
+      await execInSprite(
+        sprites,
+        launch.spriteName,
+        ["rm", "-f", envFilePath],
+        {
+          op: "rm-env-file",
+          known,
+        },
+      ).catch(() => {});
       throw err;
     });
   }
