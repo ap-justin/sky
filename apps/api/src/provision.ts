@@ -30,7 +30,9 @@ const installRunnerSdk = `[ -w ${RUNNER_DIR} ] || sudo install -d -o "$(id -u)" 
  * Installs, for the sprite's user, the plugins the clone's `.claude/settings.json` enables, after
  * adding the `extraKnownMarketplaces` entries they come from. A headless session honors
  * `enabledPlugins` only for a plugin already installed; it never fetches one. Runs as `node -e` in
- * the clone with the runner dir as its argument, so it uses the `claude` the SDK bundles.
+ * the clone with the runner dir as its argument, so it uses the `claude` the SDK bundles. It runs
+ * after the env's setup, which may add a marketplace the settings don't declare, so a plugin whose
+ * marketplace is known by neither fails naming it before any install.
  * `$HOME/.claude` outlives reprovisioning and a repeat add or install fetches nothing, so every
  * run refreshes the marketplaces and updates each plugin.
  */
@@ -82,11 +84,30 @@ const addArgs = (name, source) => {
   if (type === "directory" || type === "file") return [path];
   fail(name, "unsupported source: " + type);
 };
-const used = new Set(plugins.map((p) => p.slice(p.lastIndexOf("@") + 1)));
+const marketplaceOf = (plugin) => plugin.slice(plugin.lastIndexOf("@") + 1);
+const used = new Set(plugins.map(marketplaceOf));
 const adds = Object.entries(settings.extraKnownMarketplaces ?? {})
   .filter(([name]) => used.has(name))
   .map(([name, entry]) => addArgs(name, entry?.source));
 for (const args of adds) claude("plugin", "marketplace", "add", ...args);
+let listed;
+try {
+  listed = execFileSync(sdk + "/" + platform + "/claude", ["plugin", "marketplace", "list", "--json"], {
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "inherit"],
+  });
+} catch (err) {
+  process.exit(err.status || 1);
+}
+const known = new Set(JSON.parse(listed).map((m) => m.name));
+const missing = plugins.filter((p) => !known.has(marketplaceOf(p)));
+for (const plugin of missing) {
+  console.error(
+    'plugin "' + plugin + '" in ' + file + ': marketplace "' + marketplaceOf(plugin) + '" is not known; declare it in ' +
+      'extraKnownMarketplaces, or add it in the setup with "$SKY_CLAUDE" plugin marketplace add <source>',
+  );
+}
+if (missing.length > 0) process.exit(1);
 claude("plugin", "marketplace", "update");
 for (const plugin of plugins) claude("plugin", "install", plugin, "--scope", "user");
 for (const plugin of plugins) claude("plugin", "update", plugin, "--scope", "user");
@@ -115,8 +136,12 @@ const PACKAGE_MANAGERS_DIR = "$HOME/.local/bin";
  * download prompt off, since with a TTY it can stop to ask before fetching a package manager.
  */
 export const WITH_PACKAGE_MANAGERS = `export PATH="${PACKAGE_MANAGERS_DIR}:$PATH" COREPACK_ENABLE_DOWNLOAD_PROMPT=0`;
-// enables the shims, then execs its argv (the setup); enabling again on a rerun is harmless
-const PREPARE_SETUP = `mkdir -p "${PACKAGE_MANAGERS_DIR}" && corepack enable --install-directory "${PACKAGE_MANAGERS_DIR}" && ${WITH_PACKAGE_MANAGERS} && exec "$@"`;
+/**
+ * Points `SKY_CLAUDE` at the SDK's bundled `claude`, so a setup can add a marketplace the plugin step
+ * then installs from; the first one that runs, since a glob can also match the other libc's build.
+ * Then enables the shims and execs its argv (the setup); enabling again on a rerun is harmless.
+ */
+const PREPARE_SETUP = `for c in ${RUNNER_DIR}/node_modules/@anthropic-ai/claude-agent-sdk-*/claude; do "$c" --version >/dev/null 2>&1 && export SKY_CLAUDE="$c" && break; done; mkdir -p "${PACKAGE_MANAGERS_DIR}" && corepack enable --install-directory "${PACKAGE_MANAGERS_DIR}" && ${WITH_PACKAGE_MANAGERS} && exec "$@"`;
 // ≤ the length CHECK on environments.failure_stderr in db/src/schema.ts
 const TAIL_CHARS = 4000;
 
@@ -256,15 +281,15 @@ export function createProvisioner({
         "/tmp/sky-sdk.log",
       );
       await execNoisy(
-        ["node", "-e", INSTALL_PLUGINS, RUNNER_DIR],
-        "install-plugins",
-        "/tmp/sky-plugins.log",
-        { cwd: REPO_DIR },
-      );
-      await execNoisy(
         ["sh", "-c", PREPARE_SETUP, "sh", "bash", "-c", env.setup],
         "setup",
         "/tmp/sky-setup.log",
+        { cwd: REPO_DIR },
+      );
+      await execNoisy(
+        ["node", "-e", INSTALL_PLUGINS, RUNNER_DIR],
+        "install-plugins",
+        "/tmp/sky-plugins.log",
         { cwd: REPO_DIR },
       );
       await checkoutKruStore(env.id, name);
