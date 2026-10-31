@@ -65,12 +65,15 @@ const get = async (id: string) => {
 };
 
 /** Polls the env until its background provisioning ends. */
-const settled = (id: string) =>
-  vi.waitFor(async () => {
-    const { body } = await get(id);
-    expect(body.status).not.toBe("provisioning");
-    return body;
-  });
+const settled = (id: string, timeout = 1_000) =>
+  vi.waitFor(
+    async () => {
+      const { body } = await get(id);
+      expect(body.status).not.toBe("provisioning");
+      return body;
+    },
+    { timeout },
+  );
 
 const kru = { name: "kru", repo: "acme/kru", setup: "pnpm install" };
 
@@ -158,6 +161,7 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
   expect(wire.calls).toEqual([
     `get ${sprite}`,
     `create ${sprite}`,
+    `label ${sprite}`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
@@ -166,6 +170,123 @@ test("POST returns 202 provisioning, then the sprite is created, cloned, set up 
     `exec ${sprite} - ${ENV_FILES_RM}`,
     `checkpoint ${sprite}`,
   ]);
+});
+
+const labelLines = (logged: string[]) =>
+  logged.filter((line) => / label: (failed|timed out)/.test(line));
+
+test("a new sprite is labeled with its env, repo and base role by a PUT carrying only the labels, its url settings untouched", async () => {
+  const logged: string[] = [];
+  app = createApp({
+    db,
+    config: testConfig(),
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logged.push(line),
+    nudgeDeliveries: () => {},
+  });
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+  const sprite = spriteNameFor(id);
+  expect(wire.updates.get(sprite)).toEqual({
+    labels: ["sky", `env:${id}`, "repo:acme/kru", "role:base"],
+  });
+  expect(wire.stored.get(sprite)?.url_settings).toEqual({ auth: "sprite" });
+  expect(labelLines(logged)).toEqual([]);
+});
+
+test("a label call that fails is attempted, logged once with the sprite and cause, and provisioning still succeeds", async () => {
+  const logged: string[] = [];
+  app = createApp({
+    db,
+    config: testConfig(),
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logged.push(line),
+    nudgeDeliveries: () => {},
+  });
+  wire.updateStatus = 500;
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  const sprite = spriteNameFor(id);
+  expect(await settled(id)).toMatchObject({
+    status: "ready",
+    checkpointId: "v1",
+    failure: null,
+  });
+  expect(wire.calls).toContain(`label ${sprite}`);
+  expect(wire.updates.size).toBe(0);
+  expect(labelLines(logged)).toEqual([
+    expect.stringMatching(
+      new RegExp(`^sprite ${sprite} label: failed in \\d+ms: .+`),
+    ),
+  ]);
+});
+
+test("a label call that hangs is cut at the Sprites bound, logged once, and provisioning goes on", {
+  timeout: 10_000,
+}, async () => {
+  const logged: string[] = [];
+  // only label calls hang, and the bound leaves every other call ample room on a slow runner
+  app = createApp({
+    db,
+    config: testConfig(),
+    sprites: new SpritesClient(spritesToken),
+    spritesTimeoutMs: 1_500,
+    log: (line) => logged.push(line),
+    nudgeDeliveries: () => {},
+  });
+  wire.hangs = (call) => call.startsWith("label ");
+  // the SDK's update takes no signal, so the hung PUT outlives the bound; the finally keeps it inside this test
+  wire.hangMs = 2_000;
+  try {
+    const { id } = (await (await post(kru)).json()) as { id: string };
+    const sprite = spriteNameFor(id);
+    expect(await settled(id, 4_000)).toMatchObject({
+      status: "ready",
+      failure: null,
+    });
+    expect(wire.calls).toContain(`label ${sprite}`);
+    expect(labelLines(logged)).toEqual([
+      `sprite ${sprite} label: timed out after 1500ms`,
+    ]);
+  } finally {
+    await wire.hangsSettled();
+  }
+});
+
+test("an existing sprite is relabeled when the repo changes, its url settings kept", async () => {
+  const id = await ready();
+  const sprite = spriteNameFor(id);
+  expect(wire.stored.get(sprite)?.labels).toContain("repo:acme/kru");
+  // set outside sky after the first provision; a relabel must not reset it
+  wire.stored.set(sprite, {
+    labels: wire.stored.get(sprite)?.labels ?? [],
+    url_settings: { auth: "public" },
+  });
+  expect((await patch(id, { repo: "acme/other" })).status).toBe(202);
+  await settled(id);
+  expect(wire.updates.get(sprite)).toEqual({
+    labels: ["sky", `env:${id}`, "repo:acme/other", "role:base"],
+  });
+  expect(wire.stored.get(sprite)).toEqual({
+    labels: ["sky", `env:${id}`, "repo:acme/other", "role:base"],
+    url_settings: { auth: "public" },
+  });
+});
+
+test("a label that failed on first provision lands when the env is retried", async () => {
+  wire.updateStatus = 500;
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  await settled(id);
+  const sprite = spriteNameFor(id);
+  expect(wire.stored.get(sprite)?.labels).toEqual([]);
+  wire.updateStatus = 200;
+  expect(
+    (await patch(id, { setup: "pnpm install --frozen-lockfile" })).status,
+  ).toBe(202);
+  expect(await settled(id)).toMatchObject({ status: "ready", failure: null });
+  expect(wire.stored.get(sprite)).toEqual({
+    labels: ["sky", `env:${id}`, "repo:acme/kru", "role:base"],
+    url_settings: { auth: "sprite" },
+  });
 });
 
 test("the setup script finds pnpm though the sprite ships only node, and a rerun finds it too", async () => {
@@ -905,6 +1026,7 @@ test("PATCH that changes setup reruns setup and replaces checkpointId", async ()
   const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
+    `label ${sprite}`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
@@ -969,6 +1091,7 @@ test("with a connector, provisioning checks the Kru store out through the runner
   const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
+    `label ${sprite}`,
     // the runner loads the SDK at startup, so a fresh sprite's repo-pull needs it installed first
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
@@ -1600,6 +1723,7 @@ test("retry of a setup failure reruns provisioning on the same spec and ends rea
   const sprite = spriteNameFor(id);
   expect(wire.calls).toEqual([
     `get ${sprite}`,
+    `label ${sprite}`,
     `exec ${sprite} - sh -c ${installRunnerSdk} &> /tmp/sky-sdk.log`,
     `exec ${sprite} - rm -rf /workspace/repo /workspace/worktrees`,
     `exec ${sprite} - git clone https://github.com/acme/kru.git /workspace/repo &> /tmp/sky-clone.log`,
