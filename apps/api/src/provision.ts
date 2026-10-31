@@ -1,4 +1,3 @@
-import type { SpritesClient } from "@fly/sprites";
 import { type Db, type environmentFailureSteps, environments } from "@sky/db";
 import type { EnvironmentId } from "@sky/shared";
 import { eq, sql } from "drizzle-orm";
@@ -11,6 +10,7 @@ import {
   ensureSprite,
   execInSprite,
   execLogged,
+  type SpriteOps,
   spriteNameFor,
   writeSpriteFile,
 } from "./sprites.js";
@@ -129,7 +129,7 @@ type Deps = {
   db: Db;
   secretEncryptionKey: Buffer;
   secrets: KnownSecrets;
-  sprites: SpritesClient;
+  sprites: SpriteOps;
   ensureBundle: BundleInstaller;
   log: (line: string) => void;
 };
@@ -138,7 +138,8 @@ type Target = { id: EnvironmentId; repo: string; setup: string };
 /**
  * Runs provisioning as in-process background jobs. A failure lands in `failure_step` and
  * `failure_stderr`: the failed command's output tail (stdout and stderr together), or the Sprites
- * error for create/checkpoint.
+ * error for create/checkpoint, a timeout's included. Clone, installs, setup and checkpoint are bounded
+ * by `sprites.longTimeoutMs`, every other call by `sprites.timeoutMs`.
  */
 export function createProvisioner({
   db,
@@ -150,8 +151,8 @@ export function createProvisioner({
 }: Deps) {
   async function run(env: Target): Promise<void> {
     const name = spriteNameFor(env.id);
-    const exec = async (argv: [string, ...string[]]) => {
-      const out = await execInSprite(sprites, name, argv);
+    const exec = async (argv: [string, ...string[]], op: string) => {
+      const out = await execInSprite(sprites, name, argv, { op });
       if (out.exitCode !== 0) {
         throw new StepFailed(out.stderr || `exited with code ${out.exitCode}`);
       }
@@ -159,10 +160,14 @@ export function createProvisioner({
     // clone, install and setup print plenty, so their output stays in a log in the sprite
     const execNoisy = async (
       argv: [string, ...string[]],
+      op: string,
       log: string,
-      cwd?: string,
+      { cwd, known }: { cwd?: string; known?: readonly string[] } = {},
     ) => {
       const out = await execLogged(sprites, name, argv, {
+        op,
+        timeoutMs: sprites.longTimeoutMs,
+        known,
         cwd,
         log,
         tailBytes: TAIL_CHARS,
@@ -176,8 +181,8 @@ export function createProvisioner({
      * transport, so the Kru store (private) is checked out by the runner's `store-sync pull`, then
      * the store's own `setup.sh` runs, as the cloud setup script does after its clone. `~/.kru`
      * outlives reprovisioning and a pull merges what is there, so this is safe to repeat. Without
-     * a connector secret there is nothing to reach GitHub with. A failure is logged and never
-     * fails provisioning: each run's own pull tries again.
+     * a connector secret there is nothing to reach GitHub with. A failure, a timeout included, is
+     * logged and never fails provisioning: each run's own pull tries again.
      */
     const checkoutKruStore = async (
       envId: EnvironmentId,
@@ -189,26 +194,34 @@ export function createProvisioner({
         stored = openEnvSecrets(db, secretEncryptionKey, envId);
         // the runner's own off switch, which it reads from the same env on every run
         if (stored.get("KRU_NO_STORE_SYNC")) return;
+        const known = [...stored.values()];
         await ensureBundle(sprite, `provision-${envId}`);
         await writeSpriteFile(
           sprites,
           sprite,
           STORE_ENV_FILE,
           envFile([...stored, ["KRU_STORE_REPO", KRU_STORE_REPO]]),
-          { mode: 0o600 },
+          { op: "write-store-env", mode: 0o600, known },
         );
         try {
           await execNoisy(
             ["sh", "-c", PULL_STORE, "sh", STORE_ENV_FILE],
+            "store-pull",
             "/tmp/sky-kru-store.log",
+            { known },
           );
           await execNoisy(
             ["bash", "-c", RUN_STORE_SETUP, "bash", STORE_ENV_FILE],
+            "store-setup",
             "/tmp/sky-kru-setup.log",
+            { known },
           );
         } finally {
           // the checkpoint must not keep the env's secrets
-          await execInSprite(sprites, sprite, ["rm", "-f", STORE_ENV_FILE]);
+          await execInSprite(sprites, sprite, ["rm", "-f", STORE_ENV_FILE], {
+            op: "rm-store-env",
+            known,
+          });
         }
       } catch (err) {
         const detail = err instanceof Error ? err.message : String(err);
@@ -230,22 +243,29 @@ export function createProvisioner({
       begin("create");
       await ensureSprite(sprites, name);
       begin("clone");
-      await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR]);
+      await exec(["rm", "-rf", REPO_DIR, WORKTREES_DIR], "rm-repo");
       await execNoisy(
         ["git", "clone", cloneUrl(env.repo), REPO_DIR],
+        "clone",
         "/tmp/sky-clone.log",
       );
       begin("setup");
-      await execNoisy(["sh", "-c", installRunnerSdk], "/tmp/sky-sdk.log");
+      await execNoisy(
+        ["sh", "-c", installRunnerSdk],
+        "install-sdk",
+        "/tmp/sky-sdk.log",
+      );
       await execNoisy(
         ["node", "-e", INSTALL_PLUGINS, RUNNER_DIR],
+        "install-plugins",
         "/tmp/sky-plugins.log",
-        REPO_DIR,
+        { cwd: REPO_DIR },
       );
       await execNoisy(
         ["sh", "-c", PREPARE_SETUP, "sh", "bash", "-c", env.setup],
+        "setup",
         "/tmp/sky-setup.log",
-        REPO_DIR,
+        { cwd: REPO_DIR },
       );
       await checkoutKruStore(env.id, name);
       begin("checkpoint");

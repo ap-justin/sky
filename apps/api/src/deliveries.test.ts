@@ -9,6 +9,7 @@ import {
   webhookDeliveries,
 } from "@sky/db";
 import type { AgentId, EnvironmentId, RunId } from "@sky/shared";
+import { eq } from "drizzle-orm";
 import { HttpResponse, http } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
@@ -501,6 +502,122 @@ test("after 30 failed attempts the delivery is failed and never tried again", as
   expect(logs.at(-1)).toMatch(
     /^warn: webhook whk_\w+ evt_\d+: attempt 30\/30 failed: status 503; giving up$/,
   );
+});
+
+/** A subscriber answering every POST with a 429, carrying `retryAfter` when given. */
+function rateLimited(retryAfter?: string, url = subscriberUrl) {
+  const received: string[] = [];
+  server.use(
+    http.post(url, async ({ request }) => {
+      received.push(await request.text());
+      return new HttpResponse(null, {
+        status: 429,
+        headers: retryAfter === undefined ? {} : { "Retry-After": retryAfter },
+      });
+    }),
+  );
+  return received;
+}
+
+const finishRun = async () => {
+  const { runId, token } = runningRun();
+  await postEvent(token, {
+    runId,
+    type: "run.finished",
+    payload: { summary: "ok", usage },
+  });
+  await dispatcher.drain();
+};
+
+test.each([
+  ["delta-seconds", () => "120", () => 120_000],
+  [
+    "an HTTP-date",
+    () => new Date(clock.getTime() + 300_000).toUTCString(),
+    () =>
+      Date.parse(new Date(clock.getTime() + 300_000).toUTCString()) -
+      clock.getTime(),
+  ],
+  ["a value past the 1 h cap", () => "86400", () => 3_600_000],
+  ["a date in the past", () => new Date(0).toUTCString(), () => 5_000],
+  ["zero", () => "0", () => 5_000],
+  ["an unparseable value", () => "soon", () => 10_000],
+])(
+  "a 429 with Retry-After as %s sets the next attempt from it",
+  async (_, header, delayMs) => {
+    await subscribe(["run.finished"]);
+    rateLimited(header());
+    await finishRun();
+    expect(deliveries()).toEqual([
+      expect.objectContaining({
+        status: "pending",
+        attempts: 1,
+        lastStatus: 429,
+        nextAttemptAt: new Date(clock.getTime() + delayMs()).toISOString(),
+      }),
+    ]);
+  },
+);
+
+test("a 429 without Retry-After backs off as any failed attempt does", async () => {
+  await subscribe(["run.finished"]);
+  rateLimited();
+  await finishRun();
+  expect(deliveries()).toEqual([
+    expect.objectContaining({
+      attempts: 1,
+      lastStatus: 429,
+      nextAttemptAt: new Date(clock.getTime() + 10_000).toISOString(),
+    }),
+  ]);
+});
+
+test("a 429 holds the webhook's other pending deliveries, without spending their attempts, while another webhook's are still sent", async () => {
+  const limited = await subscribe(["claude.PostToolUse"]);
+  const other = await subscribe(
+    ["claude.PostToolUse"],
+    "https://b.example.com/h",
+  );
+  await dispatcher.stop();
+  const { runId, token } = runningRun();
+  for (const toolUseId of ["tu_1", "tu_2"]) {
+    const payload = { toolName: "Bash", toolUseId, input: "{}", output: "" };
+    await postEvent(token, { runId, type: "claude.PostToolUse", payload });
+  }
+  // the second of the limited webhook's deliveries comes due after the 429 lands, before it expires
+  const [, held] = deliveries().filter((d) => d.webhookId === limited);
+  db.update(webhookDeliveries)
+    .set({ nextAttemptAt: new Date(clock.getTime() + 30_000).toISOString() })
+    .where(eq(webhookDeliveries.id, held?.id ?? -1))
+    .run();
+  const a = rateLimited("120");
+  const b = subscriber([200, 200], "https://b.example.com/h");
+  dispatcher = createDispatcher({
+    db,
+    signingKey: config.webhookSigningKey,
+    log: () => {},
+    now: () => clock,
+    random: () => 0.5,
+  });
+  await dispatcher.drain();
+  expect([a.length, b.length]).toEqual([1, 2]);
+  const retryAt = new Date(clock.getTime() + 120_000).toISOString();
+  expect(
+    deliveries().map((d) => [
+      d.webhookId,
+      d.status,
+      d.attempts,
+      d.nextAttemptAt,
+    ]),
+  ).toEqual([
+    [limited, "pending", 1, retryAt],
+    [other, "delivered", 1, expect.any(String)],
+    [limited, "pending", 0, retryAt],
+    [other, "delivered", 1, expect.any(String)],
+  ]);
+  advance(60_000);
+  await dispatcher.drain();
+  expect(a).toHaveLength(1);
 });
 
 test("pending deliveries left by a previous process are sent once a dispatcher starts", async () => {

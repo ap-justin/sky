@@ -18,6 +18,7 @@ import { createProvisioner } from "./provision.js";
 import { KnownSecrets } from "./redact.js";
 import { createBundleInstaller } from "./runner-bundle.js";
 import { registerStoredValues, secretRoutes } from "./secrets.js";
+import { SPRITES_TIMEOUT_MS, type SpriteOps } from "./sprites.js";
 import { webhookRoutes } from "./webhooks.js";
 
 export type AppDeps = {
@@ -33,6 +34,8 @@ export type AppDeps = {
   longPollMs?: number;
   /** How long a launch watches its runner for an exit at start; 3 s unless a test shortens it. */
   launchWatchMs?: number;
+  /** The bound on a Sprites call that should answer promptly; 60 s unless a test shortens it. */
+  spritesTimeoutMs?: number;
   /** The redaction registry, shared with whatever else purges from it; one from `config` by default. */
   secrets?: KnownSecrets;
   /** Aborted at shutdown: event streams send a final `server.shutdown` frame and end, parked event polls answer. */
@@ -48,6 +51,7 @@ export function createApp({
   heartbeatMs = 15_000,
   longPollMs = 25_000,
   launchWatchMs = 3_000,
+  spritesTimeoutMs = SPRITES_TIMEOUT_MS,
   secrets = KnownSecrets.fromConfig(config),
   closing = new AbortController().signal,
 }: AppDeps) {
@@ -56,12 +60,22 @@ export function createApp({
     apiError(c, 401, "unauthorized", message);
 
   registerStoredValues(db, config.secretEncryptionKey, secrets);
-  const ensureBundle = createBundleInstaller(sprites, config.runnerBundlePath);
+  const spriteOps: SpriteOps = {
+    client: sprites,
+    log,
+    secrets,
+    timeoutMs: spritesTimeoutMs,
+    longTimeoutMs: config.spritesLongTimeoutMs,
+  };
+  const ensureBundle = createBundleInstaller(
+    spriteOps,
+    config.runnerBundlePath,
+  );
   const provisioner = createProvisioner({
     db,
     secretEncryptionKey: config.secretEncryptionKey,
     secrets,
-    sprites,
+    sprites: spriteOps,
     ensureBundle,
     log,
   });
@@ -69,7 +83,7 @@ export function createApp({
     db,
     config,
     secrets,
-    sprites,
+    sprites: spriteOps,
     ensureBundle,
     log,
     nudgeDeliveries,
@@ -91,9 +105,9 @@ export function createApp({
   });
   const v1 = factory
     .createApp()
-    .route("/environments", environmentRoutes(provisioner, sprites, log))
+    .route("/environments", environmentRoutes(provisioner, spriteOps, log))
     .route("/environments", secretRoutes())
-    .route("/agents", agentRoutes(launcher, sprites, log, heartbeatMs))
+    .route("/agents", agentRoutes(launcher, spriteOps, log, heartbeatMs))
     .route("/webhooks", webhookRoutes())
     .route("/", accountEventRoutes(heartbeatMs, log));
 

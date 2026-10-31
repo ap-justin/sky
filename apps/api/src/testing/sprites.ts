@@ -17,6 +17,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   runnerBundlePath: "/unused/runner.mjs",
   cliBundlePath: "/unused/sky.mjs",
   runTimeoutMs: 30 * 60_000,
+  spritesLongTimeoutMs: 30 * 60_000,
   waitTimeoutMs: 120 * 60_000,
   webhookSigningKey: "webhook-signing-key-for-tests-0123456789",
   secretEncryptionKey: Buffer.alloc(32, 1),
@@ -123,12 +124,24 @@ export function stubSprites() {
      * intermediary may re-chunk them; the SDK takes each read to start a frame, so this breaks it.
      */
     execChunkBytes: undefined as number | undefined,
+    /**
+     * A call whose `calls` line this matches gets no answer until the client aborts it (or 5 s
+     * pass, then a 503), as a Sprites API that hangs.
+     */
+    hangs: (_call: string): boolean => false,
     createStatus: 201,
     writeStatus: 200,
     checkpointLines: undefined as object[] | undefined,
     deleteStatus: 204,
   };
   let checkpoints = 0;
+  const hang = (request: Request) =>
+    new Promise<Response>((resolve) => {
+      const answer = () =>
+        resolve(HttpResponse.json({ error: "hung" }, { status: 503 }));
+      request.signal.addEventListener("abort", answer, { once: true });
+      setTimeout(answer, 5_000).unref();
+    });
   const authorized = (request: Request) =>
     request.headers.get("authorization") === `Bearer ${spritesToken}`;
 
@@ -163,11 +176,11 @@ export function stubSprites() {
         argv[0] === "sh" && argv[1] === "-c" && argv[2] === LOGGED_EXEC
           ? { log: argv[4] ?? "", bytes: Number(argv[5]), argv: argv.slice(6) }
           : undefined;
-      wire.calls.push(
-        `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${
-          logged ? `${logged.argv.join(" ")} &> ${logged.log}` : argv.join(" ")
-        }`,
-      );
+      const call = `exec ${name} ${url.searchParams.get("dir") ?? "-"} ${
+        logged ? `${logged.argv.join(" ")} &> ${logged.log}` : argv.join(" ")
+      }`;
+      wire.calls.push(call);
+      if (wire.hangs(call)) return hang(request);
       if (!wire.sprites.has(name)) {
         return HttpResponse.json({ error: "not found" }, { status: 404 });
       }
@@ -215,6 +228,7 @@ export function stubSprites() {
       const query = new URL(request.url).searchParams;
       const path = query.get("path") ?? "";
       wire.calls.push(`write ${name} ${path}`);
+      if (wire.hangs(`write ${name} ${path}`)) return hang(request);
       const mode = query.get("mode");
       if (mode) wire.modes.set(path, mode);
       if (wire.writeStatus !== 200) {

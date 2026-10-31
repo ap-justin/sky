@@ -1,4 +1,3 @@
-import type { SpritesClient } from "@fly/sprites";
 import { zValidator } from "@hono/zod-validator";
 import { agents, type Db, environments, runs } from "@sky/db";
 import {
@@ -43,7 +42,7 @@ import {
   reservedName,
   storeRunEnvVars,
 } from "./secrets.js";
-import { execInSprite } from "./sprites.js";
+import { execInSprite, type SpriteOps } from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
 
 const Prompt = z.string().min(1);
@@ -182,7 +181,7 @@ const WAKE_TIMEOUT_MS = 15_000;
  */
 async function decide(
   c: Context<AppEnv>,
-  sprites: SpritesClient,
+  sprites: SpriteOps,
   log: (line: string) => void,
   agentId: AgentId,
   decision: Decision,
@@ -237,7 +236,8 @@ async function decide(
   // a failed wake is only logged: the decision is already recorded
   try {
     await execInSprite(sprites, outcome.spriteName, ["true"], {
-      timeout: WAKE_TIMEOUT_MS,
+      op: "wake",
+      timeoutMs: WAKE_TIMEOUT_MS,
     });
   } catch (err) {
     log(`waking ${outcome.spriteName} for ${outcome.run.id} failed: ${err}`);
@@ -284,7 +284,7 @@ const lastEventId = zValidator(
 
 export function agentRoutes(
   launcher: Launcher,
-  sprites: SpritesClient,
+  sprites: SpriteOps,
   log: (line: string) => void,
   heartbeatMs: number,
 ) {
@@ -621,7 +621,7 @@ export function agentRoutes(
             sprites,
             spriteName,
             ["git", "diff", `origin/HEAD...${agent.branch}`],
-            { cwd: REPO_DIR },
+            { op: "diff", cwd: REPO_DIR },
           );
           // nonzero: the runner never created the branch (a launch that failed)
           if (out.exitCode === 0) {

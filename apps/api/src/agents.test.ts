@@ -544,6 +544,32 @@ test("a launch the sprite rejects fails the run with a redacted error and frees 
   expect(wire.sessions).toEqual([]);
 });
 
+test("a launch whose file write hangs past its bound fails the run with launch_failed naming the timeout", async () => {
+  app = createApp({
+    db,
+    config,
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logs.push(line),
+    nudgeDeliveries: () => {},
+    launchWatchMs: 50,
+    spritesTimeoutMs: 300,
+  });
+  wire.hangs = (call) => call.endsWith(".prompt");
+  const envId = readyEnv();
+  const sprite = spriteNameFor(envId);
+  const { run } = await launched(envId);
+  await vi.waitFor(() =>
+    expect(runStatus(run.id)).toMatchObject({ status: "failed" }),
+  );
+  expect(runFailure(run.id)).toBe(
+    `launch_failed: sprite ${sprite}: write-prompt timed out after 300 ms`,
+  );
+  expect(logs).toContain(
+    `sprite ${sprite} write-prompt: timed out after 300ms`,
+  );
+  expect(wire.sessions).toEqual([]);
+});
+
 const envRow = (id: string) =>
   db.$client
     .prepare(

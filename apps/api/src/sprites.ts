@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
+import { type KnownSecrets, redact } from "./redact.js";
 
 /**
  * The one sprite an environment owns. Hashed because the API rejects names outside lowercase
@@ -8,51 +9,149 @@ import { APIError, ExecError, type SpritesClient } from "@fly/sprites";
 export const spriteNameFor = (envId: string) =>
   `sky-${createHash("sha256").update(envId).digest("hex").slice(0, 24)}`;
 
+/** The Sprites client, with what every call through `spriteCall` logs to and is bounded by. */
+export type SpriteOps = {
+  client: SpritesClient;
+  log: (line: string) => void;
+  secrets: KnownSecrets;
+  /** The bound on a call that should answer promptly: a file write, a check, a short command. */
+  timeoutMs: number;
+  /** The bound on clone, installs, the setup script, the Kru store steps and checkpoint. */
+  longTimeoutMs: number;
+};
+
+export const SPRITES_TIMEOUT_MS = 60_000;
+
+export type CallOptions = {
+  /** A fixed short name for the log and a timeout's error; never argv or a user's script. */
+  op: string;
+  /** `ops.timeoutMs` when absent. */
+  timeoutMs?: number;
+  /** Values the caller holds, scrubbed from the log alongside `ops.secrets`. */
+  known?: readonly string[];
+};
+
+export class SpriteTimeoutError extends Error {}
+
+const formatBound = (ms: number) =>
+  ms % 60_000 === 0
+    ? `${ms / 60_000} min`
+    : ms % 1000 === 0
+      ? `${ms / 1000} s`
+      : `${ms} ms`;
+
+/**
+ * Runs one Sprites call, bounded by `timeoutMs`, logging a start line and an end line (ok, failed,
+ * or timed out, with the duration). At the bound it aborts `signal`, for `call` to cut its request
+ * or close what it holds, and rejects with a `SpriteTimeoutError` naming sprite, op and bound
+ * whether or not `call` ever settles. `outcome` words a resolved value for the end line.
+ */
+export async function spriteCall<T>(
+  ops: SpriteOps,
+  name: string,
+  { op, timeoutMs = ops.timeoutMs, known = [] }: CallOptions,
+  call: (signal: AbortSignal) => Promise<T>,
+  outcome: (value: T) => string = () => "ok",
+): Promise<T> {
+  const log = (line: string) =>
+    ops.log(
+      redact(`sprite ${name} ${op}: ${line}`, [
+        ...ops.secrets.values(),
+        ...known,
+      ]),
+    );
+  log("start");
+  const started = Date.now();
+  const abort = new AbortController();
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new SpriteTimeoutError(
+        `sprite ${name}: ${op} timed out after ${formatBound(timeoutMs)}`,
+      );
+      abort.abort(err);
+      reject(err);
+    }, timeoutMs);
+  });
+  try {
+    const value = await Promise.race([call(abort.signal), timedOut]);
+    log(`${outcome(value)} in ${Date.now() - started}ms`);
+    return value;
+  } catch (err) {
+    log(
+      err instanceof SpriteTimeoutError
+        ? `timed out after ${timeoutMs}ms`
+        : `failed in ${Date.now() - started}ms: ${err instanceof Error ? err.message : String(err)}`,
+    );
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 const isNotFound = (err: unknown) =>
   err instanceof APIError && err.statusCode === 404;
 
 /** Whether the sprite exists; any error but a 404 throws. */
-export async function spriteExists(
-  client: SpritesClient,
-  name: string,
-): Promise<boolean> {
-  try {
-    await client.getSprite(name);
-    return true;
-  } catch (err) {
-    if (isNotFound(err)) return false;
-    throw err;
-  }
+export function spriteExists(ops: SpriteOps, name: string): Promise<boolean> {
+  return spriteCall(
+    ops,
+    name,
+    { op: "get" },
+    async () => {
+      try {
+        await ops.client.getSprite(name);
+        return true;
+      } catch (err) {
+        if (isNotFound(err)) return false;
+        throw err;
+      }
+    },
+    (exists) => (exists ? "ok" : "not found"),
+  );
 }
 
 /** Creates the sprite unless it exists, so a rerun after any interruption starts from one. */
 export async function ensureSprite(
-  client: SpritesClient,
+  ops: SpriteOps,
   name: string,
 ): Promise<void> {
-  if (!(await spriteExists(client, name))) await client.createSprite(name);
+  if (await spriteExists(ops, name)) return;
+  await spriteCall(ops, name, { op: "create" }, () =>
+    ops.client.createSprite(name),
+  );
 }
 
 export type ExecOutcome = { exitCode: number; stdout: string; stderr: string };
 
 /**
  * Runs `argv` in the sprite over the SDK's HTTP exec (no WebSocket, no TTY) and waits for it to
- * exit. A nonzero exit resolves with its outcome; only transport and API errors throw, including a
- * `timeout` (ms) running out. Without a `timeout`, nothing bounds the wait.
+ * exit. A nonzero exit resolves with its outcome; only transport and API errors throw, the bound
+ * running out included, which also cuts the request (and with it the process).
  */
-export async function execInSprite(
-  client: SpritesClient,
+export function execInSprite(
+  ops: SpriteOps,
   name: string,
   [file, ...args]: [string, ...string[]],
-  options: { cwd?: string; timeout?: number } = {},
+  options: CallOptions & { cwd?: string },
 ): Promise<ExecOutcome> {
-  try {
-    const result = await client.sprite(name).execFileHTTP(file, args, options);
-    return toOutcome(result);
-  } catch (err) {
-    if (err instanceof ExecError) return toOutcome(err.result);
-    throw err;
-  }
+  return spriteCall(
+    ops,
+    name,
+    options,
+    async (signal) => {
+      try {
+        const result = await ops.client
+          .sprite(name)
+          .execFileHTTP(file, args, { cwd: options.cwd, signal });
+        return toOutcome(result);
+      } catch (err) {
+        if (err instanceof ExecError) return toOutcome(err.result);
+        throw err;
+      }
+    },
+    (out) => (out.exitCode === 0 ? "ok" : `exited ${out.exitCode}`),
+  );
 }
 
 const toOutcome = (r: ExecError["result"]): ExecOutcome => ({
@@ -72,77 +171,102 @@ export const LOGGED_EXEC =
  * `tailBytes` bytes, read back over the filesystem API; empty when that read fails.
  */
 export async function execLogged(
-  client: SpritesClient,
+  ops: SpriteOps,
   name: string,
   argv: [string, ...string[]],
-  options: { cwd?: string; log: string; tailBytes: number },
+  {
+    log,
+    tailBytes,
+    ...options
+  }: CallOptions & {
+    cwd?: string;
+    log: string;
+    tailBytes: number;
+  },
 ): Promise<{ exitCode: number; tail: string }> {
   const { exitCode } = await execInSprite(
-    client,
+    ops,
     name,
-    [
-      "sh",
-      "-c",
-      LOGGED_EXEC,
-      "sh",
-      options.log,
-      `${options.tailBytes}`,
-      ...argv,
-    ],
-    { cwd: options.cwd },
+    ["sh", "-c", LOGGED_EXEC, "sh", log, `${tailBytes}`, ...argv],
+    options,
   );
   if (exitCode === 0) return { exitCode, tail: "" };
-  const tail = await client
-    .sprite(name)
-    .filesystem("/")
-    .readFile(`${options.log}.tail`, "utf8")
-    .catch(() => "");
+  const tail = await spriteCall(
+    ops,
+    name,
+    { op: "read-tail", known: options.known },
+    () =>
+      ops.client.sprite(name).filesystem("/").readFile(`${log}.tail`, "utf8"),
+  ).catch(() => "");
   return { exitCode, tail };
 }
 
 // the API names the new checkpoint only in the `complete` message's text
 const CREATED = /^Checkpoint (\S+) created/;
 
-/** Checkpoints the sprite and resolves with the new checkpoint's id. */
-export async function checkpointSprite(
-  client: SpritesClient,
+/** Checkpoints the sprite, bounded by `ops.longTimeoutMs`, and resolves with the new checkpoint's id. */
+export function checkpointSprite(
+  ops: SpriteOps,
   name: string,
   comment?: string,
 ): Promise<string> {
-  const stream = await client.sprite(name).createCheckpoint(comment);
-  let id: string | undefined;
-  for await (const message of stream) {
-    if (message.type === "error") {
-      throw new Error(message.error ?? "checkpoint failed");
-    }
-    if (message.type === "complete") id = CREATED.exec(message.data ?? "")?.[1];
-  }
-  if (!id) throw new Error("checkpoint completed without naming its id");
-  return id;
+  return spriteCall(
+    ops,
+    name,
+    { op: "checkpoint", timeoutMs: ops.longTimeoutMs },
+    async (signal) => {
+      const stream = await ops.client.sprite(name).createCheckpoint(comment);
+      if (signal.aborted) stream.close();
+      else
+        signal.addEventListener("abort", () => stream.close(), { once: true });
+      let id: string | undefined;
+      for await (const message of stream) {
+        if (message.type === "error") {
+          throw new Error(message.error ?? "checkpoint failed");
+        }
+        if (message.type === "complete") {
+          id = CREATED.exec(message.data ?? "")?.[1];
+        }
+      }
+      if (!id) throw new Error("checkpoint completed without naming its id");
+      return id;
+    },
+  );
 }
 
 /** Destroys the sprite; one already gone counts as destroyed. */
-export async function destroySprite(
-  client: SpritesClient,
-  name: string,
-): Promise<void> {
-  try {
-    await client.deleteSprite(name);
-  } catch (err) {
-    if (isNotFound(err)) return;
-    throw err;
-  }
+export function destroySprite(ops: SpriteOps, name: string): Promise<void> {
+  return spriteCall(
+    ops,
+    name,
+    { op: "delete" },
+    async () => {
+      try {
+        await ops.client.deleteSprite(name);
+        return "ok";
+      } catch (err) {
+        if (isNotFound(err)) return "already gone";
+        throw err;
+      }
+    },
+    (outcome) => outcome,
+  ).then(() => {});
 }
 
-/** Writes `data` to an absolute path in the sprite, creating parent directories. */
+/**
+ * Writes `data` to an absolute path in the sprite, creating parent directories. The SDK's write
+ * takes no signal, so a timeout leaves its request to finish or fail on its own.
+ */
 export async function writeSpriteFile(
-  client: SpritesClient,
+  ops: SpriteOps,
   name: string,
   path: string,
   data: string | Buffer,
-  options: { mode?: number } = {},
+  { mode, ...options }: CallOptions & { mode?: number },
 ): Promise<void> {
-  await client.sprite(name).filesystem("/").writeFile(path, data, options);
+  await spriteCall(ops, name, options, () =>
+    ops.client.sprite(name).filesystem("/").writeFile(path, data, { mode }),
+  );
 }
 
 // past any run: the runner holds the sprite itself and exits on its own; the server default is undocumented
@@ -155,12 +279,48 @@ const OUTPUT_TAIL = 2000;
  * its connection drops, so this is the one way to leave a process running. Rejects when the process
  * exits nonzero inside the window, with its exit code and output tail. A TTY merges stderr into
  * that output, and the SDK reads its exit code from the socket's close, so it is only ever 0 or 1.
+ * Bounded by `ops.timeoutMs` past `watchMs`, so a session that never spawns can't hang the caller;
+ * the session is closed when the bound runs out.
  */
 export function startDetached(
+  ops: SpriteOps,
+  name: string,
+  [file, ...args]: [string, ...string[]],
+  {
+    cwd,
+    env,
+    watchMs,
+    ...options
+  }: Omit<CallOptions, "timeoutMs"> & {
+    cwd: string;
+    env: Record<string, string>;
+    watchMs: number;
+  },
+): Promise<void> {
+  return spriteCall(
+    ops,
+    name,
+    { ...options, timeoutMs: ops.timeoutMs + watchMs },
+    (signal) =>
+      watchSession(ops.client, name, [file, ...args], {
+        cwd,
+        env,
+        watchMs,
+        signal,
+      }),
+  );
+}
+
+function watchSession(
   client: SpritesClient,
   name: string,
   [file, ...args]: [string, ...string[]],
-  options: { cwd: string; env: Record<string, string>; watchMs: number },
+  options: {
+    cwd: string;
+    env: Record<string, string>;
+    watchMs: number;
+    signal: AbortSignal;
+  },
 ): Promise<void> {
   const session = client.sprite(name).createSession(file, args, {
     cwd: options.cwd,
@@ -197,5 +357,12 @@ export function startDetached(
     });
     // `on`, not `once`: an 'error' emitted after the first, with no listener, would crash the process
     session.on("error", (err: Error) => settle(err));
+    options.signal.addEventListener(
+      "abort",
+      () => settle(options.signal.reason),
+      {
+        once: true,
+      },
+    );
   });
 }

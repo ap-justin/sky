@@ -1,4 +1,3 @@
-import type { SpritesClient } from "@fly/sprites";
 import { zValidator } from "@hono/zod-validator";
 import {
   agents,
@@ -17,7 +16,7 @@ import { factory } from "./factory.js";
 import { mintId } from "./ids.js";
 import type { Provisioner } from "./provision.js";
 import { activeRunStatuses, type Tx } from "./runs.js";
-import { destroySprite, spriteNameFor } from "./sprites.js";
+import { destroySprite, type SpriteOps, spriteNameFor } from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
 
 const { name, repo, setup, concurrency, approvalPolicy, autoApprove } =
@@ -140,7 +139,7 @@ const envParam = zValidator(
 
 export function environmentRoutes(
   provisioner: Provisioner,
-  sprites: SpritesClient,
+  sprites: SpriteOps,
   log: (line: string) => void,
 ) {
   return factory

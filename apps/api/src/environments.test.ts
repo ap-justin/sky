@@ -501,6 +501,29 @@ test("a runner SDK install that fails ends failed at the setup step", async () =
   expect(wire.calls.some((c) => c.includes("bash -c"))).toBe(false);
 });
 
+test("a clone that hangs past the long bound ends failed at the clone step with the timeout, and logs it", async () => {
+  const logged: string[] = [];
+  app = createApp({
+    db,
+    config: testConfig({ spritesLongTimeoutMs: 100 }),
+    sprites: new SpritesClient(spritesToken),
+    log: (line) => logged.push(line),
+    nudgeDeliveries: () => {},
+  });
+  wire.hangs = (call) => call.includes("git clone");
+  const { id } = (await (await post(kru)).json()) as { id: string };
+  const sprite = spriteNameFor(id);
+  expect(await settled(id)).toMatchObject({
+    status: "failed",
+    failure: {
+      step: "clone",
+      stderr: `sprite ${sprite}: clone timed out after 100 ms`,
+    },
+  });
+  expect(logged).toContain(`sprite ${sprite} clone: timed out after 100ms`);
+  expect(wire.calls.some((c) => c.startsWith(`checkpoint`))).toBe(false);
+});
+
 test("a setup that fails with no stderr names its exit code", async () => {
   wire.exec = (argv) => (isSetup(argv) ? { exitCode: 2 } : { exitCode: 0 });
   const { id } = (await (await post(kru)).json()) as { id: string };

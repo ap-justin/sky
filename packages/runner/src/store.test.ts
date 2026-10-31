@@ -369,6 +369,80 @@ test("a directory that already is a git repo is carried over whole and its tip k
   expect(git(home, "rev-parse", "refs/sky/pre-sync")).toBe(tip);
 });
 
+const many = (count: number, prefix: string) =>
+  Object.fromEntries(
+    Array.from({ length: count }, (_, i) => [
+      `${prefix}/${i}.md`,
+      `${prefix} ${i}\n`,
+    ]),
+  );
+const remoteBlob = (sha: string) =>
+  execFileSync("git", ["cat-file", "blob", sha], { cwd: remote }).toString(
+    "base64",
+  );
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("a pull fetches missing blobs several at a time, never more than 8", async () => {
+  pushElsewhere(many(30, "bulk"));
+  let inFlight = 0;
+  let peak = 0;
+  let fetched = 0;
+  server.use(
+    http.get(`${REPO}/git/blobs/:sha`, async ({ params }) => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await sleep(15);
+      inFlight--;
+      fetched++;
+      return HttpResponse.json({
+        encoding: "base64",
+        content: remoteBlob(String(params.sha)),
+      });
+    }),
+  );
+
+  await pullStore(options());
+
+  expect(peak).toBeGreaterThan(1);
+  expect(peak).toBeLessThanOrEqual(8);
+  expect(fetched).toBe(33);
+  for (const [path, content] of Object.entries(many(30, "bulk")))
+    expect(local(path)).toBe(content);
+  expect(local("inbox.md")).toBe("one\ntwo\n");
+  expect(git(home, "status", "--porcelain")).toBe("");
+});
+
+test("a blob that arrives with the wrong content fails the pull, and no new fetch starts after it", async () => {
+  pushElsewhere(many(30, "bulk"));
+  let started = 0;
+  let inFlight = 0;
+  server.use(
+    http.get(`${REPO}/git/blobs/:sha`, async ({ params }) => {
+      const first = ++started === 1;
+      inFlight++;
+      // the bad blob answers at once; the rest are still in flight when the pull sees it
+      if (!first) await sleep(100);
+      inFlight--;
+      return HttpResponse.json({
+        encoding: "base64",
+        content: first
+          ? Buffer.from("tampered\n").toString("base64")
+          : remoteBlob(String(params.sha)),
+      });
+    }),
+  );
+
+  await expect(pullStore(options())).rejects.toThrow("arrived as");
+
+  // the first wave of 8 and nothing after it; every one of them finished before the rejection
+  expect(started).toBe(8);
+  expect(inFlight).toBe(0);
+  await sleep(250);
+  expect(started).toBe(8);
+  expect(existsSync(join(home, ".git", "sky-sync-index"))).toBe(false);
+  expect(existsSync(join(home, "bulk/0.md"))).toBe(false);
+});
+
 test("a push sends the checkout as one commit on top of the remote's head", async () => {
   await pullStore(options());
   const before = git(remote, "rev-parse", "main");
@@ -546,6 +620,41 @@ test("store-sync names the missing connector, and a bad mode", async () => {
   const b = io();
   expect(await storeSyncMain(["sideways"], {}, b.io)).toBe(2);
   expect(b.out.stderr).toContain("usage: store-sync <pull|push>");
+});
+
+test("a pull that downloads blobs reports its progress on stderr, and one with nothing to fetch is silent", async () => {
+  pushElsewhere(many(250, "bulk"));
+  const env = {
+    KRU_HOME: home,
+    KRU_STORE_REPO: "acme/store",
+    GITHUB_CONNECTOR: CONNECTOR,
+    GITHUB_GATEWAY_URL: GATEWAY,
+  };
+  const first = io();
+
+  expect(await storeSyncMain(["pull", "--locked"], env, first.io)).toBe(0);
+
+  expect(first.out.stderr).toBe(
+    [
+      "store sync: fetching 253 of 253 blobs",
+      "store sync: fetched 100/253 blobs",
+      "store sync: fetched 200/253 blobs",
+      "store sync: fetched 253/253 blobs",
+      "",
+    ].join("\n"),
+  );
+
+  pushElsewhere({ "new.md": "new\n" });
+  const second = io();
+  expect(await storeSyncMain(["pull", "--locked"], env, second.io)).toBe(0);
+  expect(second.out.stderr).toBe(
+    "store sync: fetching 1 of 254 blobs\nstore sync: fetched 1/1 blobs\n",
+  );
+
+  pushElsewhere({ "new.md": null });
+  const third = io();
+  expect(await storeSyncMain(["pull", "--locked"], env, third.io)).toBe(0);
+  expect(third.out.stderr).toBe("");
 });
 
 test("a sync that fails is logged and never thrown", async () => {
