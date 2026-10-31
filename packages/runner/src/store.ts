@@ -1,4 +1,5 @@
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
@@ -11,6 +12,7 @@ import {
   GatewayError,
   gateway,
 } from "./publish.js";
+import { readTarball } from "./tarball.js";
 
 const run = promisify(execFile);
 
@@ -32,6 +34,9 @@ const LOCK_WAIT_S = 600;
 // `--locked` child only ever exits 0, 1 or 2
 const LOCK_TIMED_OUT = 75;
 const PUSH_ATTEMPTS = 4;
+// below this many missing blobs a pull fetches each one; at or above it, one tarball is cheaper
+// against GitHub's rate limit than that many API calls
+export const TARBALL_MIN_BLOBS = 50;
 // blob downloads in flight at once through the connector gateway during a pull
 const BLOB_FETCH_CONCURRENCY = 8;
 const PROGRESS_EVERY = 100;
@@ -234,7 +239,10 @@ async function pull(
   const blobs = listing.tree.filter((item) => item.type === "blob");
   const lines = blobs.map((item) => `${item.mode} ${item.sha}\t${item.path}\0`);
   try {
-    await fetchMissing(g, call, blobs, progress);
+    await fetchMissing(g, call, blobs, progress, "store sync", {
+      sha: remote.sha,
+      min: TARBALL_MIN_BLOBS,
+    });
     const env = { GIT_INDEX_FILE: index };
     await rm(index, { force: true });
     // -z takes each path literally; without it a path starting with `"` would be unquoted
@@ -258,6 +266,7 @@ async function pull(
   } finally {
     await rm(index, { force: true });
   }
+  progress(`store sync: pull used ${call.calls} GitHub API calls`);
   return remote;
 }
 
@@ -277,21 +286,37 @@ async function missingObjects(
 }
 
 /**
- * Downloads every blob of `items` the object store lacks, `BLOB_FETCH_CONCURRENCY` at a time, and checks
- * each one hashes to the sha GitHub listed it under.
+ * Makes every blob of `items` resolvable in the object store, each checked to hash to the sha GitHub
+ * listed it under. When `source.min` or more are missing they come from one tarball of commit
+ * `source.sha`, a single API call whatever the count; a blob the tarball lacks or carries
+ * differently (`export-ignore`, `export-subst`) is fetched alone, `BLOB_FETCH_CONCURRENCY` at a
+ * time, as are all of them when fewer are missing.
  */
 export async function fetchMissing(
   g: ReturnType<typeof git>,
   call: ReturnType<typeof gateway>,
   items: TreeItem[],
   progress: Progress,
-  label = "store sync",
+  label: string,
+  source: { sha: string; min: number },
 ): Promise<void> {
   const listed = [...new Set(items.map((item) => item.sha))];
-  const missing = await missingObjects(g, listed);
+  let missing = await missingObjects(g, listed);
   if (!missing.length) return;
+  progress(`${label}: fetching ${missing.length} of ${listed.length} blobs`);
+  if (missing.length >= source.min) {
+    const wanted = new Set(missing);
+    const blobs = new Map<string, Buffer>();
+    for (const content of readTarball(await call.tarball(source.sha))) {
+      const sha = blobId(content);
+      if (wanted.has(sha)) blobs.set(sha, content);
+    }
+    await writeBlobs(g, [...blobs.values()]);
+    progress(`${label}: ${blobs.size} blobs from one tarball`);
+    missing = await missingObjects(g, missing);
+  }
   const total = missing.length;
-  progress(`${label}: fetching ${total} of ${listed.length} blobs`);
+  if (!total) return;
   let fetched = 0;
   await eachLimited(missing, BLOB_FETCH_CONCURRENCY, async (sha) => {
     const blob = await call<{ content: string }>("GET", `/git/blobs/${sha}`);
@@ -300,6 +325,30 @@ export async function fetchMissing(
     fetched++;
     if (fetched % PROGRESS_EVERY === 0 || fetched === total)
       progress(`${label}: fetched ${fetched}/${total} blobs`);
+  });
+}
+
+const blobId = (content: Buffer) =>
+  createHash("sha1")
+    .update(`blob ${content.length}\0`)
+    .update(content)
+    .digest("hex");
+
+/** Writes `blobs` in one `fast-import`, a single process however many there are. */
+async function writeBlobs(
+  g: ReturnType<typeof git>,
+  blobs: Buffer[],
+): Promise<void> {
+  if (!blobs.length) return;
+  await g(["fast-import", "--quiet", "--done"], {
+    input: Buffer.concat([
+      ...blobs.flatMap((blob) => [
+        Buffer.from(`blob\ndata ${blob.length}\n`),
+        blob,
+        Buffer.from("\n"),
+      ]),
+      Buffer.from("done\n"),
+    ]),
   });
 }
 

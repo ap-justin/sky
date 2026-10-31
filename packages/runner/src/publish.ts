@@ -176,7 +176,11 @@ const RETRIES = 3;
 // a stalled gateway call fails rather than holding the caller
 const REQUEST_TIMEOUT_MS = 120_000;
 
-/** GitHub's REST API for one repo, through the gateway, with no credential of its own. */
+/**
+ * GitHub's REST API for one repo, through the gateway, with no credential of its own. `calls`
+ * counts the requests sent to the gateway so far, retries included, each one against the
+ * connector's GitHub rate limit.
+ */
 export function gateway(options: {
   gatewayUrl: string;
   connectorId: string;
@@ -185,20 +189,23 @@ export function gateway(options: {
 }) {
   const root = `${options.gatewayUrl.replace(/\/+$/, "")}/${encodeURIComponent(options.connectorId)}`;
   const repoPath = `/repos/${options.owner}/${options.repo}`;
-  return async function call<T>(
+  let calls = 0;
+  async function send(
     method: string,
     path: string,
+    accept: string,
     body?: unknown,
-  ): Promise<T> {
+  ): Promise<Response> {
     const where = `${method} ${repoPath}${path}`;
     let response: Response;
     for (let attempt = 0; ; attempt++) {
+      calls++;
       try {
         response = await fetch(`${root}${repoPath}${path}`, {
           method,
           signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
           headers: {
-            accept: "application/vnd.github+json",
+            accept,
             "x-github-api-version": "2022-11-28",
             ...(body !== undefined && { "content-type": "application/json" }),
           },
@@ -224,7 +231,7 @@ export function gateway(options: {
       }
       break;
     }
-    if (response.ok) return (await response.json()) as T;
+    if (response.ok) return response;
     const text = await response.text();
     let detail = text.trim() || response.statusText;
     try {
@@ -235,7 +242,39 @@ export function gateway(options: {
       `GitHub gateway: ${where} returned ${response.status}: ${detail}`,
       response.status,
     );
+  }
+  async function call<T>(
+    method: string,
+    path: string,
+    body?: unknown,
+  ): Promise<T> {
+    const response = await send(
+      method,
+      path,
+      "application/vnd.github+json",
+      body,
+    );
+    return (await response.json()) as T;
+  }
+  const methods = {
+    /**
+     * The gzipped tarball of commit `sha`'s files: one API call. GitHub answers with a redirect to
+     * a pre-signed codeload URL, which `fetch` follows; it needs no credential, and the request
+     * sends none a cross-origin hop could leak.
+     */
+    async tarball(sha: string): Promise<Buffer> {
+      const response = await send(
+        "GET",
+        `/tarball/${encodeURIComponent(sha)}`,
+        "application/vnd.github+json",
+      );
+      return Buffer.from(await response.arrayBuffer());
+    },
   };
+  // a getter, not a copied number: Object.assign would read it once
+  return Object.defineProperty(Object.assign(call, methods), "calls", {
+    get: () => calls,
+  }) as typeof call & typeof methods & { readonly calls: number };
 }
 
 /**

@@ -15,6 +15,7 @@ import {
   messageOf,
   type Progress,
   remoteHead,
+  TARBALL_MIN_BLOBS,
   type TreeItem,
 } from "./store.js";
 
@@ -173,6 +174,9 @@ export async function pullRepo(options: {
     await writeCheckout(dir, options.repo, remote, commit, listing.tree, raw, {
       call,
       progress,
+      // a fresh checkout has nothing yet, so one tarball always beats a call per blob; one a
+      // run already made is missing only what changed since
+      tarballMin: hadGit ? TARBALL_MIN_BLOBS : 1,
     });
   } catch (error) {
     if (created) await rm(created, { recursive: true, force: true });
@@ -180,6 +184,7 @@ export async function pullRepo(options: {
       await rm(join(dir, ".git"), { recursive: true, force: true });
     throw error;
   }
+  progress(`repo pull: ${options.repo} used ${call.calls} GitHub API calls`);
   return remote;
 }
 
@@ -194,10 +199,18 @@ async function writeObjects(
   commit: ApiCommit,
   tree: TreeItem[],
   raw: string,
-  source: { call: ReturnType<typeof gateway>; progress: Progress },
+  source: {
+    call: ReturnType<typeof gateway>;
+    progress: Progress;
+    /** How many missing blobs it takes to fetch them as a tarball. */
+    tarballMin: number;
+  },
 ): Promise<void> {
   const blobs = tree.filter((item) => item.type === "blob");
-  await fetchMissing(g, source.call, blobs, source.progress, "repo pull");
+  await fetchMissing(g, source.call, blobs, source.progress, "repo pull", {
+    sha,
+    min: source.tarballMin,
+  });
   // a submodule is a gitlink: a commit sha in the tree with nothing behind it here
   const entries = tree.filter(
     (item) => item.type === "blob" || item.type === "commit",
@@ -247,6 +260,7 @@ export async function fetchCommit(
   await writeObjects(g, gitDir, sha, commit, listing.tree, raw, {
     call,
     progress,
+    tarballMin: TARBALL_MIN_BLOBS,
   });
   const here = async (parent: string) =>
     g(["cat-file", "-e", `${parent}^{commit}`]).then(
@@ -279,7 +293,11 @@ async function writeCheckout(
   commit: ApiCommit,
   tree: TreeItem[],
   raw: string,
-  source: { call: ReturnType<typeof gateway>; progress: Progress },
+  source: {
+    call: ReturnType<typeof gateway>;
+    progress: Progress;
+    tarballMin: number;
+  },
 ): Promise<void> {
   const g = git(dir);
   await g(["init", "-q", "-b", remote.branch]);

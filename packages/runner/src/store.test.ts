@@ -23,6 +23,7 @@ import {
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
 const REPO = `${GATEWAY}/${CONNECTOR}/repos/acme/store`;
+const CODELOAD = "https://codeload.test/acme/store/legacy.tar.gz";
 
 const git = (cwd: string, ...args: string[]) =>
   execFileSync("git", args, { cwd, encoding: "utf8" }).trim();
@@ -73,7 +74,13 @@ function pushElsewhere(
  * push from another machine landing in between would.
  */
 function fakeGitHub(options: { racing?: () => boolean } = {}) {
-  const state = { patches: 0, blobPosts: 0, commits: [] as unknown[] };
+  const state = {
+    patches: 0,
+    blobPosts: 0,
+    blobGets: 0,
+    tarballs: 0,
+    commits: [] as unknown[],
+  };
   const bare = (...args: string[]) => git(remote, ...args);
   server.use(
     http.get(REPO, () => HttpResponse.json({ default_branch: "main" })),
@@ -101,14 +108,35 @@ function fakeGitHub(options: { racing?: () => boolean } = {}) {
           }),
       }),
     ),
-    http.get(`${REPO}/git/blobs/:sha`, ({ params }) =>
-      HttpResponse.json({
+    http.get(`${REPO}/git/blobs/:sha`, ({ params }) => {
+      state.blobGets++;
+      return HttpResponse.json({
         encoding: "base64",
         content: execFileSync("git", ["cat-file", "blob", String(params.sha)], {
           cwd: remote,
         }).toString("base64"),
-      }),
-    ),
+      });
+    }),
+    // GitHub answers the tarball with a redirect to a pre-signed codeload URL
+    http.get(`${REPO}/tarball/:sha`, ({ params }) => {
+      state.tarballs++;
+      return new HttpResponse(null, {
+        status: 302,
+        headers: { location: `${CODELOAD}/${params.sha}` },
+      });
+    }),
+    http.get(`${CODELOAD}/:sha`, ({ request, params }) => {
+      expect(request.headers.get("authorization")).toBeNull();
+      const sha = String(params.sha);
+      return new HttpResponse(
+        execFileSync(
+          "git",
+          ["archive", "--format=tar.gz", `--prefix=acme-store-${sha}/`, sha],
+          { cwd: remote, maxBuffer: 64 * 1024 * 1024 },
+        ),
+        { headers: { "content-type": "application/x-gzip" } },
+      );
+    }),
     http.post(`${REPO}/git/blobs`, async ({ request }) => {
       state.blobPosts++;
       const { content } = (await request.json()) as { content: string };
@@ -412,6 +440,56 @@ test("a pull fetches missing blobs several at a time, never more than 8", async 
   expect(git(home, "status", "--porcelain")).toBe("");
 });
 
+test("a pull missing 50 or more blobs takes them as one tarball, and the tree is GitHub's exactly", async () => {
+  pushElsewhere(many(60, "bulk"));
+  const lines: string[] = [];
+
+  await pullStore({ ...options(), progress: (line) => lines.push(line) });
+
+  expect(hub.tarballs).toBe(1);
+  expect(hub.blobGets).toBe(0);
+  for (const [path, content] of Object.entries(many(60, "bulk")))
+    expect(local(path)).toBe(content);
+  expect(git(home, "rev-parse", "refs/sky/synced^{tree}")).toBe(
+    git(remote, "rev-parse", "main^{tree}"),
+  );
+  expect(git(home, "status", "--porcelain")).toBe("");
+  // repo, ref, commit, tree, tarball
+  expect(lines).toContain("store sync: pull used 5 GitHub API calls");
+});
+
+test("a pull missing fewer than 50 blobs fetches just those, without a tarball", async () => {
+  await pullStore(options());
+  hub.blobGets = 0;
+  pushElsewhere(many(49, "few"));
+  const lines: string[] = [];
+
+  await pullStore({ ...options(), progress: (line) => lines.push(line) });
+
+  expect(hub.tarballs).toBe(0);
+  expect(hub.blobGets).toBe(49);
+  expect(local("few/48.md")).toBe("few 48\n");
+  // repo, ref, commit, tree, then a call per blob
+  expect(lines).toContain("store sync: pull used 53 GitHub API calls");
+});
+
+test("a pull whose tarball is refused fails naming the repo and the status", async () => {
+  pushElsewhere(many(60, "bulk"));
+  server.use(
+    http.get(`${REPO}/tarball/:sha`, () =>
+      HttpResponse.json(
+        { message: "API rate limit exceeded" },
+        { status: 403 },
+      ),
+    ),
+  );
+
+  const failure = pullStore(options());
+
+  await expect(failure).rejects.toThrow(/acme\/store.*returned 403/);
+  await expect(failure).rejects.toThrow("API rate limit exceeded");
+});
+
 test("a blob that arrives with the wrong content fails the pull, and no new fetch starts after it", async () => {
   pushElsewhere(many(30, "bulk"));
   let started = 0;
@@ -622,7 +700,7 @@ test("store-sync names the missing connector, and a bad mode", async () => {
   expect(b.out.stderr).toContain("usage: store-sync <pull|push>");
 });
 
-test("a pull that downloads blobs reports its progress on stderr, and one with nothing to fetch is silent", async () => {
+test("a pull that downloads blobs reports its progress on stderr, and one with nothing to fetch names only its API calls", async () => {
   pushElsewhere(many(250, "bulk"));
   const env = {
     KRU_HOME: home,
@@ -637,9 +715,8 @@ test("a pull that downloads blobs reports its progress on stderr, and one with n
   expect(first.out.stderr).toBe(
     [
       "store sync: fetching 253 of 253 blobs",
-      "store sync: fetched 100/253 blobs",
-      "store sync: fetched 200/253 blobs",
-      "store sync: fetched 253/253 blobs",
+      "store sync: 253 blobs from one tarball",
+      "store sync: pull used 5 GitHub API calls",
       "",
     ].join("\n"),
   );
@@ -648,13 +725,13 @@ test("a pull that downloads blobs reports its progress on stderr, and one with n
   const second = io();
   expect(await storeSyncMain(["pull", "--locked"], env, second.io)).toBe(0);
   expect(second.out.stderr).toBe(
-    "store sync: fetching 1 of 254 blobs\nstore sync: fetched 1/1 blobs\n",
+    "store sync: fetching 1 of 254 blobs\nstore sync: fetched 1/1 blobs\nstore sync: pull used 5 GitHub API calls\n",
   );
 
   pushElsewhere({ "new.md": null });
   const third = io();
   expect(await storeSyncMain(["pull", "--locked"], env, third.io)).toBe(0);
-  expect(third.out.stderr).toBe("");
+  expect(third.out.stderr).toBe("store sync: pull used 4 GitHub API calls\n");
 });
 
 test("a sync that fails is logged and never thrown", async () => {

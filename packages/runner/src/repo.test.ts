@@ -23,6 +23,7 @@ import { pullRepo, rebuildCommit, repoPullMain } from "./repo.js";
 const GATEWAY = "https://gateway.test/v1/gateway/github";
 const CONNECTOR = "conn_123";
 const REPO = `${GATEWAY}/${CONNECTOR}/repos/acme/private`;
+const CODELOAD = "https://codeload.test/acme/private/legacy.tar.gz";
 
 // a host with commit.gpgsign=true would sign every fixture commit and turn the file red
 const NO_SIGN = ["-c", "commit.gpgsign=false"];
@@ -86,6 +87,13 @@ beforeEach(() => {
   writeFileSync(join(seed, "run.sh"), "#!/bin/sh\n");
   chmodSync(join(seed, "run.sh"), 0o755);
   symlinkSync("README.md", join(seed, "link"));
+  // `git archive` leaves the first out and rewrites the second, as GitHub's tarball does
+  writeFileSync(
+    join(seed, ".gitattributes"),
+    "kept-out.txt export-ignore\nstamped.txt export-subst\n",
+  );
+  writeFileSync(join(seed, "kept-out.txt"), "not in the archive\n");
+  writeFileSync(join(seed, "stamped.txt"), "at $Format:%h$\n");
   headSha = commitAs(
     seed,
     "second\n\nwith a body",
@@ -130,6 +138,8 @@ const apiCommit = (sha: string) => {
 /** GitHub's REST API for the private repo, reachable only through the connector's gateway. */
 function fakeGitHub(base = REPO) {
   const seen = {
+    blobGets: 0,
+    tarballs: 0,
     commits: [] as { parents: string[]; tree: string; message: string }[],
     refs: [] as { ref: string; sha: string }[],
   };
@@ -155,6 +165,7 @@ function fakeGitHub(base = REPO) {
       }),
     ),
     http.get(`${base}/git/blobs/:sha`, ({ params }) => {
+      seen.blobGets++;
       // a blob GitHub lacks is a 404, which is how publish learns to upload it
       let content: Buffer;
       try {
@@ -173,6 +184,26 @@ function fakeGitHub(base = REPO) {
         encoding: "base64",
         content: content.toString("base64"),
       });
+    }),
+    // a redirect to a pre-signed codeload URL, which takes no credential
+    http.get(`${base}/tarball/:sha`, ({ params }) => {
+      seen.tarballs++;
+      return new HttpResponse(null, {
+        status: 302,
+        headers: { location: `${CODELOAD}/${params.sha}` },
+      });
+    }),
+    http.get(`${CODELOAD}/:sha`, ({ request, params }) => {
+      expect(request.headers.get("authorization")).toBeNull();
+      const sha = String(params.sha);
+      return new HttpResponse(
+        execFileSync(
+          "git",
+          ["archive", "--format=tar.gz", `--prefix=acme-private-${sha}/`, sha],
+          { cwd: remote, maxBuffer: 64 * 1024 * 1024 },
+        ),
+        { headers: { "content-type": "application/x-gzip" } },
+      );
     }),
     http.get(`${base}/git/ref/*`, () =>
       HttpResponse.json({ message: "Not Found" }, { status: 404 }),
@@ -240,6 +271,57 @@ test("the checkout holds GitHub's own commit, with origin/HEAD and the default b
   expect(git(dir, "log", "-1", "--format=%an|%aI|%cI|%B")).toBe(
     git(remote, "log", "-1", "--format=%an|%aI|%cI|%B", "trunk"),
   );
+});
+
+test("the tree comes from one tarball, rebuilt to GitHub's exact tree sha with modes and symlinks, and only the files the archive alters are fetched alone", async () => {
+  const seen = fakeGitHub();
+  const dir = join(root, "repo");
+  const lines: string[] = [];
+
+  await pullRepo({
+    repo: "acme/private",
+    dir,
+    gatewayUrl: GATEWAY,
+    connectorId: CONNECTOR,
+    progress: (line) => lines.push(line),
+  });
+
+  expect(git(dir, "rev-parse", "HEAD^{tree}")).toBe(
+    bare("rev-parse", `${headSha}^{tree}`),
+  );
+  expect(git(dir, "ls-tree", "HEAD", "run.sh", "link")).toBe(
+    bare("ls-tree", "trunk", "run.sh", "link"),
+  );
+  expect(seen.tarballs).toBe(1);
+  // kept-out.txt is missing from the archive and stamped.txt differs in it
+  expect(seen.blobGets).toBe(2);
+  expect(readFileSync(join(dir, "stamped.txt"), "utf8")).toBe(
+    "at $Format:%h$\n",
+  );
+  expect(readFileSync(join(dir, "kept-out.txt"), "utf8")).toBe(
+    "not in the archive\n",
+  );
+  // repo, ref, commit, tree, tarball, two blobs
+  expect(lines).toContain("repo pull: acme/private used 7 GitHub API calls");
+});
+
+test("a refused tarball fails the pull naming the repo and the status, and leaves no checkout", async () => {
+  fakeGitHub();
+  server.use(
+    http.get(`${REPO}/tarball/:sha`, () =>
+      HttpResponse.json(
+        { message: "API rate limit exceeded" },
+        { status: 403 },
+      ),
+    ),
+  );
+  const dir = join(root, "repo");
+
+  const failure = pull(dir);
+
+  await expect(failure).rejects.toThrow(/acme\/private.*returned 403/);
+  await expect(failure).rejects.toThrow("API rate limit exceeded");
+  expect(existsSync(dir)).toBe(false);
 });
 
 test("a worktree branches from origin/HEAD as the runner's does, on GitHub's commit", async () => {
@@ -1311,7 +1393,7 @@ test("a write to the branch on GitHub while a forced re-publish runs is not over
   expect(bare("rev-parse", "claude/agt_1")).toBe(suggestion);
 });
 
-test("nothing outside the repo's REST endpoints is called, and no request carries a credential", async () => {
+test("nothing outside the repo's REST endpoints and its codeload tarball is called, and no request carries a credential", async () => {
   fakeGitHub();
   const requests: { url: string; auth: string | null }[] = [];
   server.use(
@@ -1325,7 +1407,12 @@ test("nothing outside the repo's REST endpoints is called, and no request carrie
   await pull(join(root, "repo"));
   expect(requests.length).toBeGreaterThan(3);
   for (const { url, auth } of requests) {
-    expect(url === REPO || url.startsWith(`${REPO}/`), url).toBe(true);
+    expect(
+      url === REPO ||
+        url.startsWith(`${REPO}/`) ||
+        url.startsWith(`${CODELOAD}/`),
+      url,
+    ).toBe(true);
     expect(auth, url).toBeNull();
   }
 });
