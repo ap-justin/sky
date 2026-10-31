@@ -160,7 +160,7 @@ async function apiAndGateway() {
   return { seen, base: `http://127.0.0.1:${port}` };
 }
 
-const storeRunEnv = (base: string, kruHome: string) => ({
+const storeRunEnv = (base: string, storeHome: string) => ({
   AGENT_ID: "agt_1",
   RUN_ID: "run_1",
   PROMPT: "do it",
@@ -170,9 +170,9 @@ const storeRunEnv = (base: string, kruHome: string) => ({
   // the run fails at worktree setup, so no session starts
   REPO_DIR: "/nonexistent/repo",
   WORKTREES_DIR: "/nonexistent/worktrees",
-  HOME: kruHome,
-  KRU_HOME: join(kruHome, ".kru"),
-  KRU_STORE_REPO: "acme/store",
+  HOME: storeHome,
+  SKY_STORE_HOME: ".store",
+  SKY_STORE_REPO: "acme/store",
   GITHUB_CONNECTOR: "conn_1",
   GITHUB_GATEWAY_URL: `${base}/gateway`,
 });
@@ -191,18 +191,22 @@ test("the store is pulled before the run and pushed after it, a failed run inclu
   }
 }, 30_000);
 
-test("KRU_NO_STORE_SYNC turns the pull and the push off", async () => {
-  const { seen, base } = await apiAndGateway();
-  const home = mkdtempSync(join(tmpdir(), "runner-main-store-"));
-  try {
-    const { code, stderr } = await runBundle({
-      ...storeRunEnv(base, home),
-      KRU_NO_STORE_SYNC: "1",
-    });
-    expect(seen).toEqual(["api"]);
-    expect(code).toBe(1);
-    expect(stderr).not.toMatch(/pull|push/);
-  } finally {
-    rmSync(home, { recursive: true, force: true });
-  }
-}, 30_000);
+test.each(["SKY_NO_STORE_SYNC", "KRU_NO_STORE_SYNC"])(
+  "%s turns the pull and the push off",
+  async (name) => {
+    const { seen, base } = await apiAndGateway();
+    const home = mkdtempSync(join(tmpdir(), "runner-main-store-"));
+    try {
+      const { code, stderr } = await runBundle({
+        ...storeRunEnv(base, home),
+        [name]: "1",
+      });
+      expect(seen).toEqual(["api"]);
+      expect(code).toBe(1);
+      expect(stderr).not.toMatch(/pull|push/);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  },
+  30_000,
+);

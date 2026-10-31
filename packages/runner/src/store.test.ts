@@ -197,8 +197,15 @@ function fakeGitHub(options: { racing?: () => boolean } = {}) {
   return state;
 }
 
+// a layout the way a profile would write it: hook state stays local, the line files union-merge
+const layout = {
+  home: ".store",
+  exclude: ["audit/", "lead-gate/", "tmp/"],
+  lineFiles: ["inbox.md", "refusals.jsonl", "management/*/TODOS.md"],
+};
 const options = () => ({
   home,
+  layout,
   repo: "acme/store",
   gatewayUrl: GATEWAY,
   connectorId: CONNECTOR,
@@ -214,8 +221,7 @@ const local = (path: string) => readFileSync(join(home, path), "utf8");
 
 beforeEach(() => {
   root = mkdtempSync(join(tmpdir(), "runner-store-"));
-  // a Kru plugin under the host's ~/.claude, its git config or an exported identity would change
-  // which store home, merge driver and author these tests see
+  // the host's git config or an exported identity would change which author these tests see
   mkdirSync(join(root, "home"));
   vi.stubEnv("HOME", join(root, "home"));
   vi.stubEnv("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -228,7 +234,7 @@ beforeEach(() => {
   ])
     vi.stubEnv(name, undefined);
   remote = join(root, "remote.git");
-  home = join(root, "kru");
+  home = join(root, "home", ".store");
   execFileSync("git", ["init", "-q", "--bare", "-b", "main", remote]);
   const seed = join(root, "seed");
   execFileSync("git", ["init", "-q", "-b", "main", seed]);
@@ -597,13 +603,21 @@ const io = () => {
 };
 
 test("store-sync does nothing without a store repo or with the kill switch on", async () => {
-  const env = { KRU_HOME: home, GITHUB_CONNECTOR: CONNECTOR };
+  const env = { SKY_STORE_HOME: ".store", GITHUB_CONNECTOR: CONNECTOR };
   const quiet = io();
   expect(await storeSyncMain(["push"], env, quiet.io)).toBe(0);
   expect(
     await storeSyncMain(
       ["push"],
-      { ...env, KRU_STORE_REPO: "acme/store", KRU_NO_STORE_SYNC: "1" },
+      { ...env, SKY_STORE_REPO: "acme/store", SKY_NO_STORE_SYNC: "1" },
+      quiet.io,
+    ),
+  ).toBe(0);
+  // the switch's earlier name still works
+  expect(
+    await storeSyncMain(
+      ["push"],
+      { ...env, SKY_STORE_REPO: "acme/store", KRU_NO_STORE_SYNC: "1" },
       quiet.io,
     ),
   ).toBe(0);
@@ -614,7 +628,7 @@ test("store-sync does nothing without a store repo or with the kill switch on", 
 test("store-sync names the missing connector, and a bad mode", async () => {
   const a = io();
   expect(
-    await storeSyncMain(["pull"], { KRU_STORE_REPO: "acme/store" }, a.io),
+    await storeSyncMain(["pull"], { SKY_STORE_REPO: "acme/store" }, a.io),
   ).toBe(2);
   expect(a.out.stderr).toContain("GITHUB_CONNECTOR is not set");
   const b = io();
@@ -625,8 +639,9 @@ test("store-sync names the missing connector, and a bad mode", async () => {
 test("a pull that downloads blobs reports its progress on stderr, and one with nothing to fetch is silent", async () => {
   pushElsewhere(many(250, "bulk"));
   const env = {
-    KRU_HOME: home,
-    KRU_STORE_REPO: "acme/store",
+    SKY_STORE_HOME: ".store",
+    SKY_STORE_LAYOUT: JSON.stringify(layout),
+    SKY_STORE_REPO: "acme/store",
     GITHUB_CONNECTOR: CONNECTOR,
     GITHUB_GATEWAY_URL: GATEWAY,
   };
@@ -660,8 +675,9 @@ test("a pull that downloads blobs reports its progress on stderr, and one with n
 test("a sync that fails is logged and never thrown", async () => {
   server.use(http.get(REPO, () => new HttpResponse("down", { status: 500 })));
   const env = {
-    KRU_HOME: home,
-    KRU_STORE_REPO: "acme/store",
+    SKY_STORE_HOME: ".store",
+    SKY_STORE_LAYOUT: JSON.stringify(layout),
+    SKY_STORE_REPO: "acme/store",
     GITHUB_CONNECTOR: CONNECTOR,
     GITHUB_GATEWAY_URL: GATEWAY,
   };
@@ -670,12 +686,120 @@ test("a sync that fails is logged and never thrown", async () => {
   expect(failed.out.stderr).toContain("pull failed");
 
   const warnings: string[] = [];
-  await syncStoreQuietly("push", { KRU_HOME: home }, (l) => warnings.push(l));
+  await syncStoreQuietly("push", { SKY_STORE_HOME: ".store" }, (l) =>
+    warnings.push(l),
+  );
   expect(warnings).toEqual([]);
   await syncStoreQuietly(
     "push",
-    { KRU_HOME: home, KRU_STORE_REPO: "acme/store" },
+    { SKY_STORE_HOME: ".store", SKY_STORE_REPO: "acme/store" },
     (l) => warnings.push(l),
   );
   expect(warnings.join()).toContain("GITHUB_CONNECTOR is not set");
+});
+
+test("with no layout, only the lock stays out of the store and no file is merge-driven", async () => {
+  mkdirSync(home, { recursive: true });
+  mkdirSync(join(home, "audit"));
+  writeFileSync(join(home, "audit/session.jsonl"), "state\n");
+  writeFileSync(join(home, ".sky-store.lock"), "");
+  await pullStore({ ...options(), layout: undefined });
+  expect(git(home, "ls-files")).toContain("audit/session.jsonl");
+  expect(git(home, "ls-files")).not.toContain(".sky-store.lock");
+  expect(git(home, "config", "merge.sky-lines.driver")).toBe(
+    "git merge-file --union %A %O %B",
+  );
+});
+
+test("a layout's merge script, when it exists under $HOME, is the line files' driver; a missing one falls back to union", async () => {
+  mkdirSync(join(root, "home", "bin"));
+  writeFileSync(join(root, "home", "bin/merge.sh"), "#!/bin/sh\n");
+  await pullStore({
+    ...options(),
+    layout: { ...layout, mergeScript: "bin/merge.sh" },
+  });
+  expect(git(home, "config", "merge.sky-lines.driver")).toBe(
+    `bash '${join(root, "home", "bin/merge.sh")}' %O %A %B`,
+  );
+  await pullStore({
+    ...options(),
+    layout: { ...layout, mergeScript: "bin/missing.sh" },
+  });
+  expect(git(home, "config", "merge.sky-lines.driver")).toBe(
+    "git merge-file --union %A %O %B",
+  );
+});
+
+test("the line files' merge script is run by a real merge with the base, ours and theirs files in that order", async () => {
+  mkdirSync(join(root, "home", "bin"));
+  // reports each argument's content, so a swapped %O %A %B shows up in the merged file
+  writeFileSync(
+    join(root, "home", "bin/merge.sh"),
+    [
+      "#!/bin/bash",
+      'out="O=$(tr \'\\n\' , < "$1") A=$(tr \'\\n\' , < "$2") B=$(tr \'\\n\' , < "$3")"',
+      'printf \'%s\\n\' "$out" > "$2"',
+      "",
+    ].join("\n"),
+  );
+  const scripted = {
+    ...options(),
+    layout: { ...layout, mergeScript: "bin/merge.sh" },
+  };
+  await pullStore(scripted);
+  writeFileSync(join(home, "inbox.md"), "one\ntwo\nlocal\n");
+  pushElsewhere({ "inbox.md": "one\ntwo\nremote\n" });
+
+  await pullStore(scripted);
+
+  // the pull rebases local work onto the remote, so the remote is "ours" and the local commit "theirs"
+  expect(local("inbox.md")).toBe(
+    "O=one,two, A=one,two,remote, B=one,two,local,\n",
+  );
+});
+
+test("with no merge script, a real merge of two appends to a line file keeps both", async () => {
+  await pullStore(options());
+  writeFileSync(join(home, "inbox.md"), "one\ntwo\nlocal\n");
+  pushElsewhere({ "inbox.md": "one\ntwo\nremote\n" });
+
+  await pullStore(options());
+
+  const lines = local("inbox.md").trim().split("\n");
+  expect(lines.sort()).toEqual(["local", "one", "remote", "two"]);
+});
+
+test("SKY_STORE_HOME names the checkout over the layout's home, and the layout's home is used without it", async () => {
+  const env = {
+    SKY_STORE_LAYOUT: JSON.stringify({ ...layout, home: ".from-layout" }),
+    SKY_STORE_REPO: "acme/store",
+    GITHUB_CONNECTOR: CONNECTOR,
+    GITHUB_GATEWAY_URL: GATEWAY,
+  };
+  const withEnv = io();
+  expect(
+    await storeSyncMain(
+      ["pull", "--locked"],
+      { ...env, SKY_STORE_HOME: ".from-env" },
+      withEnv.io,
+    ),
+  ).toBe(0);
+  const base = join(root, "home");
+  expect(existsSync(join(base, ".from-env/inbox.md"))).toBe(true);
+  expect(existsSync(join(base, ".from-layout"))).toBe(false);
+
+  expect(await storeSyncMain(["pull", "--locked"], env, io().io)).toBe(0);
+  expect(existsSync(join(base, ".from-layout/inbox.md"))).toBe(true);
+});
+
+test("a malformed SKY_STORE_LAYOUT stops the sync with a message that names the variable, not its value", async () => {
+  const bad = io();
+  const env = {
+    SKY_STORE_REPO: "acme/store",
+    GITHUB_CONNECTOR: CONNECTOR,
+    SKY_STORE_LAYOUT: '{"home":"/etc/secret-ish"}',
+  };
+  expect(await storeSyncMain(["pull"], env, bad.io)).toBe(2);
+  expect(bad.out.stderr).toContain("SKY_STORE_LAYOUT is not a store layout");
+  expect(bad.out.stderr).not.toContain("secret-ish");
 });

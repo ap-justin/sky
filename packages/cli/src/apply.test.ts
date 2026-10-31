@@ -12,6 +12,7 @@ const spec = {
   name: "web",
   repo: "acme/web",
   setup: "pnpm install",
+  base: null,
   concurrency: 3,
   approvalPolicy: [],
   autoApprove: { defaults: true, commands: [] },
@@ -523,4 +524,45 @@ test("a rejected API key exits 2 naming where the key came from", async () => {
       message: "invalid API key; check the key from SKY_API_KEY",
     },
   });
+});
+
+test.each([
+  ["adding a base", "base: acme\n", null, "acme"],
+  ["dropping the base line", "", "acme", null],
+])(
+  "%s patches base alone and waits for the reprovision",
+  async (_, extra, was, now) => {
+    writeFileSync(file, `${yaml}${extra}`);
+    writeFileSync(
+      lockFile,
+      JSON.stringify({ envId: "env_1", specHash: "old" }),
+    );
+    server.use(
+      getSequence(
+        env({ base: was }),
+        env({ base: now, status: "provisioning", checkpointId: null }),
+        env({ base: now }),
+      ),
+      http.patch(
+        `${apiUrl}/v1/environments/env_1`,
+        recordWrite(
+          202,
+          env({ base: now, status: "provisioning", checkpointId: null }),
+        ),
+      ),
+    );
+    const r = await runCli(["apply", file]);
+    expect(r.code).toBe(0);
+    expect(writes).toEqual([{ method: "PATCH", body: { base: now } }]);
+    expect(r.stderr).toMatch(/provisioning/);
+  },
+);
+
+test("a base the env already has is not patched", async () => {
+  writeFileSync(file, `${yaml}base: acme\n`);
+  server.use(list(env({ base: "acme" })));
+  const r = await runCli(["apply", file]);
+  expect(r.code).toBe(0);
+  expect(writes).toEqual([]);
+  expect(r.stdout).toBe("up to date web env_1\n");
 });

@@ -58,6 +58,8 @@ beforeEach(() => {
     worktreesDir: join(root, "worktrees"),
     approvalPolicy: [],
     autoApprove: { defaults: true, commands: [] },
+    sessionEnv: {},
+    checks: [],
     waitTimeoutMs: 60_000,
   };
 });
@@ -686,34 +688,35 @@ test("the session's git config pairs go after any the project's env already sets
   }
 });
 
-test("the plugin's own store sync is off in the session, since the runner syncs the store under a lock", async () => {
+test("the profile's session variables reach the session, over the caller's env", async () => {
+  vi.stubEnv("PLUGIN_SWITCH", "caller");
   const query = scripted([init, success]);
-  await runSession(config, {
-    query,
-    post: recorder().post,
-    signal: new AbortController().signal,
-    awaitDecision: noDecision,
-  });
-  expect(query.calls[0]?.options.env).toMatchObject({ KRU_NO_STORE_SYNC: "1" });
-});
-
-test.each([["0"], [""], ["true"]])(
-  "the plugin's store sync stays off in the session when the caller env says KRU_NO_STORE_SYNC=%j",
-  async (value) => {
-    vi.stubEnv("KRU_NO_STORE_SYNC", value);
-    const query = scripted([init, success]);
-    await runSession(config, {
+  await runSession(
+    { ...config, sessionEnv: { PLUGIN_SWITCH: "1", OTHER: "x" } },
+    {
       query,
       post: recorder().post,
       signal: new AbortController().signal,
       awaitDecision: noDecision,
-    });
-    expect(query.calls[0]?.options.env?.KRU_NO_STORE_SYNC).toBe("1");
-  },
-);
+    },
+  );
+  expect(query.calls[0]?.options.env).toMatchObject({
+    PLUGIN_SWITCH: "1",
+    OTHER: "x",
+  });
+});
 
-test("the session sees the caller's KRU_STORE_REPO unchanged", async () => {
-  vi.stubEnv("KRU_STORE_REPO", "acme/store");
+test("with no profile, the session env holds the caller's env plus only the runner's git identity and config", async () => {
+  for (const name of [
+    "GIT_AUTHOR_NAME",
+    "GIT_AUTHOR_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+  ])
+    vi.stubEnv(name, undefined);
   const query = scripted([init, success]);
   await runSession(config, {
     query,
@@ -721,7 +724,20 @@ test("the session sees the caller's KRU_STORE_REPO unchanged", async () => {
     signal: new AbortController().signal,
     awaitDecision: noDecision,
   });
-  expect(query.calls[0]?.options.env?.KRU_STORE_REPO).toBe("acme/store");
+  const env = query.calls[0]?.options.env ?? {};
+  expect(
+    Object.keys(env)
+      .filter((k) => !(k in process.env))
+      .sort(),
+  ).toEqual([
+    "GIT_AUTHOR_EMAIL",
+    "GIT_AUTHOR_NAME",
+    "GIT_COMMITTER_EMAIL",
+    "GIT_COMMITTER_NAME",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_KEY_0",
+    "GIT_CONFIG_VALUE_0",
+  ]);
 });
 
 test("with a GitHub connector in its env, the session is told to publish through the runner instead of git push or gh", async () => {
@@ -750,24 +766,75 @@ test("with a GitHub connector in its env, the session is told to publish through
   }
 });
 
-test("without a GitHub connector, the session is still told how to run the Kru checks", async () => {
-  vi.stubEnv("GITHUB_CONNECTOR", undefined);
-  try {
-    const query = scripted([init, success]);
-    await runSession(config, {
+const appendOf = async (checks: string[]) => {
+  const query = scripted([init, success]);
+  await runSession(
+    { ...config, checks },
+    {
       query,
       post: recorder().post,
       signal: new AbortController().signal,
       awaitDecision: noDecision,
-    });
-    const append =
-      (query.calls[0]?.options.systemPrompt as { append?: string } | undefined)
-        ?.append ?? "";
+    },
+  );
+  return (
+    (query.calls[0]?.options.systemPrompt as { append?: string } | undefined)
+      ?.append ?? ""
+  );
+};
+
+test("with checks in the profile, the session is told to run them in order before finishing, connector or not", async () => {
+  vi.stubEnv("GITHUB_CONNECTOR", undefined);
+  try {
+    const append = await appendOf([
+      'env -u ANTHROPIC_API_KEY claude -p "/acme:review"',
+      "update the changelog",
+    ]);
     expect(append).not.toContain("publish --title");
+    expect(append).toContain("Before you finish, run these checks");
     expect(append).toContain(
-      'env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"',
+      '- env -u ANTHROPIC_API_KEY claude -p "/acme:review"\n- update the changelog',
     );
-    expect(append).toContain('claude -p "/kru:text-fix"');
+    expect(append).toContain("Never set or use an API key");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("with a connector and checks, the publish instructions come first, then the checks, as separate paragraphs", async () => {
+  vi.stubEnv("GITHUB_CONNECTOR", "conn_123");
+  try {
+    const append = await appendOf(["update the changelog"]);
+    const paragraphs = append.split("\n\n");
+    expect(paragraphs).toHaveLength(2);
+    expect(paragraphs[0]).toContain(" publish --title <title>");
+    expect(paragraphs[0]).not.toContain("Before you finish");
+    expect(paragraphs[1]).toMatch(/^Before you finish, run these checks/);
+    expect(paragraphs[1]).toContain("- update the changelog");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("a check written as plain `claude -p` is still run with the API key unset", async () => {
+  vi.stubEnv("GITHUB_CONNECTOR", undefined);
+  try {
+    const append = await appendOf(['claude -p "/acme:review"']);
+    expect(append).toContain('- claude -p "/acme:review"');
+    expect(append).toContain(
+      "`env -u ANTHROPIC_API_KEY claude -p …`, even where the check leaves that prefix out",
+    );
+    expect(append).not.toContain("as written");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
+test("without checks, the session is told nothing about them", async () => {
+  vi.stubEnv("GITHUB_CONNECTOR", undefined);
+  try {
+    const append = await appendOf([]);
+    expect(append).toBe("");
   } finally {
     vi.unstubAllEnvs();
   }

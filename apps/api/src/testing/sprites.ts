@@ -19,6 +19,7 @@ export const testConfig = (overrides: Partial<Config> = {}): Config => ({
   runTimeoutMs: 30 * 60_000,
   spritesLongTimeoutMs: 30 * 60_000,
   waitTimeoutMs: 120 * 60_000,
+  baseProfiles: {},
   webhookSigningKey: "webhook-signing-key-for-tests-0123456789",
   secretEncryptionKey: Buffer.alloc(32, 1),
   ...overrides,

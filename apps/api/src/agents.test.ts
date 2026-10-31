@@ -6,6 +6,7 @@ import { SpritesClient } from "@fly/sprites";
 import { type Db, environments, migrate, openDb, runs, secrets } from "@sky/db";
 import {
   type AgentId,
+  BaseProfile,
   type EnvironmentId,
   EVENT_TEXT_MAX,
   type RunId,
@@ -16,6 +17,7 @@ import { HttpResponse, http, ws } from "msw";
 import { afterEach, beforeEach, expect, test, vi } from "vitest";
 import { server } from "../../../test/msw.js";
 import { createApp } from "./app.js";
+import { BASE_ENV_NAMES } from "./base-profile.js";
 import type { Config } from "./config.js";
 import { envSecretAad, seal } from "./crypto.js";
 import { failStaleRuns } from "./runs.js";
@@ -43,7 +45,10 @@ beforeEach(() => {
   migrate(db);
   wire = stubSprites();
   logs = [];
-  config = testConfig({ runnerBundlePath: join(dir, "runner.mjs") });
+  config = testConfig({
+    runnerBundlePath: join(dir, "runner.mjs"),
+    baseProfiles: { team },
+  });
   app = createApp({
     db,
     config,
@@ -265,6 +270,28 @@ test("a secret stored under a reserved name never reaches the runner, so the env
   );
 });
 
+const team = BaseProfile.parse({
+  storeRepo: "acme/store",
+  storeLayout: { home: ".store" },
+  sessionEnv: { PLUGIN_SWITCH: "1" },
+  checks: ["run the linter", "update the changelog"],
+});
+
+const BASE_NAMES = [
+  "SKY_STORE_REPO",
+  "SKY_STORE_HOME",
+  "SKY_STORE_LAYOUT",
+  "SKY_SESSION_ENV",
+  "SKY_CHECKS",
+];
+const profileEnv: Record<string, string> = {
+  SKY_STORE_REPO: "acme/store",
+  SKY_STORE_HOME: ".store",
+  SKY_STORE_LAYOUT: JSON.stringify(team.storeLayout),
+  SKY_SESSION_ENV: '{"PLUGIN_SWITCH":"1"}',
+  SKY_CHECKS: '["run the linter","update the changelog"]',
+};
+
 const putSecret = (envId: string, name: string, body: unknown) =>
   app.request(`/v1/environments/${envId}/secrets/${name}`, {
     method: "PUT",
@@ -292,7 +319,6 @@ test("the env's secrets reach the runner through the env file, quotes intact; a 
     TRICKY: tricky,
     DB_URL: "postgres://u:p@db/x",
     GITHUB_CONNECTOR: "VPpb7x",
-    KRU_STORE_REPO: "ap-justin/kru-store",
     CLAUDE_CODE_OAUTH_TOKEN: config.claudeOauthToken,
     AGENT_TOKEN: expect.any(String),
   });
@@ -309,52 +335,143 @@ test("the env's secrets reach the runner through the env file, quotes intact; a 
   );
 });
 
-test("with a GITHUB_CONNECTOR connector, every agent's session gets the Kru store repo, whatever a secret says", async () => {
-  const envId = readyEnv();
+const connect = async (envId: string) =>
   expect(
     (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
       .status,
   ).toBe(200);
-  expect(
-    (await putSecret(envId, "KRU_STORE_REPO", { value: "someone/else" }))
-      .status,
-  ).toBe(200);
+
+test("an env with a base profile and a GITHUB_CONNECTOR connector gives every session the profile's store, session variables and checks", async () => {
+  const envId = readyEnv({ base: "team" });
+  await connect(envId);
   await launched(envId);
   await sessionOpened();
-  expect(envFileOf(wire, wire.sessions[0]).KRU_STORE_REPO).toBe(
-    "ap-justin/kru-store",
-  );
-});
-
-test("a launch's envVars cannot point the Kru store at another repo", async () => {
-  const envId = readyEnv();
-  expect(
-    (await putSecret(envId, "GITHUB_CONNECTOR", { connector: "VPpb7x" }))
-      .status,
-  ).toBe(200);
-  const res = await launch({
-    envId,
-    prompt: "go",
-    envVars: { KRU_STORE_REPO: "someone/else" },
+  expect(envFileOf(wire, wire.sessions[0])).toMatchObject({
+    SKY_STORE_REPO: "acme/store",
+    SKY_STORE_HOME: ".store",
+    SKY_STORE_LAYOUT: JSON.stringify(team.storeLayout),
+    SKY_SESSION_ENV: '{"PLUGIN_SWITCH":"1"}',
+    SKY_CHECKS: '["run the linter","update the changelog"]',
   });
-  expect(res.status).toBe(202);
-  await sessionOpened();
-  expect(envFileOf(wire, wire.sessions[0]).KRU_STORE_REPO).toBe(
-    "ap-justin/kru-store",
-  );
 });
 
-test("a session in an env with no GITHUB_CONNECTOR connector is told of no Kru store", async () => {
-  const envId = readyEnv();
+test.each(BASE_NAMES)(
+  "a secret named %s is refused, since the profile fills it",
+  async (name) => {
+    const envId = readyEnv({ base: "team" });
+    const res = await putSecret(envId, name, { value: "someone/else" });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: { code: "reserved_name" },
+    });
+  },
+);
+
+test.each(BASE_NAMES)(
+  "a launch's envVars cannot set %s, which the profile fills",
+  async (name) => {
+    const envId = readyEnv({ base: "team" });
+    await connect(envId);
+    const res = await launch({
+      envId,
+      prompt: "go",
+      envVars: { [name]: "someone/else" },
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({
+      error: { code: "reserved_name", message: `${name} is reserved by sky` },
+    });
+    expect(db.$client.prepare("select count(*) n from runs").get()).toEqual({
+      n: 0,
+    });
+  },
+);
+
+/** A row written before the name was reserved; PUT refuses it now. */
+const seedLegacySecret = (
+  envId: `env_${string}`,
+  name: string,
+  value: string,
+) =>
+  db
+    .insert(secrets)
+    .values({
+      envId,
+      name,
+      kind: "value",
+      connector: null,
+      ...seal(config.secretEncryptionKey, value, envSecretAad(envId, name)),
+    })
+    .run();
+
+test.each(BASE_NAMES)(
+  "a stored %s secret never overrides the profile's value, and the log says it was dropped",
+  async (name) => {
+    const envId = readyEnv({ base: "team" });
+    await connect(envId);
+    seedLegacySecret(envId, name, "someone/else");
+    const { agent, run } = await launched(envId);
+    await sessionOpened();
+    const file = envFileOf(wire, wire.sessions[0]);
+    expect(file[name]).toBe(profileEnv[name]);
+    await vi.waitFor(async () =>
+      expect((await getRun(agent.id, run.id)).body.secretNames).toEqual([
+        "GITHUB_CONNECTOR",
+      ]),
+    );
+    expect(logs.join("\n")).toContain(
+      `secret ${name} on ${envId} is reserved by sky; not passed to ${run.id}`,
+    );
+  },
+);
+
+test.each(BASE_NAMES)(
+  "a stored %s secret in an env with no base profile reaches no session",
+  async (name) => {
+    const envId = readyEnv();
+    await connect(envId);
+    seedLegacySecret(envId, name, "someone/else");
+    await launched(envId);
+    await sessionOpened();
+    expect(envFileOf(wire, wire.sessions[0])).not.toHaveProperty(name);
+  },
+);
+
+test("a session in an env with no GITHUB_CONNECTOR connector gets no store, but still the profile's variables and checks", async () => {
+  const envId = readyEnv({ base: "team" });
   expect(
     (await putSecret(envId, "GITHUB_CONNECTOR", { value: "ghp_pasted" }))
       .status,
   ).toBe(200);
   await launched(envId);
   await sessionOpened();
-  expect(envFileOf(wire, wire.sessions[0])).not.toHaveProperty(
-    "KRU_STORE_REPO",
+  const file = envFileOf(wire, wire.sessions[0]);
+  expect(file).not.toHaveProperty("SKY_STORE_REPO");
+  expect(file).not.toHaveProperty("SKY_STORE_HOME");
+  expect(file).toHaveProperty("SKY_CHECKS");
+  expect(file).toHaveProperty("SKY_SESSION_ENV");
+});
+
+test("an env with no base gets no store, session variables or checks, connector or not", async () => {
+  const envId = readyEnv();
+  await connect(envId);
+  await launched(envId);
+  await sessionOpened();
+  const file = envFileOf(wire, wire.sessions[0]);
+  for (const name of BASE_ENV_NAMES) expect(file).not.toHaveProperty(name);
+});
+
+test("an env whose base profile is no longer configured fails the run at launch, naming it, and starts no runner", async () => {
+  const envId = readyEnv({ base: "gone" });
+  await connect(envId);
+  const { agent, run } = await launched(envId);
+  await vi.waitFor(async () =>
+    expect((await getRun(agent.id, run.id)).body).toMatchObject({
+      status: "failed",
+      error: expect.stringContaining('base profile "gone"'),
+    }),
   );
+  expect(wire.sessions).toEqual([]);
 });
 
 test("a runner session that fails to open fails the run and deletes the env file it would have sourced", async () => {

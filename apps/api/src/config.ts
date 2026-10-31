@@ -1,4 +1,5 @@
 import { fileURLToPath } from "node:url";
+import { BaseProfiles } from "@sky/shared";
 import { z } from "zod";
 
 // the build copies the runner bundle next to the API bundle, which is where this module lands
@@ -6,6 +7,15 @@ const bundledRunner = fileURLToPath(new URL("./runner.mjs", import.meta.url));
 
 // likewise the CLI bundle, which GET /cli/sky.mjs serves
 const bundledCli = fileURLToPath(new URL("./sky.mjs", import.meta.url));
+
+const json = z.string().transform((s, ctx) => {
+  try {
+    return JSON.parse(s) as unknown;
+  } catch {
+    ctx.issues.push({ code: "custom", message: "expected JSON", input: s });
+    return z.NEVER;
+  }
+});
 
 const configSchema = z.object({
   /** Token68 only: bearerAuth rejects any token outside RFC 6750's token68 charset, so a key outside it could never match. */
@@ -25,8 +35,10 @@ const configSchema = z.object({
   RUN_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
   /** How long a runner waits on a question or approval before giving up; the runner gets it at launch. */
   WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
-  /** The bound on a sprite's clone, installs, setup script, Kru store steps and checkpoint. */
+  /** The bound on a sprite's clone, installs, setup script, store steps and checkpoint. */
   SPRITES_LONG_TIMEOUT_MINUTES: z.coerce.number().positive().default(30),
+  /** Base profiles by name, as JSON; an environment's `base` names one. Holds no secret values. */
+  SKY_BASE_PROFILES: json.pipe(BaseProfiles).default({}),
   /** HMAC key every outbound webhook delivery is signed with. */
   WEBHOOK_SIGNING_KEY: z.string().min(32),
   /** AES-256 key, base64, that env secrets and run envVars are encrypted under. */
@@ -49,11 +61,27 @@ export type Config = {
   runTimeoutMs: number;
   waitTimeoutMs: number;
   spritesLongTimeoutMs: number;
+  baseProfiles: BaseProfiles;
   webhookSigningKey: string;
   secretEncryptionKey: Buffer;
 };
 
 type Env = Record<string, string | undefined>;
+
+/**
+ * A union no branch matched reports one issue at the union, "Invalid input"; its branches' own
+ * issues, with their full paths, are what name the field that's wrong.
+ */
+function unionBranchIssues(issue: z.core.$ZodIssue): z.core.$ZodIssue[] {
+  if (issue.code !== "invalid_union" || issue.errors.length === 0) {
+    return [issue];
+  }
+  return issue.errors
+    .flat()
+    .flatMap((inner) =>
+      unionBranchIssues({ ...inner, path: [...issue.path, ...inner.path] }),
+    );
+}
 
 /** Names each bad variable; values stay out of the message since some are secrets. */
 export function loadConfig(
@@ -76,17 +104,22 @@ export function loadConfig(
         runTimeoutMs: e.RUN_TIMEOUT_MINUTES * 60_000,
         waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
         spritesLongTimeoutMs: e.SPRITES_LONG_TIMEOUT_MINUTES * 60_000,
+        baseProfiles: e.SKY_BASE_PROFILES,
         webhookSigningKey: e.WEBHOOK_SIGNING_KEY,
         secretEncryptionKey: Buffer.from(e.SECRET_ENCRYPTION_KEY, "base64"),
       },
     };
   }
   // zod's default issue messages describe the rule, never the input
-  const problems = parsed.error.issues.map((issue) => {
-    const name = String(issue.path[0]);
-    return env[name] === undefined
-      ? `${name} is missing`
-      : `${name} is invalid: ${issue.message}`;
-  });
+  const problems = parsed.error.issues
+    .flatMap(unionBranchIssues)
+    .map((issue) => {
+      const name = String(issue.path[0]);
+      // a nested path names the field inside a JSON variable, never its value
+      const field = issue.path.slice(1).map(String).join(".");
+      return env[name] === undefined
+        ? `${name} is missing`
+        : `${name}${field ? `.${field}` : ""} is invalid: ${issue.message}`;
+    });
   return { ok: false, message: `invalid config: ${problems.join("; ")}` };
 }

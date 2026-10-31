@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { loadConfig } from "./config.js";
 
@@ -28,6 +29,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
       runTimeoutMs: 30 * 60_000,
       waitTimeoutMs: 120 * 60_000,
+      baseProfiles: {},
       spritesLongTimeoutMs: 30 * 60_000,
       webhookSigningKey: "w".repeat(32),
       secretEncryptionKey: Buffer.alloc(32, 7),
@@ -128,4 +130,129 @@ test.each([
     ok: false,
     message: expect.stringContaining(message),
   });
+});
+
+const profileJson = JSON.stringify({
+  team: {
+    marketplaces: ["acme/plugins"],
+    plugins: ["review@plugins"],
+    mcpServers: {
+      docs: { command: "npx", args: ["-y", "docs-mcp"] },
+      search: {
+        url: "https://search.example.com/mcp",
+        headers: { "X-Api-Key": "SEARCH_KEY" },
+      },
+    },
+    storeRepo: "acme/store",
+    checks: ["run the linter"],
+  },
+});
+
+test("SKY_BASE_PROFILES is parsed into profiles with their defaults filled, and is empty when unset", () => {
+  const result = loadConfig({ ...required, SKY_BASE_PROFILES: profileJson });
+  expect(result.ok && result.config.baseProfiles).toEqual({
+    team: {
+      marketplaces: ["acme/plugins"],
+      plugins: ["review@plugins"],
+      mcpServers: {
+        docs: { command: "npx", args: ["-y", "docs-mcp"], env: {} },
+        search: {
+          url: "https://search.example.com/mcp",
+          headers: { "X-Api-Key": "SEARCH_KEY" },
+        },
+      },
+      storeRepo: "acme/store",
+      sessionEnv: {},
+      checks: ["run the linter"],
+    },
+  });
+  const bare = loadConfig({ ...required, SKY_BASE_PROFILES: '{"empty":{}}' });
+  expect(bare.ok && bare.config.baseProfiles).toEqual({
+    empty: {
+      marketplaces: [],
+      plugins: [],
+      mcpServers: {},
+      sessionEnv: {},
+      checks: [],
+    },
+  });
+  expect(loadConfig(required)).toMatchObject({
+    ok: true,
+    config: { baseProfiles: {} },
+  });
+});
+
+// each input carries SECRET where a credential would sit; the message must name the field, not echo it
+const SECRET = "sk-live";
+test.each([
+  [
+    "JSON that isn't JSON",
+    `{${SECRET}`,
+    "SKY_BASE_PROFILES is invalid: expected JSON",
+  ],
+  [
+    "a profile with an unknown field",
+    `{"team":{"secrets":{"KEY":"${SECRET}"}}}`,
+    'SKY_BASE_PROFILES.team is invalid: Unrecognized key: "secrets"',
+  ],
+  [
+    "a plugin that isn't name@marketplace",
+    `{"team":{"plugins":["${SECRET}"]}}`,
+    "SKY_BASE_PROFILES.team.plugins.0 is invalid: Invalid string: must match pattern /^[A-Za-z0-9][^@\\s]*@[^@\\s]+$/",
+  ],
+  [
+    "a profile name with a space",
+    `{"a b":{"checks":["${SECRET}"]}}`,
+    "SKY_BASE_PROFILES.a b is invalid: Invalid key in record",
+  ],
+  [
+    "a store repo that isn't owner/name",
+    `{"team":{"storeRepo":"${SECRET}"}}`,
+    "SKY_BASE_PROFILES.team.storeRepo is invalid: expected a GitHub repo as owner/name",
+  ],
+  [
+    "an MCP credential that isn't a secret's name",
+    `{"team":{"mcpServers":{"x":{"command":"x","env":{"KEY":"${SECRET} abc"}}}}}`,
+    "SKY_BASE_PROFILES.team.mcpServers.x.env.KEY is invalid: expected an env secret's name",
+  ],
+  [
+    "an MCP server that is neither stdio nor http",
+    `{"team":{"mcpServers":{"x":{"args":["${SECRET}"]}}}}`,
+    'SKY_BASE_PROFILES.team.mcpServers.x.command is invalid: Invalid input: expected string, received undefined; SKY_BASE_PROFILES.team.mcpServers.x.url is invalid: Invalid input: expected string, received undefined; SKY_BASE_PROFILES.team.mcpServers.x is invalid: Unrecognized key: "args"',
+  ],
+  [
+    "an MCP server mixing stdio and http fields",
+    `{"team":{"mcpServers":{"x":{"command":"","url":"${SECRET} abc"}}}}`,
+    'SKY_BASE_PROFILES.team.mcpServers.x.command is invalid: Too small: expected string to have >=1 characters; SKY_BASE_PROFILES.team.mcpServers.x is invalid: Unrecognized key: "url"; SKY_BASE_PROFILES.team.mcpServers.x.url is invalid: Invalid URL; SKY_BASE_PROFILES.team.mcpServers.x is invalid: Unrecognized key: "command"',
+  ],
+  [
+    "a store home outside $HOME",
+    `{"team":{"storeRepo":"a/b","storeLayout":{"home":"/etc/${SECRET}"}}}`,
+    "SKY_BASE_PROFILES.team.storeLayout.home is invalid: expected a path under $HOME",
+  ],
+  [
+    "a marketplace source that is a flag",
+    `{"team":{"marketplaces":["--${SECRET}"]}}`,
+    "SKY_BASE_PROFILES.team.marketplaces.0 is invalid: Invalid string: must match pattern /^[^\\s-][^\\s]*$/",
+  ],
+])(
+  "SKY_BASE_PROFILES with %s is rejected, naming the field and never the value",
+  (_, value, problems) => {
+    const result = loadConfig({ ...required, SKY_BASE_PROFILES: value });
+    expect(result).toEqual({
+      ok: false,
+      message: `invalid config: ${problems}`,
+    });
+    expect(!result.ok && result.message).not.toContain(SECRET);
+  },
+);
+
+test("docs/examples/base-profile.kru.json is a valid SKY_BASE_PROFILES", () => {
+  const example = readFileSync(
+    new URL("../../../docs/examples/base-profile.kru.json", import.meta.url),
+    "utf8",
+  );
+  const result = loadConfig({ ...required, SKY_BASE_PROFILES: example });
+  expect(result.ok).toBe(true);
+  expect(result.ok && Object.keys(result.config.baseProfiles)).toEqual(["kru"]);
 });

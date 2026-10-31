@@ -64,6 +64,13 @@
       "when": 1793378614815,
       "tag": "0008_fearless_stardust",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1793457834928,
+      "tag": "0009_smooth_risque",
+      "breakpoints": true
     }
   ]
 }

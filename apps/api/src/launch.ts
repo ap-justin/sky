@@ -1,11 +1,17 @@
 import { type Db, environments, runs } from "@sky/db";
-import type { AgentId, AutoApprove, EnvironmentId, RunId } from "@sky/shared";
+import type {
+  AgentId,
+  AutoApprove,
+  BaseProfile,
+  EnvironmentId,
+  RunId,
+} from "@sky/shared";
 import { and, eq } from "drizzle-orm";
 import { mintAgentToken } from "./agent-token.js";
+import { runEnv } from "./base-profile.js";
 import type { Config } from "./config.js";
 import {
   envFile,
-  KRU_STORE_REPO,
   REPO_DIR,
   RUNNER,
   WITH_PACKAGE_MANAGERS,
@@ -166,6 +172,28 @@ export function createLauncher({
   nudgeDeliveries,
   watchMs,
 }: Deps) {
+  /** The env's base profile, without its store when there is no connector to reach GitHub with. */
+  function profileFor(
+    envId: EnvironmentId,
+    connector: boolean,
+  ): BaseProfile | undefined {
+    const row = db
+      .select({ base: environments.base })
+      .from(environments)
+      .where(eq(environments.id, envId))
+      .get();
+    const profile = row?.base ? config.baseProfiles[row.base] : undefined;
+    // a run without its profile would skip the env's checks and store sync unnoticed
+    if (row?.base && !profile) {
+      throw new Error(
+        `base profile ${JSON.stringify(row.base)} of ${envId} is not configured on this server`,
+      );
+    }
+    return profile && !connector
+      ? { ...profile, storeRepo: undefined }
+      : profile;
+  }
+
   async function run(launch: Launch, agentToken: string): Promise<void> {
     const known = [agentToken];
     await ensureBundle(launch.spriteName, launch.runId);
@@ -220,11 +248,14 @@ export function createLauncher({
       envFile([
         ...envSecrets,
         ...envVars,
-        // after the secrets, so no secret points Kru at another store than the one the runner syncs;
-        // without the connector the runner has nothing to sync through
-        ...(hasConnectorSecret(db, launch.envId, "GITHUB_CONNECTOR")
-          ? [["KRU_STORE_REPO", KRU_STORE_REPO] as const]
-          : []),
+        // after the secrets, so no secret points the runner at another store or other checks than the
+        // env's base profile; without the connector it has nothing to sync a store through
+        ...runEnv(
+          profileFor(
+            launch.envId,
+            hasConnectorSecret(db, launch.envId, "GITHUB_CONNECTOR"),
+          ),
+        ),
         ["CLAUDE_CODE_OAUTH_TOKEN", config.claudeOauthToken],
         ["AGENT_TOKEN", agentToken],
       ]),

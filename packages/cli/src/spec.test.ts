@@ -12,6 +12,7 @@ test("parses a spec and fills the schema defaults", () => {
       name: "web",
       repo: "acme/web",
       setup: "pnpm install\n",
+      base: null,
       concurrency: 3,
       approvalPolicy: [],
       autoApprove: { defaults: true, commands: [] },
@@ -99,4 +100,30 @@ test("reads autoApprove overrides and names the line of a bad command", () => {
   expect(bad.ok).toBe(false);
   if (bad.ok) return;
   expect(bad.errors[0]).toMatch(/^env\.yaml:6: autoApprove\.commands\.0: /);
+});
+
+test("reads a base profile's name, and refuses a name the API would", () => {
+  expect(
+    parseSpec("name: web\nrepo: acme/web\nsetup: x\nbase: acme\n", "env.yaml"),
+  ).toMatchObject({ ok: true, spec: { base: "acme" } });
+  const bad = parseSpec(
+    "name: web\nrepo: acme/web\nsetup: x\nbase: not a name\n",
+    "env.yaml",
+  );
+  expect(bad).toMatchObject({ ok: false });
+  expect(bad.ok ? [] : bad.errors[0]).toContain("env.yaml:4: base:");
+});
+
+test("a spec's hash changes with its base", () => {
+  const base = {
+    name: "web",
+    repo: "acme/web",
+    setup: "x",
+    concurrency: 3,
+    approvalPolicy: [],
+    autoApprove: { defaults: true, commands: [] },
+  };
+  expect(specHash({ ...base, base: null })).not.toBe(
+    specHash({ ...base, base: "acme" }),
+  );
 });

@@ -4,6 +4,7 @@ import { EnvironmentId, type RunId } from "@sky/shared";
 import { and, asc, eq, isNotNull, lte } from "drizzle-orm";
 import type { Context } from "hono";
 import { z } from "zod";
+import { BASE_ENV_NAMES } from "./base-profile.js";
 import {
   envSecretAad,
   open,
@@ -21,7 +22,8 @@ import { body, jsonBody } from "./validation.js";
 export const EnvVarName = z.string().regex(/^[A-Za-z_][A-Za-z0-9_]*$/);
 
 // the runner's own variables, and what would hijack the shell or node that start it
-const reservedNames = new Set([
+const reservedNames = new Set<string>([
+  ...BASE_ENV_NAMES,
   "AGENT_ID",
   "RUN_ID",
   "API_BASE_URL",

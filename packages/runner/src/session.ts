@@ -79,12 +79,6 @@ function withGitConfig(
   return { ...env, ...added };
 }
 
-/**
- * The runner syncs the Kru store itself, under a lock and through the connector; the plugin's own
- * hook would clone from github.com, which a sprite can't reach, and race it on the same checkout.
- */
-const KRU_PLUGIN_SYNC_OFF = { KRU_NO_STORE_SYNC: "1" };
-
 type RunnerEvent = Omit<RunnerEventPost, "runId">;
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
   ? Omit<T, K>
@@ -107,7 +101,7 @@ function sessionOptions(
     resume: config.sessionId,
     abortController,
     env: withGitConfig(
-      { ...env, ...SESSION_GIT_IDENTITY, ...KRU_PLUGIN_SYNC_OFF },
+      { ...env, ...SESSION_GIT_IDENTITY, ...config.sessionEnv },
       SESSION_GIT_CONFIG,
     ),
     systemPrompt: {
@@ -115,7 +109,7 @@ function sessionOptions(
       preset: "claude_code",
       append: [
         ...(env[CONNECTOR_ENV] ? [publishInstructions()] : []),
-        KRU_CHECK_INSTRUCTIONS,
+        ...(config.checks.length > 0 ? [checkInstructions(config.checks)] : []),
       ].join("\n\n"),
     },
     // the approval policy holds calls in the PreToolUse hook; everything else runs unasked
@@ -142,14 +136,18 @@ const publishInstructions = () =>
   ].join("\n");
 
 /**
- * Plugin skills can't be invoked by the model, so the Kru checks run as a nested, headless session;
- * the runner has logged it in with the subscription, and an API key must stay out of it.
+ * The env's base profile lists what to run before finishing. A command that calls `claude` runs as
+ * a nested headless session, which the runner has logged in with the subscription; an API key must
+ * stay out of it. The session env carries the project's ANTHROPIC_API_KEY, which a nested `claude`
+ * would use over the login, so the prompt has it unset whatever the profile wrote.
  */
-const KRU_CHECK_INSTRUCTIONS = [
-  "To run the Kru checks on your change, run them from the repo root through a nested headless session; the Skill tool can't invoke them (they are reserved for the user):",
-  '`env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"`, then `env -u ANTHROPIC_API_KEY claude -p "/kru:text-fix"`.',
-  "The nested session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
-].join("\n");
+const checkInstructions = (checks: string[]) =>
+  [
+    "Before you finish, run these checks on your change, in order, from the repo root. Plugin skills can't be invoked through the Skill tool, so run any `claude -p` command through Bash:",
+    ...checks.map((check) => `- ${check}`),
+    "Run each command that calls `claude` with ANTHROPIC_API_KEY unset, as `env -u ANTHROPIC_API_KEY claude -p …`, even where the check leaves that prefix out.",
+    "A nested `claude` session is already logged in with the sandbox's subscription. Never set or use an API key for it, and never print or read credential files or tokens. Give each call a 10-minute timeout, fix what the checks find, and report the checks' output if one can't run.",
+  ].join("\n");
 
 /**
  * Hooks forward what Claude is doing without holding it up: the event is queued

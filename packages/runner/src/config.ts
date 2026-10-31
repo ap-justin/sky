@@ -36,6 +36,9 @@ const Env = z.object({
     commands: [],
   }),
   WAIT_TIMEOUT_MINUTES: z.coerce.number().positive().default(120),
+  // the env's base profile: variables for the session, and the lines it is told to follow before finishing
+  SKY_SESSION_ENV: json.pipe(z.record(z.string(), z.string())).default({}),
+  SKY_CHECKS: json.pipe(z.array(z.string().min(1))).default([]),
 });
 
 export type Config = {
@@ -51,6 +54,10 @@ export type Config = {
   approvalPolicy: string[];
   /** Read-only Bash commands that skip `approvalPolicy`; see `isAutoApproved`. */
   autoApprove: AutoApprove;
+  /** Variables set in the session on top of the runner's own env. */
+  sessionEnv: Record<string, string>;
+  /** Instruction lines or commands the agent is told to run before it finishes; none when empty. */
+  checks: string[];
   /** How long one wait for an answer or approval may last before the run fails. */
   waitTimeoutMs: number;
 };
@@ -78,6 +85,8 @@ export function loadConfig(env: NodeJS.ProcessEnv): Config {
     worktreesDir: e.WORKTREES_DIR,
     approvalPolicy: e.APPROVAL_POLICY,
     autoApprove: e.AUTO_APPROVE,
+    sessionEnv: e.SKY_SESSION_ENV,
+    checks: e.SKY_CHECKS,
     waitTimeoutMs: e.WAIT_TIMEOUT_MINUTES * 60_000,
   };
 }
