@@ -19,12 +19,13 @@ import { activeRunStatuses, type Tx } from "./runs.js";
 import { destroySprite, type SpriteOps, spriteNameFor } from "./sprites.js";
 import { body, jsonBody } from "./validation.js";
 
-const { name, repo, setup, concurrency, approvalPolicy, autoApprove } =
+const { name, repo, setup, base, concurrency, approvalPolicy, autoApprove } =
   Environment.shape;
 const EnvironmentInput = z.strictObject({
   name,
   repo,
   setup,
+  base,
   concurrency,
   approvalPolicy,
   autoApprove,
@@ -36,6 +37,7 @@ const EnvironmentPatch = z.strictObject({
   name: name.optional(),
   repo: repo.optional(),
   setup: setup.optional(),
+  base: base.unwrap().optional(),
   concurrency: concurrency.unwrap().optional(),
   approvalPolicy: approvalPolicy.unwrap().optional(),
   autoApprove: z
@@ -54,6 +56,7 @@ const present = (row: EnvRow) => ({
     name: row.name,
     repo: row.repo,
     setup: row.setup,
+    base: row.base,
     status: row.status,
     spriteName: row.spriteName,
     checkpointId: row.checkpointId,
@@ -68,6 +71,13 @@ const present = (row: EnvRow) => ({
       : { step: row.failureStep, stderr: row.failureStderr ?? "" },
   createdAt: row.createdAt,
 });
+
+const unknownBase = (base: string, known: string[]) =>
+  `unknown base profile ${JSON.stringify(base)}; ${
+    known.length === 0
+      ? "this server has none configured"
+      : `this server has: ${known.join(", ")}`
+  }`;
 
 const nameTakenResult = { kind: "name_taken" } as const;
 
@@ -155,6 +165,15 @@ export function environmentRoutes(
     })
     .post("/", jsonBody, body(EnvironmentInput), (c) => {
       const input = c.req.valid("json");
+      const profiles = Object.keys(c.var.config.baseProfiles);
+      if (input.base !== null && !profiles.includes(input.base)) {
+        return apiError(
+          c,
+          400,
+          "unknown_base",
+          unknownBase(input.base, profiles),
+        );
+      }
       const id = mintId("env");
       const row = nameTakenOnConflict(() =>
         c.var.db.transaction(
@@ -190,6 +209,19 @@ export function environmentRoutes(
     .patch("/:id", envParam, jsonBody, body(EnvironmentPatch), (c) => {
       const { id } = c.req.valid("param");
       const patch = c.req.valid("json");
+      const profiles = Object.keys(c.var.config.baseProfiles);
+      if (
+        patch.base !== undefined &&
+        patch.base !== null &&
+        !profiles.includes(patch.base)
+      ) {
+        return apiError(
+          c,
+          400,
+          "unknown_base",
+          unknownBase(patch.base, profiles),
+        );
+      }
       const outcome = nameTakenOnConflict(() =>
         c.var.db.transaction(
           (tx) => {
@@ -198,7 +230,8 @@ export function environmentRoutes(
             if (hasActiveRun(tx, id)) return { kind: "run_active" } as const;
             const reprovision =
               (patch.repo !== undefined && patch.repo !== env.repo) ||
-              (patch.setup !== undefined && patch.setup !== env.setup);
+              (patch.setup !== undefined && patch.setup !== env.setup) ||
+              (patch.base !== undefined && patch.base !== env.base);
             if (reprovision && env.status === "provisioning") {
               return { kind: "provisioning" } as const;
             }
@@ -254,7 +287,7 @@ export function environmentRoutes(
             c,
             409,
             "agents_exist",
-            `changing repo or setup replaces every agent's worktree and branch; archive agents ${outcome.agentIds.join(", ")} first`,
+            `changing repo, setup or base replaces every agent's worktree and branch; archive agents ${outcome.agentIds.join(", ")} first`,
           );
       }
       if (outcome.reprovision) {

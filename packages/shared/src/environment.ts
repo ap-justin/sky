@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { commandEntryProblem } from "./auto-approve.js";
+import { BaseProfileName } from "./base-profile.js";
 import { EnvironmentId } from "./ids.js";
 
 export const EnvironmentStatus = z.enum(["provisioning", "ready", "failed"]);
@@ -36,6 +37,8 @@ export const Environment = z.object({
     ),
   /** Shell script run once after clone, before the checkpoint. */
   setup: z.string(),
+  /** Name of a server-side base profile applied before `setup`; null applies none. */
+  base: BaseProfileName.nullable().default(null),
   status: EnvironmentStatus,
   spriteName: z.string().min(1),
   /** Null until the post-setup checkpoint exists. */

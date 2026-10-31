@@ -22,8 +22,29 @@ test("reads a run from env, defaulting the sprite paths", () => {
     worktreesDir: "/workspace/worktrees",
     approvalPolicy: [],
     autoApprove: { defaults: true, commands: [] },
+    sessionEnv: {},
+    checks: [],
     waitTimeoutMs: 120 * 60_000,
   });
+});
+
+test("reads the profile's session variables and checks, and refuses ones that aren't", () => {
+  expect(
+    loadConfig({
+      ...env,
+      SKY_SESSION_ENV: '{"A":"1"}',
+      SKY_CHECKS: '["run the tests", "lint"]',
+    }),
+  ).toMatchObject({
+    sessionEnv: { A: "1" },
+    checks: ["run the tests", "lint"],
+  });
+  expect(() => loadConfig({ ...env, SKY_CHECKS: "run it" })).toThrow(
+    "SKY_CHECKS",
+  );
+  expect(() => loadConfig({ ...env, SKY_SESSION_ENV: '["A"]' })).toThrow(
+    "SKY_SESSION_ENV",
+  );
 });
 
 test("reads the approval policy and the max wait", () => {

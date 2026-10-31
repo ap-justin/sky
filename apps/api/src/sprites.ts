@@ -16,7 +16,7 @@ export type SpriteOps = {
   secrets: KnownSecrets;
   /** The bound on a call that should answer promptly: a file write, a check, a short command. */
   timeoutMs: number;
-  /** The bound on clone, installs, the setup script, the Kru store steps and checkpoint. */
+  /** The bound on clone, installs, the setup script, the store steps and checkpoint. */
   longTimeoutMs: number;
 };
 

@@ -1,9 +1,10 @@
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, rm, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { parseArgs, promisify } from "node:util";
+import { parseArgs } from "node:util";
+import { BaseProfileStoreLayout } from "@sky/shared";
 import {
   CONNECTOR_ENV,
   DEFAULT_GATEWAY_URL,
@@ -12,12 +13,14 @@ import {
   gateway,
 } from "./publish.js";
 
-const run = promisify(execFile);
-
 /** The env var naming the store repo (`owner/repo`); unset, nothing syncs. */
-export const STORE_REPO_ENV = "KRU_STORE_REPO";
-/** Kru's own kill switch for store sync; the runner honors it too. */
-export const NO_SYNC_ENV = "KRU_NO_STORE_SYNC";
+export const STORE_REPO_ENV = "SKY_STORE_REPO";
+/** The env var holding the store's layout as JSON (`BaseProfileStoreLayout`); unset, the defaults. */
+export const STORE_LAYOUT_ENV = "SKY_STORE_LAYOUT";
+/** Kill switch for store sync. */
+export const NO_SYNC_ENV = "SKY_NO_STORE_SYNC";
+/** The kill switch's earlier name, still honored. */
+const LEGACY_NO_SYNC_ENV = "KRU_NO_STORE_SYNC";
 export const STORE_SYNC_USAGE = "store-sync <pull|push>";
 
 // the store's git repo is local; GitHub, reachable only through the gateway's REST API, holds the
@@ -37,14 +40,8 @@ const BLOB_FETCH_CONCURRENCY = 8;
 const PROGRESS_EVERY = 100;
 // `git hash-object -t tree /dev/null`
 const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
-// session-lived hook state and our lock stay out of the store, as kru's own defaults keep them
-const EXCLUDES = ["audit/", "lead-gate/", "tmp/", ".DS_Store", LOCK_FILE];
-// the line files merge by kru's driver, so two agents' appends both land
-const ATTRIBUTES = [
-  "inbox.md merge=kru-lines",
-  "refusals.jsonl merge=kru-lines",
-  "management/*/TODOS.md merge=kru-lines",
-];
+// our lock stays out of the store, with whatever the layout keeps local to the sprite
+const ALWAYS_EXCLUDED = [".DS_Store", LOCK_FILE];
 
 export const messageOf = (error: unknown) =>
   error instanceof Error ? error.message : String(error);
@@ -91,34 +88,31 @@ export const git =
   async (args: string[], options: GitOptions = {}): Promise<string> =>
     (await gitBytes(home)(args, options)).toString().trim();
 
-/**
- * Where Kru keeps its store: what its own `kru-store.sh home` answers when the plugin is installed,
- * else `KRU_HOME`, else `~/.kru`.
- */
-export async function resolveStoreHome(
+/** The store's checkout: the layout's directory under `$HOME`, or `SKY_STORE_HOME` when set. */
+export const resolveStoreHome = (
   env: NodeJS.ProcessEnv,
-): Promise<string> {
-  const script = join(
-    homedir(),
-    ".claude/plugins/marketplaces/kru/scripts/kru-store.sh",
-  );
-  if (existsSync(script)) {
-    try {
-      const { stdout } = await run("bash", [script, "home"], { env });
-      if (stdout.trim()) return stdout.trim();
-    } catch {}
-  }
-  return env.KRU_HOME || join(homedir(), ".kru");
-}
+  layout: BaseProfileStoreLayout,
+): string => join(homedir(), env.SKY_STORE_HOME || layout.home);
 
-const kruMergeScript = () =>
-  join(
-    homedir(),
-    ".claude/plugins/marketplaces/kru/scripts/kru-merge-lines.sh",
-  );
+/** The layout the env carries; throws on JSON that isn't one, naming the variable and not its value. */
+export function storeLayoutOf(env: NodeJS.ProcessEnv): BaseProfileStoreLayout {
+  const raw = env[STORE_LAYOUT_ENV];
+  if (!raw) return BaseProfileStoreLayout.parse({});
+  let parsed: ReturnType<typeof BaseProfileStoreLayout.safeParse>;
+  try {
+    parsed = BaseProfileStoreLayout.safeParse(JSON.parse(raw));
+  } catch {
+    throw new Error(`${STORE_LAYOUT_ENV} is not JSON`);
+  }
+  if (!parsed.success)
+    throw new Error(`${STORE_LAYOUT_ENV} is not a store layout`);
+  return parsed.data;
+}
 
 type StoreOptions = {
   home: string;
+  /** How the checkout treats local-only and line files; the defaults when absent. */
+  layout?: BaseProfileStoreLayout;
   /** `owner/repo` of the store on GitHub. */
   repo: string;
   gatewayUrl: string;
@@ -139,20 +133,28 @@ export type TreeItem = {
 };
 
 /** Makes `home` a git repo that knows the store's local-only files and merge driver; safe to repeat. */
-async function ensureRepo(home: string): Promise<void> {
+async function ensureRepo(
+  home: string,
+  layout: BaseProfileStoreLayout = BaseProfileStoreLayout.parse({}),
+): Promise<void> {
   await mkdir(home, { recursive: true });
   const g = git(home);
   if (!existsSync(join(home, ".git"))) await g(["init", "-q", "-b", "main"]);
   const info = (await g(["rev-parse", "--git-path", "info"])).trim();
   await mkdir(join(home, info), { recursive: true });
-  await writeFile(join(home, info, "exclude"), `${EXCLUDES.join("\n")}\n`);
-  await writeFile(join(home, info, "attributes"), `${ATTRIBUTES.join("\n")}\n`);
-  await g(["config", "merge.kru-lines.name", "kru line files"]);
-  const script = kruMergeScript();
+  const excluded = [...layout.exclude, ...ALWAYS_EXCLUDED];
+  await writeFile(join(home, info, "exclude"), `${excluded.join("\n")}\n`);
+  const attributes = layout.lineFiles.map((p) => `${p} merge=sky-lines`);
+  await writeFile(
+    join(home, info, "attributes"),
+    attributes.length > 0 ? `${attributes.join("\n")}\n` : "",
+  );
+  await g(["config", "merge.sky-lines.name", "line files"]);
+  const script = layout.mergeScript && join(homedir(), layout.mergeScript);
   await g([
     "config",
-    "merge.kru-lines.driver",
-    existsSync(script)
+    "merge.sky-lines.driver",
+    script && existsSync(script)
       ? `bash '${script}' %O %A %B`
       : "git merge-file --union %A %O %B",
   ]);
@@ -183,7 +185,7 @@ async function commitLocal(
 async function anchor(g: ReturnType<typeof git>): Promise<void> {
   if (await hasRef(g, SYNCED_REF)) return;
   await g(["hash-object", "-t", "tree", "-w", "--stdin"], { input: "" });
-  const base = await g(["commit-tree", EMPTY_TREE, "-m", "kru-store base"]);
+  const base = await g(["commit-tree", EMPTY_TREE, "-m", "sky store base"]);
   if (await hasRef(g, "HEAD")) {
     await g(["update-ref", PRE_SYNC_REF, "HEAD"]);
     await g(["reset", "--quiet", "--soft", base]);
@@ -250,7 +252,7 @@ async function pull(
       "-p",
       synced,
       "-m",
-      `kru-store ${remote.sha}`,
+      `store ${remote.sha}`,
     ]);
     await rebaseOnto(g, home, snapshot, synced);
     await g(["update-ref", SYNCED_REF, snapshot]);
@@ -339,7 +341,7 @@ async function writeBlob(
 }
 
 /**
- * Replays the local commits past `from` onto the remote's snapshot. A conflict `kru-lines` can't
+ * Replays the local commits past `from` onto the remote's snapshot. A conflict the line-file driver can't
  * settle is retried with the local side winning; the remote's version stays in the history.
  */
 async function rebaseOnto(
@@ -511,7 +513,7 @@ async function push(
 
 /** Brings the store checkout up to date with GitHub, keeping every local file. Run under the lock. */
 export async function pullStore(options: StoreOptions): Promise<void> {
-  await ensureRepo(options.home);
+  await ensureRepo(options.home, options.layout);
   const g = git(options.home);
   await pull(
     g,
@@ -527,7 +529,7 @@ export async function pullStore(options: StoreOptions): Promise<void> {
  * and tries again, a few times. Returns whether anything was pushed. Run under the lock.
  */
 export async function pushStore(options: StoreOptions): Promise<boolean> {
-  await ensureRepo(options.home);
+  await ensureRepo(options.home, options.layout);
   const g = git(options.home);
   const call = callFor(options);
   for (let attempt = 1; ; attempt++) {
@@ -610,7 +612,7 @@ export function underLock(
 }
 
 /**
- * `runner.mjs store-sync <pull|push>`: syncs the Kru store with GitHub through the connector, one
+ * `runner.mjs store-sync <pull|push>`: syncs the profile's store with GitHub through the connector, one
  * agent at a time. Exits 0 without doing anything when no store repo is set or the kill switch is.
  * Returns the exit status: 2 for a usage or config error, 1 for a failed sync.
  */
@@ -639,7 +641,7 @@ export async function storeSyncMain(
     return 2;
   }
   const repo = env[STORE_REPO_ENV];
-  if (!repo || env[NO_SYNC_ENV]) return 0;
+  if (!repo || env[NO_SYNC_ENV] || env[LEGACY_NO_SYNC_ENV]) return 0;
   if (!/^[^/\s]+\/[^/\s]+$/.test(repo)) {
     io.stderr(`store sync: ${STORE_REPO_ENV} must be owner/repo\n`);
     return 2;
@@ -651,13 +653,21 @@ export async function storeSyncMain(
     );
     return 2;
   }
-  const home = await resolveStoreHome(env);
+  let layout: BaseProfileStoreLayout;
+  try {
+    layout = storeLayoutOf(env);
+  } catch (error) {
+    io.stderr(`store sync: ${messageOf(error)}\n`);
+    return 2;
+  }
+  const home = resolveStoreHome(env, layout);
   if (!locked) {
     await mkdir(home, { recursive: true });
     return underLock(home, mode, io);
   }
   const options: StoreOptions = {
     home,
+    layout,
     repo,
     gatewayUrl: env[GATEWAY_URL_ENV] || DEFAULT_GATEWAY_URL,
     connectorId,

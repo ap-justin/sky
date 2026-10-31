@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { expect, test } from "vitest";
 import { loadConfig } from "./config.js";
 
@@ -28,6 +29,7 @@ test("parses the env, defaulting PORT, the runner bundle path and the run and wa
       cliBundlePath: expect.stringMatching(/\/sky\.mjs$/),
       runTimeoutMs: 30 * 60_000,
       waitTimeoutMs: 120 * 60_000,
+      baseProfiles: {},
       spritesLongTimeoutMs: 30 * 60_000,
       webhookSigningKey: "w".repeat(32),
       secretEncryptionKey: Buffer.alloc(32, 7),
@@ -128,4 +130,121 @@ test.each([
     ok: false,
     message: expect.stringContaining(message),
   });
+});
+
+const profileJson = JSON.stringify({
+  team: {
+    marketplaces: ["acme/plugins"],
+    plugins: ["review@plugins"],
+    mcpServers: {
+      docs: { command: "npx", args: ["-y", "docs-mcp"] },
+      search: {
+        url: "https://search.example.com/mcp",
+        headers: { "X-Api-Key": "SEARCH_KEY" },
+      },
+    },
+    storeRepo: "acme/store",
+    checks: ["run the linter"],
+  },
+});
+
+test("SKY_BASE_PROFILES is parsed into profiles with their defaults filled, and is empty when unset", () => {
+  const result = loadConfig({ ...required, SKY_BASE_PROFILES: profileJson });
+  expect(result.ok && result.config.baseProfiles).toEqual({
+    team: {
+      marketplaces: ["acme/plugins"],
+      plugins: ["review@plugins"],
+      mcpServers: {
+        docs: { command: "npx", args: ["-y", "docs-mcp"], env: {} },
+        search: {
+          url: "https://search.example.com/mcp",
+          headers: { "X-Api-Key": "SEARCH_KEY" },
+        },
+      },
+      storeRepo: "acme/store",
+      sessionEnv: {},
+      checks: ["run the linter"],
+    },
+  });
+  const bare = loadConfig({ ...required, SKY_BASE_PROFILES: '{"empty":{}}' });
+  expect(bare.ok && bare.config.baseProfiles).toEqual({
+    empty: {
+      marketplaces: [],
+      plugins: [],
+      mcpServers: {},
+      sessionEnv: {},
+      checks: [],
+    },
+  });
+  expect(loadConfig(required)).toMatchObject({
+    ok: true,
+    config: { baseProfiles: {} },
+  });
+});
+
+test.each([
+  [
+    "JSON that isn't JSON",
+    "{not json",
+    "SKY_BASE_PROFILES is invalid: expected JSON",
+  ],
+  [
+    "a profile with an unknown field",
+    '{"team":{"secrets":{}}}',
+    "SKY_BASE_PROFILES.team",
+  ],
+  [
+    "a plugin that isn't name@marketplace",
+    '{"team":{"plugins":["review"]}}',
+    "SKY_BASE_PROFILES.team.plugins.0",
+  ],
+  ["a profile name with a space", '{"a b":{}}', "SKY_BASE_PROFILES"],
+  [
+    "a store repo that isn't owner/name",
+    '{"team":{"storeRepo":"nope"}}',
+    "SKY_BASE_PROFILES.team.storeRepo",
+  ],
+  [
+    "an MCP credential that isn't a secret's name",
+    '{"team":{"mcpServers":{"x":{"command":"x","env":{"KEY":"sk-live abc"}}}}}',
+    "SKY_BASE_PROFILES.team.mcpServers.x",
+  ],
+  [
+    "a store home outside $HOME",
+    '{"team":{"storeRepo":"a/b","storeLayout":{"home":"/etc"}}}',
+    "SKY_BASE_PROFILES.team.storeLayout.home",
+  ],
+  [
+    "a marketplace source that is a flag",
+    '{"team":{"marketplaces":["--scope"]}}',
+    "SKY_BASE_PROFILES.team.marketplaces.0",
+  ],
+])(
+  "SKY_BASE_PROFILES with %s is rejected, naming the field and never the value",
+  (_, value, named) => {
+    const result = loadConfig({ ...required, SKY_BASE_PROFILES: value });
+    expect(result.ok).toBe(false);
+    const message = !result.ok ? result.message : "";
+    expect(message).toContain(named);
+    expect(message).not.toContain("sk-live");
+  },
+);
+
+test("docs/examples/base-profile.kru.json is a valid SKY_BASE_PROFILES", () => {
+  const example = readFileSync(
+    new URL("../../../docs/examples/base-profile.kru.json", import.meta.url),
+    "utf8",
+  );
+  const result = loadConfig({ ...required, SKY_BASE_PROFILES: example });
+  expect(result.ok).toBe(true);
+  expect(result.ok && result.config.baseProfiles.kru).toMatchObject({
+    plugins: ["kru@kru"],
+    storeRepo: "ap-justin/kru-store",
+    checks: [
+      'env -u ANTHROPIC_API_KEY claude -p "/kru:reflect"',
+      'env -u ANTHROPIC_API_KEY claude -p "/kru:text-fix"',
+    ],
+  });
+  // no value that looks like a credential: every secret reference is a name
+  expect(example).not.toMatch(/sk-|ghp_|token/i);
 });

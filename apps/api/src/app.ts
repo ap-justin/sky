@@ -77,6 +77,7 @@ export function createApp({
     secrets,
     sprites: spriteOps,
     ensureBundle,
+    baseProfiles: config.baseProfiles,
     log,
   });
   const launcher = createLauncher({

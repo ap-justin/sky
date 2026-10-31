@@ -1,0 +1,27 @@
+{
+  "kru": {
+    "marketplaces": ["anthropics/claude-plugins-official", "ap-justin/kru"],
+    "plugins": ["kru@kru"],
+    "mcpServers": {
+      "context7": {
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp"]
+      }
+    },
+    "storeRepo": "ap-justin/kru-store",
+    "storeLayout": {
+      "home": ".kru",
+      "exclude": ["audit/", "lead-gate/", "tmp/"],
+      "lineFiles": ["inbox.md", "refusals.jsonl", "management/*/TODOS.md"],
+      "mergeScript": ".claude/plugins/marketplaces/kru/scripts/kru-merge-lines.sh"
+    },
+    "sessionEnv": {
+      "KRU_NO_STORE_SYNC": "1",
+      "KRU_STORE_REPO": "ap-justin/kru-store"
+    },
+    "checks": [
+      "env -u ANTHROPIC_API_KEY claude -p \"/kru:reflect\"",
+      "env -u ANTHROPIC_API_KEY claude -p \"/kru:text-fix\""
+    ]
+  }
+}

@@ -66,6 +66,7 @@ Creates or updates the environment `env.yaml` describes, waits until it's provis
 name: web
 repo: owner/name # GitHub repo, cloned once per environment
 setup: pnpm install # shell script run once after the clone
+base: team # optional: a base profile the server defines (see Base profiles)
 concurrency: 3 # agents running at once (default 3)
 approvalPolicy: [Bash] # tool names whose calls wait for your approval
 autoApprove: # optional: Bash commands that skip approvalPolicy
@@ -82,6 +83,41 @@ setup: |
 ```
 
 Provisioning fails at the setup step, naming the plugin and its marketplace, if a plugin's marketplace is neither declared nor added.
+
+### Base profiles
+
+A base profile is what every sprite gets before its own `setup`, defined once on the server so no client's tooling lives in Sky's code. The API reads them from `SKY_BASE_PROFILES`, a JSON object of profiles by name, empty by default; an environment picks one with `base: <name>`. A `base` the server doesn't have is rejected, and changing `base` rebuilds the sprite like changing `setup` (so it is refused with `agents_exist` while unarchived agents exist). With no `base`, an environment gets no plugins or MCP servers beyond its repo's, no store sync and no check instructions.
+
+A profile holds:
+
+- `marketplaces`: sources for `claude plugin marketplace add`.
+- `plugins`: `name@marketplace`, installed at user scope. Provisioning installs and updates them after adding the marketplaces.
+- `mcpServers`: user-scope MCP servers by name, each `command` (with `args`, `env`) or `url` (with `headers`). Credentials are never inline: an `env` or `headers` value is the **name** of an env secret (`sky secret set`), which the session expands from its own env. Sky writes it into the sprite's config as `${NAME}`, so no secret value reaches the checkpoint.
+- `storeRepo`: a GitHub `owner/name` synced through the env's `GITHUB_CONNECTOR`, as the next section describes. `storeLayout` says where the checkout lives under `$HOME` (`home`), which paths stay local (`exclude`), which are append-only line files to merge (`lineFiles`) and an optional merge script (`mergeScript`).
+- `sessionEnv`: non-secret variables set in every session, such as a plugin's own switch. Never put a secret here.
+- `checks`: lines the runner tells the agent to follow before it finishes, each an instruction or a command, run in order from the repo root. A command that calls `claude -p` runs as a nested headless session the runner has logged in; an API key stays out of it.
+
+Provisioning applies the profile after the clone and before `setup`, so `setup` can use what it installs; the env's own plugins from `.claude/settings.json` follow `setup`. Plugins are updated on each provision; a run does not update them again. Reprovision to refresh.
+
+```json
+{
+  "team": {
+    "marketplaces": ["acme/claude-plugins"],
+    "plugins": ["review@claude-plugins"],
+    "mcpServers": {
+      "docs": {
+        "command": "npx",
+        "args": ["-y", "docs-mcp"],
+        "env": { "DOCS_API_KEY": "DOCS_API_KEY" }
+      }
+    },
+    "storeRepo": "acme/agent-store",
+    "checks": ["run `pnpm check` and fix what it reports"]
+  }
+}
+```
+
+Here `DOCS_API_KEY` on the left is the variable the server sees, and on the right the env secret that fills it. [`docs/examples/base-profile.kru.json`](docs/examples/base-profile.kru.json) is a full profile with a store layout. Set it with `fly secrets set SKY_BASE_PROFILES="$(jq -c . profiles.json)"`. A bad value stops the API at boot, naming the field.
 
 ```
 sky secret set web NPM_TOKEN < token.txt

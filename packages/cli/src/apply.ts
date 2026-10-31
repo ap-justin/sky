@@ -150,7 +150,7 @@ async function findEnv(
 }
 
 const reprovisioningFields = (patch: Partial<EnvSpec>) =>
-  (["repo", "setup"] as const).filter((key) => key in patch);
+  (["repo", "setup", "base"] as const).filter((key) => key in patch);
 
 function changedFields(spec: EnvSpec, env: ApiEnvironment): Partial<EnvSpec> {
   const patch: Record<string, unknown> = {};
