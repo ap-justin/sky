@@ -46,7 +46,7 @@ async function main(): Promise<void> {
   // agents on one sprite share the Kru store; a failed sync is logged, never the run's failure
   await syncStoreQuietly("pull", process.env, warn);
   // so the session runs the plugins' current versions, not those the env setup installed; bounded, never fails the run
-  await refreshPlugins({ env: process.env, warn });
+  await refreshPlugins({ env: process.env, warn, signal: controller.signal });
   try {
     process.exitCode = await runSession(config, {
       query,
